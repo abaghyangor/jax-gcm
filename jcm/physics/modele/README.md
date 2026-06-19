@@ -50,9 +50,11 @@ error on import, but the ModelE/GISS tests here do not depend on it.
 
 ## Oracle data conventions (verified)
 
-The oracle is the verified run output
-`/Users/gor/ModelE_Support/huge_space/dycoms_scm/allsteps.subdddycoms_scm.nc`
-(48 sub-daily periods, single column `im=jm=1`, `lm=63`). ModelE stores groups
+The oracle is the verified ModelE run output (a sub-daily NetCDF such as
+`<ModelE_Support>/huge_space/dycoms_scm/allsteps.subdddycoms_scm.nc`, an external
+machine-specific path set via the `MODELE_DYCOMS_ORACLE` env var; a committed
+subset is used by default — see `oracle.fixture_path()`). It has
+48 sub-daily periods, single column `im=jm=1`, `lm=63`. ModelE stores groups
 of diagnostics as a packed array plus a `sname_*` name table and a `scale_*`
 factor:
 
@@ -123,8 +125,8 @@ Consequences:
 ## Running the tests
 
 ```sh
-cd /Users/gor/Documents/GitHub/jcm_nasa/jax-gcm
-JAX_PLATFORMS=cpu ./.venv/bin/python -m pytest \
+# from the jax-gcm repo root
+JAX_PLATFORMS=cpu python -m pytest \
     jcm/physics/modele jcm/physics/convection/giss_mstcnv_test.py -q
 ```
 
