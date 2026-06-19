@@ -1,0 +1,112 @@
+# Status: ModelE → JCM Convection Conversion
+
+**Last updated:** 2026-06-19
+**Branch:** `modele-convection-port` (based on `upstream/dev`)
+**Commit:** `039cd1c` — "Add GISS ModelE convection scaffold + DYCOMS oracle layer"
+
+---
+
+## One-paragraph summary
+
+The goal of this project is to convert the GISS ModelE moist-convection routine
+(`MSTCNV`, Fortran) into the differentiable JAX model (JCM / jax-gcm), using a
+verified ModelE single-column run as a "Fortran oracle" (answer key) for
+validation. **Milestone 1 is complete and committed:** the full data pipeline
+from the ModelE oracle into the JCM model, plus a convection module correctly
+integrated into JCM's composable-physics architecture, all covered by passing
+unit tests (21 passing). **The convection physics itself is not yet
+implemented** — the module is a scaffold that returns zero tendencies. The next
+phase (the actual physics translation) is blocked on input data for a
+convectively active test case (see "What's needed next").
+
+---
+
+## What is done (Milestone 1: data layer + integration scaffold)
+
+All of the following is implemented, tested, and committed:
+
+- **Oracle reader** (`jcm/physics/modele/oracle.py`) — extracts named
+  diagnostics (`dq_mc`, `dth_mc`, `prec`, `mcp`, and state fields `t`, `th`,
+  `q`, `z`, `p_3d`) from ModelE's packed sub-daily NetCDF output. Units,
+  vertical orientation (surface = index 0), and dimension ordering are
+  documented.
+- **State adapter** (`jcm/physics/modele/adapter.py`) — builds a JCM column
+  `PhysicsState` from one oracle period, applying the required unit conversions
+  (ModelE humidity kg/kg → JCM g/kg; geopotential height → geopotential energy).
+- **Convection term** (`jcm/physics/convection/giss_mstcnv.py`) —
+  `GissConvection`, a `PhysicsTerm` that plugs into JCM's current
+  composable-physics API (`ComposablePhysics`). **Currently returns zero
+  tendencies** (clearly marked as a scaffold).
+- **Parameters / diagnostics structs** (`jcm/physics/modele/params.py`,
+  `physics_data.py`) — typed containers in the project's required style.
+- **Tests (21 passing)** — `jcm/physics/modele/oracle_test.py` and
+  `jcm/physics/convection/giss_mstcnv_test.py` cover name decoding, field
+  extraction, shapes/units/orientation, the term interface, composition, JAX/nnx
+  differentiability smoke checks, and oracle consistency.
+- **Committed answer-key fixture** — a 240 KB extract of the verified DYCOMS
+  oracle is committed under `jcm/data/test/modele/` so tests are self-contained.
+
+## What is NOT done (the main scientific work)
+
+- **The convection physics is not translated.** `GissConvection` returns zero.
+  The real ModelE `MSTCNV` routine (~8,700 lines of Fortran: convective
+  triggering, updrafts, downdrafts, microphysics, precipitation) has not been
+  ported. This is the bulk of the remaining effort.
+
+## Important caveat — please read
+
+The current scaffold "agrees" with the DYCOMS oracle **only trivially**: DYCOMS
+is a stratocumulus case in which moist convection is **inactive**, so the
+oracle's convective tendencies (`dq_mc`, `dth_mc`, `mcp`) are **identically zero
+across all 48 time steps**. Zero output matching zero truth is **not** evidence
+that any physics is correct — it simply confirms the plumbing is wired
+correctly. Validating real convection physics requires a test case in which
+convection actually occurs.
+
+## What's needed next (blocking item)
+
+To implement and validate the real convection translation, we need the
+single-column **input bundle for a convectively active case** — ideally
+**BOMEX** (clean shallow cumulus) and later **RICO** (cumulus with
+precipitation) — from the NASA team. This is the same kind of bundle they
+provided for DYCOMS:
+
+1. The case forcing file, e.g. `SCM_BOMEX.nc` (the only case-specific file).
+2. A matching single-column `extractions/` set (topography, initial conditions,
+   ozone, dust, aerosols, etc.) **extracted at the BOMEX location** (these are
+   geographically specific; the DYCOMS extractions are at a different location).
+
+Once that data arrives, generating the new oracle reuses the already-verified
+ModelE build/run pipeline, and the existing reader/adapter already understand
+the output format.
+
+## Suggested next steps (do not require the new data)
+
+- Write a design document mapping each stage of Fortran `MSTCNV`
+  (trigger → updraft → downdraft → precipitation) to the planned JAX code,
+  scoped to the DYCOMS/SCM subset.
+- Begin porting the smallest self-contained piece — the convective **trigger**
+  (`CLOUD_BASE`: is the column unstable, and where is cloud base?) — which can be
+  sanity-tested (finite, differentiable, physically sensible) before the BOMEX
+  oracle is available, then validated against it once it is.
+
+## How to run the tests
+
+```sh
+cd jax-gcm
+JAX_PLATFORMS=cpu ./.venv/bin/python -m pytest \
+    jcm/physics/modele jcm/physics/convection/giss_mstcnv_test.py -q
+# expected: 21 passed
+```
+
+## Environment notes
+
+This work is on `upstream/dev`. The Python environment required updates beyond
+the original setup:
+
+- `dinosaur >= 1.3.6` (dev imports `compute_diagnostic_state_hybrid`).
+- The radiation stack from `requirements.txt`: `jax-solar` and
+  `jax-rrtmgp >= 0.2.0`.
+
+After `pip install -r requirements.txt` (into the project venv), the full
+project test suite is healthy.
