@@ -1,8 +1,12 @@
 """Reader for the ModelE DYCOMS-II RF02 SCM sub-daily oracle NetCDF.
 
-The verified local ModelE run writes packed sub-daily diagnostics to::
-
-    /Users/gor/ModelE_Support/huge_space/dycoms_scm/allsteps.subdddycoms_scm.nc
+A local ModelE DYCOMS-II RF02 SCM run writes packed sub-daily diagnostics to a
+file such as ``<ModelE_Support>/huge_space/dycoms_scm/allsteps.subdddycoms_scm.nc``.
+That file lives outside this repo and is machine-specific, so its location is not
+hardcoded: set the ``MODELE_DYCOMS_ORACLE`` environment variable to point at it
+if you want to read a fresh full run. For everything else (including all tests) a
+small self-contained fixture is committed in the repo and used by default; see
+:func:`fixture_path`.
 
 ModelE stores groups of diagnostics as one packed array plus a parallel
 fixed-width character *name table*. For example::
@@ -75,10 +79,13 @@ from importlib import resources
 import netCDF4
 import numpy as np
 
-# Live oracle written by the verified ModelE DYCOMS-II RF02 SCM run.
-DEFAULT_ORACLE_PATH = (
-    "/Users/gor/ModelE_Support/huge_space/dycoms_scm/allsteps.subdddycoms_scm.nc"
-)
+# Optional path to the *live* external oracle written by a local ModelE run.
+# That file lives outside the repo and is machine-specific, so it is taken from
+# the MODELE_DYCOMS_ORACLE environment variable rather than hardcoded (``None``
+# if unset). Tests never use it -- they read the committed fixture via
+# ``fixture_path()``. It is only a convenience for working against a fresh full
+# ModelE run.
+DEFAULT_ORACLE_PATH = os.environ.get("MODELE_DYCOMS_ORACLE")
 
 # Which packed array / name table each named diagnostic lives in.
 _GROUP_AIJLH1 = ("aijlh1", "sname_aijlh1", "scale_aijlh1")  # 3D state
@@ -123,18 +130,16 @@ def default_path(prefer_live: bool = False) -> str:
     """Pick an oracle path: the committed fixture, or the live run if present.
 
     Args:
-        prefer_live: If True and the live oracle exists, return it; otherwise
+        prefer_live: If True and the live oracle is configured (via the
+            ``MODELE_DYCOMS_ORACLE`` env var) and exists, return it; otherwise
             fall back to the committed fixture.
 
     Returns:
-        A path that exists, preferring the fixture for reproducibility.
+        A path that exists, preferring the committed fixture for reproducibility.
     """
-    if prefer_live and os.path.exists(DEFAULT_ORACLE_PATH):
+    if prefer_live and DEFAULT_ORACLE_PATH and os.path.exists(DEFAULT_ORACLE_PATH):
         return DEFAULT_ORACLE_PATH
-    fp = fixture_path()
-    if os.path.exists(fp):
-        return fp
-    return DEFAULT_ORACLE_PATH
+    return fixture_path()
 
 
 def decode_names(char_rows) -> list[str]:
