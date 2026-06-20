@@ -3,11 +3,19 @@
 Milestone 1: the term returns zero tendencies. These tests verify the
 composable-physics interface contract (shapes, ``provides`` diagnostics,
 composition, differentiability) and -- explicitly as a *trivial* check -- that
-zero output is consistent with the inactive moist convection in the DYCOMS-II
-RF02 oracle. They do NOT claim a validated physics port (see giss_mstcnv.py).
+zero output matches the inactive moist convection in the DYCOMS-II RF02 case.
+They do NOT claim a validated physics port (see giss_mstcnv.py).
+
+Reference arrays come from a committed, deterministic fixture
+``jcm/data/test/modele/dycoms_period24.npz`` (one DYCOMS column + its
+moist-convective targets), mirroring how the SPEEDY convection tests load
+``.npy`` oracle arrays. The fixture is produced offline by the separate ModelE
+reading/conversion tooling; this repo holds only the committed arrays, not the
+NetCDF reader.
 """
 
 import unittest
+from importlib import resources
 
 import jax
 import jax.numpy as jnp
@@ -21,7 +29,9 @@ from jcm.physics.composable_physics import ComposablePhysics
 from jcm.physics.convection.giss_mstcnv import GissConvection
 from jcm.physics.modele.params import GissConvectionParameters
 from jcm.physics.modele.physics_data import GissConvectionData
-from jcm.physics.modele import oracle, adapter
+
+_G = 9.80665      # geopotential height (m) -> geopotential (m^2/s^2)
+_P0_HPA = 1013.25
 
 
 def _make_terrain(shape):
@@ -31,6 +41,11 @@ def _make_terrain(shape):
         orostd=zero, orosig=zero, orogam=zero,
         orothe=zero, oropic=zero, oroval=zero,
     )
+
+
+def _load_dycoms_fixture():
+    path = resources.files("jcm.data.test") / "modele" / "dycoms_period24.npz"
+    return np.load(str(path))
 
 
 class TestGissConvectionTerm(unittest.TestCase):
@@ -51,7 +66,6 @@ class TestGissConvectionTerm(unittest.TestCase):
         self.assertEqual(tend.temperature.shape, self.shape)
         self.assertTrue(jnp.all(tend.temperature == 0))
         self.assertTrue(jnp.all(tend.specific_humidity == 0))
-        # diagnostics dict carries a zero GissConvectionData under "convection"
         self.assertIn("convection", diag)
         conv = diag["convection"]
         self.assertIsInstance(conv, GissConvectionData)
@@ -123,39 +137,45 @@ class TestGissConvectionComposition(unittest.TestCase):
 
         self.assertEqual(float(loss(physics)), 0.0)
         grads = nnx.grad(loss)(physics)
-        # dtsrc gradient is defined and finite (zero here).
         dtsrc_grad = grads.terms[0].params.get_value().dtsrc
         self.assertTrue(jnp.all(jnp.isfinite(dtsrc_grad)))
 
 
-class TestGissScaffoldVsOracle(unittest.TestCase):
-    """Trivial consistency: scaffold zeros match the inactive-MC oracle.
+class TestGissScaffoldVsDycomsFixture(unittest.TestCase):
+    """Trivial consistency: scaffold zeros match the inactive-MC DYCOMS column.
 
-    This is a *no-convection* check, NOT validation of physics. The DYCOMS
-    oracle's dq_mc/dth_mc/mcp are identically zero (see oracle_test.py).
+    This is a *no-convection* regression check against committed oracle arrays,
+    NOT validation of physics. The DYCOMS moist-convective targets
+    (dq_mc/dth_mc/mcp) are identically zero -- a convectively active case
+    (BOMEX/RICO) is required to validate real physics. When that lands, this
+    fixture is replaced with nonzero targets and the same test shape applies.
     """
 
-    def test_scaffold_matches_zero_mc_oracle(self):
-        path = oracle.fixture_path()
-        period = 24
-        state = adapter.oracle_to_physics_state(path, period)
-        self.assertEqual(state.temperature.shape, (63, 1))  # (nlev, ncols)
+    def test_scaffold_matches_dycoms_mc_targets(self):
+        data = _load_dycoms_fixture()
+        nlev, ncols = data["temperature"].shape
+
+        state = PhysicsState.zeros(
+            (nlev, ncols),
+            temperature=jnp.asarray(data["temperature"]),
+            specific_humidity=jnp.asarray(data["specific_humidity"]),  # g/kg
+            geopotential=jnp.asarray(data["geopotential_height"]) * _G,
+            normalized_surface_pressure=jnp.asarray(data["pressure_hpa"][0] / _P0_HPA),
+        )
 
         term = GissConvection()
         tend, diag = term(state, {}, None, None)
         conv = diag["convection"]
 
-        # Oracle MC diagnostics for this column (kg/kg/day, K/day, mm/day).
-        dq_mc = oracle.read_convection_field(path, "dq_mc", period=period)
-        dth_mc = oracle.read_convection_field(path, "dth_mc", period=period)
-        mcp = oracle.read_column_field(path, "mcp", period=period)
+        # Sanity: the committed DYCOMS targets really are inactive convection.
+        self.assertTrue(np.all(data["dq_mc"] == 0))
 
         self.assertTrue(np.allclose(np.asarray(conv.dq_mc).ravel(),
-                                    np.asarray(dq_mc).ravel()))
+                                    data["dq_mc"].ravel()))
         self.assertTrue(np.allclose(np.asarray(conv.dth_mc).ravel(),
-                                    np.asarray(dth_mc).ravel()))
+                                    data["dth_mc"].ravel()))
         self.assertTrue(np.allclose(np.asarray(conv.mcp).ravel(),
-                                    np.asarray(mcp).ravel()))
+                                    data["mcp"].ravel()))
         self.assertTrue(jnp.all(tend.temperature == 0))
 
 
