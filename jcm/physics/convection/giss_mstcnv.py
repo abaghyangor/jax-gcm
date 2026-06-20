@@ -6,9 +6,10 @@ This is the JCM landing zone for the GISS ModelE moist convection routine
 ModelE DYCOMS-II RF02 single-column run as a Fortran oracle.
 
 Per the repo's by-process organization, the convection *term* lives here under
-``jcm/physics/convection/`` (named after the scheme), while the model-specific
-*infrastructure* it consumes -- oracle reader, parameters, data struct -- lives
-under :mod:`jcm.physics.modele`.
+``jcm/physics/convection/`` (named after the scheme). The scheme's parameter and
+diagnostic structs live under :mod:`jcm.physics.modele`. The ModelE oracle
+reading/conversion tooling deliberately lives in a *separate* repository; this
+repo only carries committed fixture arrays (``jcm/data/test/modele/``) for tests.
 
 Status: Milestone 1 scaffold
 ----------------------------

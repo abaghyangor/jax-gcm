@@ -7,7 +7,8 @@ user-facing xarray output as ``convection.<field>``).
 
 Arrays are in column-vectorized order ``(nlev, ncols)`` to match the composable
 physics convention; per-column scalars are ``(ncols,)``. Vertical index 0 is the
-surface (see :mod:`jcm.physics.modele.oracle`).
+surface (matching the ModelE oracle convention; the oracle reading/conversion
+tooling lives in the separate ModelE-bridge repository).
 """
 
 import jax.numpy as jnp
