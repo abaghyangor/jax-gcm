@@ -51,9 +51,17 @@ In **jax-gcm** (this repo):
   (`jcm/physics/convection/giss_thermodynamics.py`, **14 tests passing**):
   faithful ports of GISS saturation vapour pressure (Murphy & Koop 2005),
   ModelE `QSAT` (saturation specific humidity), and moist static energy, with
-  exact ModelE constants and physically-grounded + gradient + broadcasting
-  tests. These are *not yet wired into the term* (which still returns zero) —
-  they are the primitives the convective trigger will build on next.
+  exact ModelE constants and physically-grounded + gradient + broadcasting tests.
+- **Convective trigger — cloud base / LCL**
+  (`jcm/physics/convection/giss_cloud_base.py`, **7 tests passing**): faithful
+  port of the `MSTCNV` parcel-lift cloud-base detection (dry-adiabatic lift +
+  first level where the parcel saturates), vectorized broadcasting-native. The
+  continuous pieces are differentiable; the cloud-base *index* is a documented
+  discontinuous trigger.
+
+These ported pieces are *not yet wired into the term* (`GissConvection` still
+returns zero) — they are the building blocks the cloud-base closure and plume
+code will use next.
 
 In **modele-jcm-bridge** (separate repo):
 
