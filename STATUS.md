@@ -47,6 +47,13 @@ In **jax-gcm** (this repo):
 - **Tests (7 passing)** — `jcm/physics/convection/giss_mstcnv_test.py`: term
   interface, `ComposablePhysics` composition, JAX/nnx differentiability smoke
   checks, and the (trivial) DYCOMS zero-MC consistency check.
+- **First ported physics — thermodynamics building blocks**
+  (`jcm/physics/convection/giss_thermodynamics.py`, **14 tests passing**):
+  faithful ports of GISS saturation vapour pressure (Murphy & Koop 2005),
+  ModelE `QSAT` (saturation specific humidity), and moist static energy, with
+  exact ModelE constants and physically-grounded + gradient + broadcasting
+  tests. These are *not yet wired into the term* (which still returns zero) —
+  they are the primitives the convective trigger will build on next.
 
 In **modele-jcm-bridge** (separate repo):
 
