@@ -75,11 +75,19 @@ In **jax-gcm** (this repo):
   differentiable and broadcasting-native). **Structure faithful; magnitude not
   yet oracle-validated** — multi-source (`nlpi>1`) generalization deferred.
 
-These ported pieces are *not yet wired into the term* (`GissConvection` still
-returns zero) — they are the building blocks the full plume scheme will use.
-The natural next steps are (a) wire trigger + closure into the term for a first
-end-to-end cloud-base diagnostic, and (b) validate magnitudes once a BOMEX/RICO
-oracle exists.
+- **First end-to-end wiring into the term**
+  (`GissConvection.__call__`): when a `pressure_full` column-pressure diagnostic
+  is available, the term now *diagnoses the convective cloud base* from the real
+  `PhysicsState` (surface parcel lifted via the ported trigger) and writes it to
+  `diagnostics["convection"].cloud_base`. Handles the JCM (index 0 = top) vs
+  ModelE (surface-first) vertical-orientation flip explicitly. **Tendencies are
+  still zero** — converting the mass-flux closure into temperature/humidity
+  tendencies is the next step and needs an active oracle to validate.
+
+The term thus computes a real diagnostic from state, but produces no tendencies
+yet. Remaining: wire the closure → tendencies, port the plume above cloud base
+(entrainment/condensation/downdrafts/precip), and validate magnitudes once a
+BOMEX/RICO oracle exists.
 
 In **modele-jcm-bridge** (separate repo):
 

@@ -11,15 +11,18 @@ diagnostic structs live under :mod:`jcm.physics.modele`. The ModelE oracle
 reading/conversion tooling deliberately lives in a *separate* repository; this
 repo only carries committed fixture arrays (``jcm/data/test/modele/``) for tests.
 
-Status: Milestone 1 scaffold
-----------------------------
-:class:`GissConvection` currently returns **zero** tendencies and zero
-diagnostics. It is NOT a validated ModelE convection implementation. Zero output
-happens to agree with the verified DYCOMS-II RF02 oracle, but ONLY because moist
-convection is inactive there (``dq_mc``/``dth_mc``/``mcp`` are identically zero
-across all 48 periods -- all precipitation is stratiform). That agreement is
-trivial and must not be read as scientific validation. See
-``jcm/physics/modele/README.md``.
+Status: cloud-base diagnostic; zero tendencies
+----------------------------------------------
+:class:`GissConvection` returns **zero** tendencies. It now *diagnoses* the
+convective cloud base from the state (when a ``pressure_full`` column pressure is
+available in the diagnostics dict), via the ported GISS trigger pieces, and
+writes it into ``diagnostics["convection"].cloud_base``. It is NOT a validated
+ModelE convection implementation: the tendency-producing closure is not wired in
+yet, and the zero tendencies happen to agree with the verified DYCOMS-II RF02
+oracle ONLY because moist convection is inactive there (``dq_mc``/``dth_mc``/
+``mcp`` are identically zero across all 48 periods -- all precipitation is
+stratiform). That agreement is trivial and must not be read as scientific
+validation. See ``jcm/physics/modele/README.md``.
 
 Next steps ("Option B", DYCOMS/SCM subset of ``MSTCNV``)
 -------------------------------------------------------
@@ -50,12 +53,15 @@ from typing import ClassVar
 import jax.numpy as jnp
 from flax import nnx
 
+import jax.numpy as jnp
+
 from jcm.physics_interface import PhysicsState, PhysicsTendency
 from jcm.physics.physics_term import PhysicsTerm
 from jcm.forcing import ForcingData
 from jcm.terrain import TerrainData
 from jcm.physics.modele.params import GissConvectionParameters
 from jcm.physics.modele.physics_data import GissConvectionData
+from jcm.physics.convection.giss_cloud_base import lifting_condensation_level
 
 
 class GissConvection(PhysicsTerm):
@@ -70,6 +76,10 @@ class GissConvection(PhysicsTerm):
 
     name: ClassVar[str] = "giss_convection"
     category: ClassVar[str] = "convection"
+    # ``pressure_full`` (Pa, full-level column pressure) is read from the
+    # diagnostics dict when present to locate the cloud base; it is optional so
+    # the term still runs (as a pure scaffold) without an upstream pressure
+    # diagnostic. Listed as optional via the read in __call__, not in ``requires``.
     requires: ClassVar[tuple[str, ...]] = ()
     provides: ClassVar[tuple[str, ...]] = ("convection",)
 
@@ -128,5 +138,35 @@ class GissConvection(PhysicsTerm):
             specific_humidity=zero_field,
         )
 
-        convection = GissConvectionData.zeros(nodal_shape, nlev)
+        cloud_base = self._diagnose_cloud_base(state, diagnostics, nlev, nodal_shape)
+        convection = GissConvectionData.zeros(nodal_shape, nlev).copy(
+            cloud_base=cloud_base)
         return tendency, {**diagnostics, "convection": convection}
+
+    def _diagnose_cloud_base(self, state, diagnostics, nlev, nodal_shape):
+        """Cloud-base level per column from a surface parcel, if pressure is known.
+
+        Uses ``diagnostics["pressure_full"]`` (Pa) when an upstream term provides
+        it. JCM orders the vertical with **index 0 = top, last index = surface**;
+        the ported GISS routines expect **surface-first**, so the column is
+        flipped before the lift. The returned index is in surface-first order
+        (sentinel ``nlev`` = no cloud base). Without a pressure profile, returns
+        the sentinel everywhere -- the pure-scaffold behaviour.
+
+        Tendencies remain zero either way: converting the cloud base + mass-flux
+        closure into temperature/humidity tendencies is the next step and needs a
+        convectively active oracle to validate.
+        """
+        pressure_full = diagnostics.get("pressure_full")
+        if pressure_full is None:
+            return jnp.full(nodal_shape, nlev, dtype=int)
+
+        # Surface parcel (JCM surface = last level); humidity g/kg -> kg/kg.
+        t_surface = state.temperature[-1]
+        q_surface = state.specific_humidity[-1] / 1000.0
+        p_surface = pressure_full[-1]
+        level_pressure_surface_first = jnp.flip(pressure_full, axis=0)
+
+        cloud_base, _ = lifting_condensation_level(
+            t_surface, p_surface, q_surface, level_pressure_surface_first)
+        return cloud_base
