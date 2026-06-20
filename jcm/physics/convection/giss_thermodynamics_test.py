@@ -97,6 +97,33 @@ class TestMoistStaticEnergy(unittest.TestCase):
             float(base))
 
 
+class TestVirtualTemperature(unittest.TestCase):
+    def test_dry_air_equals_temperature(self):
+        t = jnp.array(290.0)
+        self.assertAlmostEqual(float(gt.virtual_temperature(t, jnp.array(0.0))),
+                               float(t), places=6)
+
+    def test_moisture_raises_it(self):
+        t = jnp.array(290.0)
+        tv = gt.virtual_temperature(t, jnp.array(0.015))   # 15 g/kg vapour
+        self.assertGreater(float(tv), float(t))
+        # exact: T*(1 + DELTX*q)
+        self.assertAlmostEqual(float(tv), float(t) * (1.0 + gt.DELTX * 0.015),
+                               places=5)
+
+    def test_condensate_loads_it_down(self):
+        t, q = jnp.array(290.0), jnp.array(0.015)
+        tv_clear = gt.virtual_temperature(t, q)
+        tv_cloudy = gt.virtual_temperature(t, q, condensate=jnp.array(0.002))
+        self.assertLess(float(tv_cloudy), float(tv_clear))
+
+    def test_gradient_finite(self):
+        g = jax.grad(lambda q: gt.virtual_temperature(jnp.array(290.0), q).sum())(
+            jnp.array(0.01))
+        self.assertTrue(jnp.isfinite(g))
+        self.assertGreater(float(g), 0.0)
+
+
 class TestDifferentiability(unittest.TestCase):
     """JAX gives d(qsat)/dT for free -- no need to port ModelE's DLNQSATDT."""
 

@@ -48,9 +48,10 @@ In **jax-gcm** (this repo):
   interface, `ComposablePhysics` composition, JAX/nnx differentiability smoke
   checks, and the (trivial) DYCOMS zero-MC consistency check.
 - **First ported physics — thermodynamics building blocks**
-  (`jcm/physics/convection/giss_thermodynamics.py`, **14 tests passing**):
+  (`jcm/physics/convection/giss_thermodynamics.py`, **18 tests passing**):
   faithful ports of GISS saturation vapour pressure (Murphy & Koop 2005),
-  ModelE `QSAT` (saturation specific humidity), and moist static energy, with
+  ModelE `QSAT` (saturation specific humidity), moist static energy, and virtual
+  temperature (the buoyancy variable, with vapour + condensate loading), with
   exact ModelE constants and physically-grounded + gradient + broadcasting tests.
 - **Convective trigger — cloud base / LCL**
   (`jcm/physics/convection/giss_cloud_base.py`, **7 tests passing**): faithful
