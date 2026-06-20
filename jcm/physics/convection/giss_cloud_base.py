@@ -36,7 +36,11 @@ import jax.numpy as jnp
 
 from jcm.physics.convection.giss_thermodynamics import (
     KAPA,
+    LHE,
+    LHS,
+    SHA,
     saturation_specific_humidity,
+    virtual_temperature,
 )
 
 
@@ -94,3 +98,97 @@ def lifting_condensation_level(parcel_temperature: jnp.ndarray,
     # sentinel ``nlev`` (an out-of-range index meaning "no cloud base").
     cloud_base = jnp.where(condenses, first_saturated, nlev)
     return cloud_base, condenses
+
+
+def cloud_base_instability(parcel_potential_temperature: jnp.ndarray,
+                           parcel_specific_humidity: jnp.ndarray,
+                           parcel_condensate: jnp.ndarray,
+                           above_potential_temperature: jnp.ndarray,
+                           above_specific_humidity: jnp.ndarray,
+                           above_condensate: jnp.ndarray,
+                           exner: jnp.ndarray,
+                           pressure: jnp.ndarray,
+                           phase: str = "water") -> jnp.ndarray:
+    """Cloud-base moist instability metric ``DMSE`` (units of K).
+
+    Faithful port of the trigger in ``MSTCNV`` ``cloud_base_closure``::
+
+        DMSE = (SVUP-SVDN)*PLK + SLH*(QSAT(SUP*PLK, LHX, pres) - QDN)
+
+    evaluated at the interface just above cloud base (``lmin+1``). ``SUP``/``SDN``
+    are *potential* temperatures (``SM = TH*MA``); ``PLK`` is the Exner function,
+    so ``SUP*PLK`` is the layer-above temperature. ``SVUP``/``SVDN`` are the
+    corresponding virtual potential temperatures (vapour + condensate loading);
+    ``SLH = L/cp``. The first term is the parcel-vs-environment virtual
+    *temperature* difference; the second is the latent contribution from the
+    parcel's vapour excess over saturation aloft.
+
+    Sign convention (confirmed from source): ``DMSE < 0`` => **unstable**.
+    Larger parcel buoyancy or vapour excess drives it more negative.
+
+    NOTE: structure and sign are read from the Fortran but **not yet validated
+    numerically** against a convectively active oracle (the available DYCOMS case
+    never triggers convection). Treat absolute values as provisional until a
+    BOMEX/RICO oracle is available; the tests below assert structure, not
+    oracle agreement.
+
+    Args:
+        parcel_potential_temperature: Source-parcel potential temperature ``SDN`` [K].
+        parcel_specific_humidity: Source-parcel specific humidity ``QDN`` [kg/kg].
+        parcel_condensate: Source-parcel condensate ``WMDN`` [kg/kg].
+        above_potential_temperature: Layer-above potential temperature ``SUP`` [K].
+        above_specific_humidity: Layer-above specific humidity ``QUP`` [kg/kg].
+        above_condensate: Layer-above condensate ``WMUP`` [kg/kg].
+        exner: Exner function ``PLK`` at the interface (= ``(p/p0)**KAPA``).
+        pressure: Interface pressure [Pa].
+        phase: ``"water"`` (``LHE``) or ``"ice"`` (``LHS``). Static.
+
+    Returns:
+        ``DMSE`` [K]; negative => convectively unstable.
+    """
+    sv_dn = virtual_temperature(
+        parcel_potential_temperature, parcel_specific_humidity, parcel_condensate)
+    sv_up = virtual_temperature(
+        above_potential_temperature, above_specific_humidity, above_condensate)
+    slh = (LHE if phase == "water" else LHS) / SHA
+    qsat_above = saturation_specific_humidity(
+        above_potential_temperature * exner, pressure, phase)
+    return (sv_up - sv_dn) * exner + slh * (qsat_above - parcel_specific_humidity)
+
+
+def cloud_base_triggers(parcel_potential_temperature: jnp.ndarray,
+                        parcel_specific_humidity: jnp.ndarray,
+                        parcel_condensate: jnp.ndarray,
+                        above_potential_temperature: jnp.ndarray,
+                        above_specific_humidity: jnp.ndarray,
+                        above_condensate: jnp.ndarray,
+                        exner: jnp.ndarray,
+                        pressure: jnp.ndarray,
+                        phase: str = "water"):
+    """Whether moist convection triggers at the cloud-base interface.
+
+    Combines the two ``MSTCNV`` ``cloud_base_closure`` gates at level ``lmin+1``:
+
+    1. the source parcel is **saturated** when lifted to the interface
+       (``QDN >= QSAT(SDN*PLK, pres)``), and
+    2. the layer is **unstable** (:func:`cloud_base_instability` ``< 0``).
+
+    Both gates are necessary; either failing means "try the next level / no
+    convection here".
+
+    The boolean trigger is a **discontinuous** switch (the convective-triggering
+    branch the project notes flag); the underlying ``DMSE`` is continuous and
+    differentiable. Not yet oracle-validated (see
+    :func:`cloud_base_instability`).
+
+    Returns:
+        ``(triggers, dmse)`` -- a boolean per column and the continuous metric.
+    """
+    qsat_parcel = saturation_specific_humidity(
+        parcel_potential_temperature * exner, pressure, phase)
+    saturated = parcel_specific_humidity >= qsat_parcel
+    dmse = cloud_base_instability(
+        parcel_potential_temperature, parcel_specific_humidity, parcel_condensate,
+        above_potential_temperature, above_specific_humidity, above_condensate,
+        exner, pressure, phase)
+    return saturated & (dmse < 0.0), dmse
