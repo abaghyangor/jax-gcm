@@ -141,6 +141,28 @@ def moist_static_energy(temperature: jnp.ndarray,
     return SHA * temperature + geopotential + latent_heat * specific_humidity
 
 
+def d_ln_qsat_dt(temperature: jnp.ndarray, phase: str = "water") -> jnp.ndarray:
+    """``d(ln qsat)/dT = L / (RVAP * T^2)`` -- ModelE ``DLNQSATDT``.
+
+    Port of ModelE ``DLNQSATDT`` (``shared/Utilities.F90``), used by the
+    cloud-base mass-flux closure's saturation-adjustment terms. Note ModelE uses
+    this Clausius-Clapeyron form (with ``C = 1/RVAP``) even when ``wv_psat`` is
+    the Murphy & Koop expression -- a deliberate approximation we reproduce.
+
+    (Elsewhere we let JAX autodiff differentiate ``qsat`` directly; this analytic
+    form exists specifically to match the closure's Fortran arithmetic.)
+
+    Args:
+        temperature: Temperature [K].
+        phase: ``"water"`` (``LHE``) or ``"ice"`` (``LHS``). Static.
+
+    Returns:
+        ``d(ln qsat)/dT`` [1/K].
+    """
+    latent_heat = LHE if phase == "water" else LHS
+    return latent_heat / (RVAP * temperature ** 2)
+
+
 def virtual_temperature(temperature: jnp.ndarray,
                         specific_humidity: jnp.ndarray,
                         condensate: jnp.ndarray = 0.0) -> jnp.ndarray:
