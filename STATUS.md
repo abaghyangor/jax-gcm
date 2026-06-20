@@ -66,9 +66,20 @@ In **jax-gcm** (this repo):
   it is **not yet numerically validated** against a convectively active oracle
   (DYCOMS never triggers) -- absolute values stay provisional until BOMEX/RICO.
 
+- **Cloud-base mass-flux closure (`MASS_FLUX2`, nlpi=1)**
+  (`jcm/physics/convection/giss_mass_flux.py`, **4 tests passing**): faithful
+  single-source-level port of the bisection that finds the plume mass fraction
+  restoring the cloud base to neutral (`DMSE1 → 0`), including layer mass
+  redistribution and precip re-evaporation. The first piece that yields a
+  **nonzero rate**. Fixed 9-step bisection unrolled with `jnp.where` (so it's
+  differentiable and broadcasting-native). **Structure faithful; magnitude not
+  yet oracle-validated** — multi-source (`nlpi>1`) generalization deferred.
+
 These ported pieces are *not yet wired into the term* (`GissConvection` still
-returns zero) — they are the building blocks the cloud-base closure and plume
-code will use next.
+returns zero) — they are the building blocks the full plume scheme will use.
+The natural next steps are (a) wire trigger + closure into the term for a first
+end-to-end cloud-base diagnostic, and (b) validate magnitudes once a BOMEX/RICO
+oracle exists.
 
 In **modele-jcm-bridge** (separate repo):
 

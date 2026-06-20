@@ -124,6 +124,18 @@ class TestVirtualTemperature(unittest.TestCase):
         self.assertGreater(float(g), 0.0)
 
 
+class TestDLnQsatDt(unittest.TestCase):
+    def test_clausius_clapeyron_magnitude(self):
+        # ~6-7 %/K near room temperature (Clausius-Clapeyron).
+        d = float(gt.d_ln_qsat_dt(jnp.array(300.0), "water"))
+        self.assertGreater(d, 0.05)
+        self.assertLess(d, 0.075)
+
+    def test_decreases_with_temperature(self):
+        d = gt.d_ln_qsat_dt(jnp.array([260.0, 280.0, 300.0]))
+        self.assertTrue(jnp.all(jnp.diff(d) < 0))      # ~1/T^2 falloff
+
+
 class TestDifferentiability(unittest.TestCase):
     """JAX gives d(qsat)/dT for free -- no need to port ModelE's DLNQSATDT."""
 
