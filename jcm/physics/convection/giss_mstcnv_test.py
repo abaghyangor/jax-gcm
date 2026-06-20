@@ -90,6 +90,32 @@ class TestGissConvectionTerm(unittest.TestCase):
         self.assertTrue(jnp.all(jnp.isfinite(g.temperature)))
         self.assertTrue(jnp.all(jnp.isfinite(g.specific_humidity)))
 
+    def test_cloud_base_sentinel_without_pressure(self):
+        # With no pressure_full diagnostic the term is a pure scaffold: the
+        # cloud base is the "no cloud base" sentinel (nlev) and tendencies zero.
+        state = PhysicsState.ones(self.shape)
+        _, diag = self.term(state, {}, None, None)
+        self.assertTrue(jnp.all(diag["convection"].cloud_base == self.nlev))
+
+    def test_cloud_base_from_pressure_full(self):
+        # Provide a realistic column (JCM order: index 0 = top, last = surface)
+        # with a moist surface parcel; the term should find a cloud base.
+        nlev = 12
+        # pressure_full increases top -> surface (Pa).
+        pfull = jnp.linspace(20000.0, 100000.0, nlev)[:, None]   # (nlev, 1)
+        temperature = jnp.linspace(230.0, 298.0, nlev)[:, None]
+        specific_humidity = jnp.full((nlev, 1), 14.0)            # g/kg, moist
+        state = PhysicsState.zeros(
+            (nlev, 1), temperature=temperature,
+            specific_humidity=specific_humidity)
+
+        _, diag = self.term(state, {"pressure_full": pfull}, None, None)
+        cb = diag["convection"].cloud_base
+        self.assertEqual(cb.shape, (1,))
+        cb0 = int(cb[0])
+        self.assertGreater(cb0, 0)        # surface parcel not saturated at surface
+        self.assertLess(cb0, nlev)        # ...but condenses below model top
+
     def test_custom_params(self):
         term = GissConvection(
             params=GissConvectionParameters(dtsrc=jnp.array(900.0)),

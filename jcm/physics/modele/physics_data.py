@@ -26,11 +26,16 @@ class GissConvectionData:
         dth_mc: Moist-convective potential-temperature tendency, ``(nlev, ncols)``
             (oracle diagnostic ``dth_mc``).
         mcp: Moist-convective precipitation, ``(ncols,)`` (oracle ``mcp``).
+        cloud_base: Convective cloud-base level index per column, ``(ncols,)``,
+            in **surface-first** (ModelE) order -- index 0 is the surface, and the
+            sentinel value ``nlev`` means the surface parcel never saturates (no
+            cloud base / no convection). Integer-valued.
     """
 
     dq_mc: jnp.ndarray
     dth_mc: jnp.ndarray
     mcp: jnp.ndarray
+    cloud_base: jnp.ndarray
 
     @classmethod
     def zeros(cls, nodal_shape, nlev):
@@ -40,6 +45,7 @@ class GissConvectionData:
             dq_mc=jnp.zeros((nlev,) + nodal_shape),
             dth_mc=jnp.zeros((nlev,) + nodal_shape),
             mcp=jnp.zeros(nodal_shape),
+            cloud_base=jnp.zeros(nodal_shape, dtype=int),
         )
 
     @classmethod
@@ -48,13 +54,15 @@ class GissConvectionData:
             dq_mc=jnp.ones((nlev,) + nodal_shape),
             dth_mc=jnp.ones((nlev,) + nodal_shape),
             mcp=jnp.ones(nodal_shape),
+            cloud_base=jnp.ones(nodal_shape, dtype=int),
         )
 
-    def copy(self, dq_mc=None, dth_mc=None, mcp=None):
+    def copy(self, dq_mc=None, dth_mc=None, mcp=None, cloud_base=None):
         return GissConvectionData(
             dq_mc=dq_mc if dq_mc is not None else self.dq_mc,
             dth_mc=dth_mc if dth_mc is not None else self.dth_mc,
             mcp=mcp if mcp is not None else self.mcp,
+            cloud_base=cloud_base if cloud_base is not None else self.cloud_base,
         )
 
     def isnan(self):
