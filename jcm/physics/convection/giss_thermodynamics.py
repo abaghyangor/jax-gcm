@@ -60,6 +60,7 @@ GRAV = 9.80665                    # gravitational acceleration [m/s^2]
 LHE = 2.5e6                       # latent heat of evaporation [J/kg]
 LHM = 3.34e5                      # latent heat of melting [J/kg]
 LHS = LHE + LHM                   # latent heat of sublimation [J/kg]
+DELTX = _MAIR / _MWAT - 1.0       # virtual-temperature humidity coeff. (~0.6078)
 
 # Murphy & Koop (2005) fit validity limits used by ModelE wv_psat.
 _MK_WATER_TMIN, _MK_WATER_TMAX = 123.0, 332.0
@@ -138,3 +139,28 @@ def moist_static_energy(temperature: jnp.ndarray,
     """
     latent_heat = LHE if phase == "water" else LHS
     return SHA * temperature + geopotential + latent_heat * specific_humidity
+
+
+def virtual_temperature(temperature: jnp.ndarray,
+                        specific_humidity: jnp.ndarray,
+                        condensate: jnp.ndarray = 0.0) -> jnp.ndarray:
+    """Virtual (density) temperature [K]: ``T * (1 + DELTX*q - wm)``.
+
+    This is the buoyancy variable ``MSTCNV`` uses in the cloud-base closure
+    (``SVDN = SDN*(1 + DELTX*QDN - WMDN)``): water vapour makes a parcel lighter
+    (``+DELTX*q``) while suspended condensate loads it down (``-wm``). Applying
+    the same multiplicative factor to potential temperature instead of ``T``
+    yields the virtual *potential* temperature used for the edge values
+    ``SVUP``/``SVDN``.
+
+    Args:
+        temperature: Temperature (or potential temperature) [K].
+        specific_humidity: Water-vapour specific humidity [kg/kg].
+        condensate: Suspended condensate (liquid + ice) mixing ratio [kg/kg].
+            Defaults to 0 (no condensate loading).
+
+    Returns:
+        Virtual temperature [K] (or virtual potential temperature, matching the
+        input).
+    """
+    return temperature * (1.0 + DELTX * specific_humidity - condensate)
