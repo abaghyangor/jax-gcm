@@ -53,12 +53,18 @@ In **jax-gcm** (this repo):
   ModelE `QSAT` (saturation specific humidity), moist static energy, and virtual
   temperature (the buoyancy variable, with vapour + condensate loading), with
   exact ModelE constants and physically-grounded + gradient + broadcasting tests.
-- **Convective trigger — cloud base / LCL**
-  (`jcm/physics/convection/giss_cloud_base.py`, **7 tests passing**): faithful
-  port of the `MSTCNV` parcel-lift cloud-base detection (dry-adiabatic lift +
-  first level where the parcel saturates), vectorized broadcasting-native. The
-  continuous pieces are differentiable; the cloud-base *index* is a documented
-  discontinuous trigger.
+- **Convective trigger — cloud base + instability**
+  (`jcm/physics/convection/giss_cloud_base.py`, **13 tests passing**): faithful
+  ports of (a) the `MSTCNV` parcel-lift cloud-base detection (dry-adiabatic lift
+  + first saturated level) and (b) the cloud-base instability criterion
+  `DMSE = (SVUP-SVDN)*PLK + (L/cp)*(qsat_above - qdn)` plus the saturation gate
+  (`cloud_base_triggers`). Vectorized broadcasting-native; continuous pieces
+  differentiable, the trigger boolean a documented discontinuity.
+  **Note:** `DMSE`'s structure and sign were confirmed by reading the Fortran
+  (`SM=TH*MA` so `SUP`/`SDN` are potential temperatures, `PLK` is the Exner
+  function) and corroborated by worked unstable/stable cases in the tests, but
+  it is **not yet numerically validated** against a convectively active oracle
+  (DYCOMS never triggers) -- absolute values stay provisional until BOMEX/RICO.
 
 These ported pieces are *not yet wired into the term* (`GissConvection` still
 returns zero) — they are the building blocks the cloud-base closure and plume
