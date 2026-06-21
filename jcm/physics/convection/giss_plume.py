@@ -33,6 +33,7 @@ import jax
 import jax.numpy as jnp
 
 from jcm.physics.convection.giss_thermodynamics import (
+    GRAV,
     LHE,
     RGAS,
     RVAP,
@@ -96,3 +97,90 @@ def moist_adiabat_ascent(t_base: jnp.ndarray,
     _, (parcel_t, condensate) = jax.lax.scan(
         step, (t_base, p_base, cond0), pressure_levels)
     return parcel_t, condensate
+
+
+# --- Entraining updraft: Gregory (2001) cumulus velocity + entrainment --------
+# MSTCNV uses contce = 0.4 (less-entraining plume, no cold pools) and 0.6 (more-
+# entraining plume); the 1/6 coefficients are Gregory's. ``_TEENY`` guards the
+# 1/w^2 entrainment rate at/below cloud base where w can be tiny.
+_SIXTH = 1.0 / 6.0
+_TEENY = 1.0e-20
+
+
+def entrainment_rate(buoyancy: jnp.ndarray,
+                     updraft_speed: jnp.ndarray,
+                     contce: jnp.ndarray = 0.4) -> jnp.ndarray:
+    """Buoyancy-sorting fractional entrainment rate [1/m], MSTCNV / Gregory 2001.
+
+    ``ENT = (1/6)·contce·g·B / w²`` (``MSTCNV`` line 2916). More buoyant or slower
+    plumes entrain more; faster plumes entrain less. ``contce`` is the
+    entrainment-strength scaling (≈0.4 for the less-entraining plume, 0.6 for the
+    more-entraining one).
+
+    Args:
+        buoyancy: Fractional buoyancy ``B = (Tv_p − Tv_e)/Tv_e − condensate``.
+        updraft_speed: Updraft speed ``w`` [m/s] (from the level below).
+        contce: Entrainment-strength scaling (static or array).
+
+    Returns:
+        Fractional entrainment rate [1/m].
+    """
+    return _SIXTH * contce * GRAV * buoyancy / (updraft_speed ** 2 + _TEENY)
+
+
+def updraft_velocity(buoyancy: jnp.ndarray,
+                     layer_thickness: jnp.ndarray,
+                     w_base: jnp.ndarray,
+                     contce: jnp.ndarray = 0.4,
+                     detrainment: jnp.ndarray = 0.0):
+    """Integrate the Gregory (2001) cumulus updraft ``w²`` from cloud base up.
+
+    Per level (``MSTCNV`` lines 3112-3115)::
+
+        W2TEM = (1/6)·g·B − w(L-1)²·((2/3)·det + ent)
+        w²(L) = w²(L-1) + 2·dz·W2TEM
+
+    where ``ent`` is the buoyancy-sorting :func:`entrainment_rate` (computed from
+    the previous level's ``w``) and ``det`` is the detrainment rate (an input
+    here; the detrainment closure is a separate port — default 0). Buoyancy
+    production lifts ``w²``; entrainment/detrainment drag and negative buoyancy
+    bring it down. **Cloud top is the first level where ``w² ≤ 0``.**
+
+    Args:
+        buoyancy: Fractional buoyancy profile above cloud base, ``(n, ...)``,
+            ordered upward.
+        layer_thickness: Layer thickness ``dz = MA/ρ`` [m], ``(n, ...)``.
+        w_base: Cloud-base updraft speed [m/s], per column ``(...)``.
+        contce: Entrainment-strength scaling.
+        detrainment: Detrainment rate [1/m] (default 0; separate port).
+
+    Returns:
+        ``(w2, w, cloud_top)`` -- the updraft ``w²`` [m²/s²] and ``w`` [m/s]
+        profiles ``(n, ...)``, and the ``cloud_top`` level index ``(...)`` (first
+        level with ``w² ≤ 0``; sentinel ``n`` if the plume never stops in range).
+    """
+    det = jnp.broadcast_to(jnp.asarray(detrainment) * 1.0, buoyancy.shape)
+
+    def step(carry, inputs):
+        w2_prev, w_prev = carry
+        b, dz, det_l = inputs
+        ent = entrainment_rate(b, w_prev, contce)
+        w2tem = _SIXTH * GRAV * b - w_prev ** 2 * (2.0 * _SIXTH * det_l + ent)
+        w2 = w2_prev + 2.0 * dz * w2tem
+        # Safe sqrt: above cloud top w2 <= 0, and a bare sqrt(max(w2,0)) has an
+        # infinite derivative at 0 (NaN gradients). The double-``where`` keeps the
+        # sqrt argument >= 1 on the masked branch so the gradient stays finite.
+        positive = w2 > 0.0
+        w = jnp.where(positive, jnp.sqrt(jnp.where(positive, w2, 1.0)), 0.0)
+        w = jnp.minimum(w, 50.0)                    # MSTCNV caps |WCU| at 50 m/s
+        return (w2, w), (w2, w)
+
+    w_base = w_base * 1.0
+    _, (w2_prof, w_prof) = jax.lax.scan(
+        step, (w_base ** 2, w_base), (buoyancy, layer_thickness, det))
+
+    n = buoyancy.shape[0]
+    stopped = w2_prof <= 0.0
+    cloud_top = jnp.where(jnp.any(stopped, axis=0),
+                          jnp.argmax(stopped, axis=0), n)
+    return w2_prof, w_prof, cloud_top
