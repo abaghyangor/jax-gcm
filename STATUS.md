@@ -84,10 +84,33 @@ In **jax-gcm** (this repo):
   still zero** — converting the mass-flux closure into temperature/humidity
   tendencies is the next step and needs an active oracle to validate.
 
-The term thus computes a real diagnostic from state, but produces no tendencies
-yet. Remaining: wire the closure → tendencies, port the plume above cloud base
-(entrainment/condensation/downdrafts/precip), and validate magnitudes once a
-BOMEX/RICO oracle exists.
+- **Plume above cloud base — moist-adiabatic ascent (foundation)**
+  (`jcm/physics/convection/giss_plume.py`, **7 tests passing**): the undilute
+  saturated parcel ascent (saturated pseudoadiabat in `ln p`, condensing vapour
+  with latent heating). Building block for the entraining plume; tests are
+  self-consistency (warmer than dry adiabat, moist lapse rate, condensate,
+  differentiable). Entrainment / updraft velocity / detrainment / closure→
+  tendencies are the remaining plume steps.
+
+## First numerical validation against active convection (BOMEX)
+
+We generated a **convectively active oracle** by running ModelE on the
+NASA-provided BOMEX inputs (same pipeline as DYCOMS): all 48 periods convect,
+cloud base ~970–950 hPa, convective heating ~12 K/day, all precip convective.
+Recipe + config kept locally (`modelE/decks/bomex_scm.R`,
+`modelErc.bomex_scm.local`); oracle at
+`/Users/gor/ModelE_Support/huge_space/bomex_scm/`.
+
+**First Fortran-vs-JAX numerical agreement:** the ported cloud-base/LCL detection
+reproduces ModelE's *actual* convective cloud base to within one model level
+across all 48 BOMEX periods (38/48 exact). This validation — and the nonzero
+BOMEX oracle data it uses — lives in the **private `modele-jcm-bridge` repo**
+(`cloud_base_validation_test.py`, `data/bomex_validation.npz`), since it is real
+NASA-derived oracle data; the public fork stays code-only.
+
+Remaining: wire the closure → tendencies; port the entraining plume
+(entrainment/updraft/detrainment/subsidence) to reproduce the `dq_mc`/`dth_mc`
+*magnitudes* the BOMEX fixture holds; generate the RICO oracle (adds precip).
 
 In **modele-jcm-bridge** (separate repo):
 
