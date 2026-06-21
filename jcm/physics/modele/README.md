@@ -74,11 +74,16 @@ JAX_PLATFORMS=cpu python -m pytest \
    across all 48 BOMEX periods (38/48 exact). The BOMEX oracle and this numerical
    validation live in the private `modele-jcm-bridge` repo (real NASA-derived
    oracle data).
-7. ~~Start the plume above cloud base — moist-adiabatic ascent~~ **done** —
+7. ~~Plume above cloud base — moist-adiabatic ascent~~ **done** —
    `giss_plume.py` (undilute saturated ascent + condensation).
-8. Port the **entraining** plume (entrainment/detrainment + updraft velocity,
-   `plume_ent_det_w2`), then the compensating subsidence + detrainment that yield
-   the environmental tendencies, to reproduce the `dq_mc`/`dth_mc` *magnitudes*
-   the BOMEX fixture holds. Consider rerunning BOMEX with `SCM_PlumeDiag=1` to get
-   per-level plume diagnostics for validating these intermediate steps.
-9. Generate the RICO oracle (adds convective precipitation) the same way.
+8. ~~Entraining updraft — Gregory (2001) cumulus velocity + buoyancy-sorting
+   entrainment~~ **done** — `giss_plume.py` (`entrainment_rate`,
+   `updraft_velocity`): integrate `w²` up, entrainment as drag, cloud top where
+   `w² ≤ 0`. Detrainment is an input (its closure is a separate port).
+9. Couple the pieces: dilute the ascent by entrainment (mix environment into the
+   plume each level) so buoyancy → updraft → entrainment feed back, giving a
+   physically-determined cloud top; then the compensating subsidence + detrainment
+   that yield the environmental tendencies, to reproduce the `dq_mc`/`dth_mc`
+   *magnitudes* the BOMEX fixture holds. Consider rerunning BOMEX with
+   `SCM_PlumeDiag=1` for per-level plume diagnostics to validate these steps.
+10. Generate the RICO oracle (adds convective precipitation) the same way.

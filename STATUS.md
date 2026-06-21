@@ -84,13 +84,19 @@ In **jax-gcm** (this repo):
   still zero** — converting the mass-flux closure into temperature/humidity
   tendencies is the next step and needs an active oracle to validate.
 
-- **Plume above cloud base — moist-adiabatic ascent (foundation)**
-  (`jcm/physics/convection/giss_plume.py`, **7 tests passing**): the undilute
-  saturated parcel ascent (saturated pseudoadiabat in `ln p`, condensing vapour
-  with latent heating). Building block for the entraining plume; tests are
-  self-consistency (warmer than dry adiabat, moist lapse rate, condensate,
-  differentiable). Entrainment / updraft velocity / detrainment / closure→
-  tendencies are the remaining plume steps.
+- **Plume above cloud base — moist-adiabatic ascent + entraining updraft**
+  (`jcm/physics/convection/giss_plume.py`, **14 tests passing**):
+  - moist-adiabatic ascent (undilute saturated pseudoadiabat in `ln p`,
+    condensing vapour with latent heating);
+  - `entrainment_rate` — buoyancy-sorting fractional entrainment
+    `(1/6)·contce·g·B/w²` (MSTCNV / Gregory 2001);
+  - `updraft_velocity` — Gregory (2001) cumulus `w²` integration
+    `w²(L)=w²(L-1)+2·dz·[(1/6)·g·B − w²·((2/3)·det+ent)]`, with cloud top where
+    `w² ≤ 0`. Tests: updraft rises in the buoyant layer then caps, entrainment
+    weakens it, differentiable (safe-sqrt at cloud top).
+  Remaining plume steps: couple entrainment into the ascent (dilute buoyancy →
+  feedback), detrainment closure, and the compensating subsidence that yields the
+  environmental tendencies.
 
 ## First numerical validation against active convection (BOMEX)
 

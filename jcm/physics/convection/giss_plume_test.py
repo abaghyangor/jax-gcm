@@ -15,8 +15,10 @@ import jax.numpy as jnp
 from jcm.physics.convection.giss_thermodynamics import RGAS, SHA, GRAV
 from jcm.physics.convection.giss_cloud_base import dry_adiabatic_temperature
 from jcm.physics.convection.giss_plume import (
+    entrainment_rate,
     moist_adiabat_ascent,
     saturated_lapse_rate_dlnp,
+    updraft_velocity,
 )
 
 # Cloud-base-like start (warm, moist marine cumulus) and levels above it (Pa).
@@ -70,6 +72,60 @@ class TestMoistAdiabatAscent(unittest.TestCase):
         g = jax.grad(loss)(_T_BASE)
         self.assertTrue(jnp.isfinite(g))
         self.assertGreater(float(g), 0.0)        # warmer base -> warmer profile
+
+
+class TestEntrainmentRate(unittest.TestCase):
+    def test_positive_for_buoyant_plume(self):
+        self.assertGreater(
+            float(entrainment_rate(jnp.array(0.002), jnp.array(2.0))), 0.0)
+
+    def test_decreases_with_updraft_speed(self):
+        # Buoyancy-sorting: faster updrafts entrain less (~1/w^2).
+        slow = float(entrainment_rate(jnp.array(0.002), jnp.array(1.0)))
+        fast = float(entrainment_rate(jnp.array(0.002), jnp.array(4.0)))
+        self.assertGreater(slow, fast)
+
+    def test_scales_with_contce(self):
+        less = float(entrainment_rate(jnp.array(0.002), jnp.array(2.0), 0.4))
+        more = float(entrainment_rate(jnp.array(0.002), jnp.array(2.0), 0.6))
+        self.assertGreater(more, less)
+
+
+class TestUpdraftVelocity(unittest.TestCase):
+    def setUp(self):
+        # Buoyant cloud layer (8 levels) then a strong stable cap (4 levels)
+        # deep enough to decelerate the updraft back to zero within the domain.
+        self.buoy = jnp.concatenate([jnp.full(8, 0.003), jnp.full(4, -0.012)])
+        self.dz = jnp.full(12, 400.0)
+        self.w_base = jnp.array(1.0)
+
+    def test_w2_rises_then_falls_and_caps(self):
+        w2, w, top = updraft_velocity(self.buoy, self.dz, self.w_base)
+        self.assertGreater(float(w2[5]), float(w2[0]))        # grows in cloud layer
+        self.assertGreater(float(w[5]), 1.0)                  # several m/s updraft
+        top = int(top)
+        self.assertGreaterEqual(top, 8)                       # top is in the cap
+        self.assertLess(top, 12)                              # plume stopped in range
+        self.assertLessEqual(float(w2[top]), 0.0)             # plume stopped
+
+    def test_entrainment_weakens_updraft(self):
+        # No entrainment (contce=0) gives a stronger updraft than the
+        # entraining plume (the buoyancy-sorting drag removes kinetic energy).
+        w2_dry, _, _ = updraft_velocity(self.buoy, self.dz, self.w_base, contce=0.0)
+        w2_ent, _, _ = updraft_velocity(self.buoy, self.dz, self.w_base, contce=0.6)
+        self.assertGreater(float(w2_dry[5]), float(w2_ent[5]))
+
+    def test_more_buoyant_stronger_updraft(self):
+        w2_a, _, _ = updraft_velocity(self.buoy, self.dz, self.w_base)
+        w2_b, _, _ = updraft_velocity(self.buoy * 1.5, self.dz, self.w_base)
+        self.assertGreater(float(w2_b[5]), float(w2_a[5]))
+
+    def test_gradient_finite(self):
+        def loss(wb):
+            w2, _, _ = updraft_velocity(self.buoy, self.dz, wb)
+            return jnp.sum(jnp.maximum(w2, 0.0))
+        g = jax.grad(loss)(self.w_base)
+        self.assertTrue(jnp.isfinite(g))
 
 
 class TestBroadcasting(unittest.TestCase):
