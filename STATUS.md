@@ -102,8 +102,24 @@ In **jax-gcm** (this repo):
     more entrainment lowers cloud top; differentiable.
   Remaining plume steps: detrainment closure, and the compensating subsidence
   that turns the plume mass flux into the environmental tendencies (`dq_mc`/
-  `dth_mc`). A `SCM_PlumeDiag=1` rerun would expose ModelE's plume internals
-  (parcel T, updraft velocity, cloud top) to validate these steps directly.
+  `dth_mc`).
+
+### Plume validation finding (BOMEX cloud top)
+
+A `SCM_PlumeDiag=1` rerun was attempted to expose ModelE's plume *internals*
+(updraft speed, entrainment) for direct validation, but those are 4-D
+CACHED_SUBDD fields (`level × base_level`) registered lazily inside the physics
+call, which the standard `SUBDD` request path does not resolve at init — out of
+scope for now.
+
+Instead the entraining ascent was checked against ModelE's convective **cloud
+top** (highest `cldmc > 0` level) using the existing oracle. Finding: at the
+nominal entrainment our plume **overshoots** ModelE's cloud top by ~10 levels;
+the mechanism is correct (stronger entrainment lowers the top toward ModelE),
+but quantitative agreement needs the missing pieces — **detrainment** (caps the
+plume when buoyancy is lost), the **implicit entrainment limiter** (`MSTCNV`
+line 2928; our explicit coupling destabilizes at strong entrainment), and the
+**two-plume** structure. This is the next porting target.
 
 ## First numerical validation against active convection (BOMEX)
 
