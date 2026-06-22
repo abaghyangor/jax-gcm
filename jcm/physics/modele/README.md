@@ -80,10 +80,15 @@ JAX_PLATFORMS=cpu python -m pytest \
    entrainment~~ **done** — `giss_plume.py` (`entrainment_rate`,
    `updraft_velocity`): integrate `w²` up, entrainment as drag, cloud top where
    `w² ≤ 0`. Detrainment is an input (its closure is a separate port).
-9. Couple the pieces: dilute the ascent by entrainment (mix environment into the
-   plume each level) so buoyancy → updraft → entrainment feed back, giving a
-   physically-determined cloud top; then the compensating subsidence + detrainment
-   that yield the environmental tendencies, to reproduce the `dq_mc`/`dth_mc`
-   *magnitudes* the BOMEX fixture holds. Consider rerunning BOMEX with
-   `SCM_PlumeDiag=1` for per-level plume diagnostics to validate these steps.
-10. Generate the RICO oracle (adds convective precipitation) the same way.
+9. ~~Couple entrainment into the ascent~~ **done** — `giss_plume.py`
+   `entraining_plume_ascent` (+ `_saturation_adjust`): a self-consistent
+   single-plume march where the plume is carried as moist static energy + total
+   water, saturation-adjusted each level, its buoyancy drives the updraft and the
+   entrainment that then dilutes it — buoyancy → updraft → entrainment feedback,
+   physically-determined cloud top. (No detrainment/precip yet.)
+10. The compensating **subsidence + detrainment** that turn the plume mass flux
+    into the environmental tendencies, to reproduce the `dq_mc`/`dth_mc`
+    *magnitudes* the BOMEX fixture holds. Consider rerunning BOMEX with
+    `SCM_PlumeDiag=1` for per-level plume diagnostics to validate the plume
+    internals (parcel T, updraft velocity, cloud top) directly.
+11. Generate the RICO oracle (adds convective precipitation) the same way.

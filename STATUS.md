@@ -94,9 +94,16 @@ In **jax-gcm** (this repo):
     `w²(L)=w²(L-1)+2·dz·[(1/6)·g·B − w²·((2/3)·det+ent)]`, with cloud top where
     `w² ≤ 0`. Tests: updraft rises in the buoyant layer then caps, entrainment
     weakens it, differentiable (safe-sqrt at cloud top).
-  Remaining plume steps: couple entrainment into the ascent (dilute buoyancy →
-  feedback), detrainment closure, and the compensating subsidence that yields the
-  environmental tendencies.
+  - `entraining_plume_ascent` (+ `_saturation_adjust`) — a self-consistent
+    single-plume march: the plume (carried as moist static energy + total water)
+    is saturation-adjusted each level, its buoyancy drives the updraft and the
+    entrainment that then dilutes it (buoyancy → updraft → entrainment feedback),
+    giving a physically-determined cloud top. Tests: buoyant, condenses, caps;
+    more entrainment lowers cloud top; differentiable.
+  Remaining plume steps: detrainment closure, and the compensating subsidence
+  that turns the plume mass flux into the environmental tendencies (`dq_mc`/
+  `dth_mc`). A `SCM_PlumeDiag=1` rerun would expose ModelE's plume internals
+  (parcel T, updraft velocity, cloud top) to validate these steps directly.
 
 ## First numerical validation against active convection (BOMEX)
 
