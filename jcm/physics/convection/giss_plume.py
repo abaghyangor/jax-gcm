@@ -38,7 +38,9 @@ from jcm.physics.convection.giss_thermodynamics import (
     RGAS,
     RVAP,
     SHA,
+    d_ln_qsat_dt,
     saturation_specific_humidity,
+    virtual_temperature,
 )
 
 
@@ -184,3 +186,110 @@ def updraft_velocity(buoyancy: jnp.ndarray,
     cloud_top = jnp.where(jnp.any(stopped, axis=0),
                           jnp.argmax(stopped, axis=0), n)
     return w2_prof, w_prof, cloud_top
+
+
+# --- Coupled entraining plume -------------------------------------------------
+def _saturation_adjust(mse, geopotential, q_total, pressure, phase="water",
+                       n_newton=4):
+    """Split moist static energy + total water into ``(T, q_vapor, q_cond)``.
+
+    Given the plume's moist static energy ``h = cp·T + Φ + L·q_v`` and total water
+    ``q_t`` at a level, recover temperature and the vapour/condensate partition.
+    If ``q_t <= qsat`` the parcel is unsaturated (``q_v = q_t``, no condensate);
+    otherwise it is saturated (``q_v = qsat(T,p)``) and ``T`` solves
+    ``cp·T + Φ + L·qsat(T,p) = h`` by a few Newton steps (using the analytic
+    ``d ln qsat/dT``).
+    """
+    t_unsat = (mse - geopotential - LHE * q_total) / SHA
+    saturated = q_total > saturation_specific_humidity(t_unsat, pressure, phase)
+
+    t = t_unsat
+    for _ in range(n_newton):
+        qs = saturation_specific_humidity(t, pressure, phase)
+        f = SHA * t + geopotential + LHE * qs - mse
+        fprime = SHA + LHE * qs * d_ln_qsat_dt(t, phase)
+        t = t - f / fprime
+
+    t = jnp.where(saturated, t, t_unsat)
+    q_vapor = jnp.where(
+        saturated, saturation_specific_humidity(t, pressure, phase), q_total)
+    q_cond = jnp.maximum(q_total - q_vapor, 0.0)
+    return t, q_vapor, q_cond
+
+
+def entraining_plume_ascent(t_base, q_base, geopotential_base, p_base, w_base,
+                            env_temperature, env_vapor, geopotential,
+                            pressure, layer_thickness,
+                            contce=0.4, phase="water"):
+    """March a self-consistent entraining plume from cloud base to cloud top.
+
+    Couples the pieces ported separately: at each level the plume (carried as
+    moist static energy + total water) is saturation-adjusted, its buoyancy vs
+    the environment drives the Gregory updraft (:func:`updraft_velocity`'s
+    per-level law) and the buoyancy-sorting :func:`entrainment_rate`, and that
+    entrainment then mixes environmental air into the plume for the next level --
+    so buoyancy → updraft → entrainment → dilution feed back. Lifting between
+    levels conserves the plume's moist static energy; entrainment relaxes it
+    toward the environment by the fractional entrained mass ``ε·dz``.
+
+    This is the single-plume ascent **without detrainment or precipitation**
+    (those are separate ports), so condensate accumulates as suspended water.
+    Cloud top is the first level where ``w² ≤ 0``.
+
+    Args (cloud-base scalars per column ``(...)``; profiles ``(n, ...)`` above
+    cloud base, ordered upward):
+        t_base, q_base, geopotential_base, p_base: cloud-base parcel temperature
+            [K], saturated vapour [kg/kg], geopotential [m²/s²], pressure [Pa].
+        w_base: cloud-base updraft speed [m/s].
+        env_temperature, env_vapor: environment T [K] / vapour [kg/kg].
+        geopotential, pressure, layer_thickness: Φ [m²/s²], p [Pa], dz [m].
+        contce: entrainment-strength scaling.
+        phase: ``"water"`` or ``"ice"`` (static).
+
+    Returns:
+        ``(parcel_temperature, condensate, buoyancy, w2, cloud_top)`` -- profiles
+        ``(n, ...)`` and the ``cloud_top`` level index ``(...)``.
+    """
+    h_base = SHA * t_base + geopotential_base + LHE * q_base
+    qt_base = q_base
+    w_base = w_base * 1.0
+
+    def step(carry, inp):
+        h_p, qt_p, w2_prev, w_prev = carry
+        t_env, q_env, phi, p, dz = inp
+
+        # Saturation-adjust the (entrained, lifted) plume at this level.
+        t_p, qv_p, qc_p = _saturation_adjust(h_p, phi, qt_p, p, phase)
+
+        # Buoyancy: virtual temperature of plume vs environment (condensate
+        # loads the plume; the environment is taken cloud-free).
+        tv_p = virtual_temperature(t_p, qv_p, qc_p)
+        tv_e = virtual_temperature(t_env, q_env, 0.0)
+        buoyancy = (tv_p - tv_e) / tv_e
+
+        # Entrainment rate (buoyancy-sorting) and Gregory updraft update.
+        ent = entrainment_rate(buoyancy, w_prev, contce)
+        w2tem = _SIXTH * GRAV * buoyancy - w_prev ** 2 * ent
+        w2 = w2_prev + 2.0 * dz * w2tem
+        positive = w2 > 0.0
+        w = jnp.where(positive, jnp.sqrt(jnp.where(positive, w2, 1.0)), 0.0)
+        w = jnp.minimum(w, 50.0)
+
+        # Entrain environmental air into the plume for the next level: relax the
+        # conserved variables toward the environment by the entrained fraction.
+        frac = jnp.clip(ent * dz, 0.0, 1.0)
+        h_env = SHA * t_env + phi + LHE * q_env
+        h_next = h_p + frac * (h_env - h_p)
+        qt_next = qt_p + frac * (q_env - qt_p)
+
+        return (h_next, qt_next, w2, w), (t_p, qc_p, buoyancy, w2)
+
+    _, (parcel_t, condensate, buoyancy, w2_prof) = jax.lax.scan(
+        step, (h_base, qt_base, w_base ** 2, w_base),
+        (env_temperature, env_vapor, geopotential, pressure, layer_thickness))
+
+    n = env_temperature.shape[0]
+    stopped = w2_prof <= 0.0
+    cloud_top = jnp.where(jnp.any(stopped, axis=0),
+                          jnp.argmax(stopped, axis=0), n)
+    return parcel_t, condensate, buoyancy, w2_prof, cloud_top
