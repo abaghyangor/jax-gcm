@@ -150,9 +150,20 @@ that drives the compensating subsidence. Two findings from the BOMEX comparison:
 - Mass-flux tracking is nonetheless the right step: it is exactly what the
   **environmental tendencies** need.
 
-Next: use the mass-flux profile to compute the compensating subsidence +
-detrainment deposition → `dq_mc`/`dth_mc`, and validate the *magnitudes* against
-the BOMEX fixture (the real target, rather than the finicky cloud-top proxy).
+- **Compensating-subsidence tendency operator**
+  (`jcm/physics/convection/giss_tendencies.py`, **6 tests passing**):
+  `subsidence_tendency` — the upwind advection of the environmental profile by a
+  convective mass flux (`MSTCNV` subsidence loop / `apply_continuity_tendencies`),
+  the mechanism that turns mass flux into environmental warming/drying. Tests:
+  mass-weighted column conservation, correct upwind donor/sign (subsidence warms
+  below), zero-flux, differentiable, broadcasting. Single-step (omits `MSTCNV`'s
+  CFL substepping, valid for shallow convection).
+
+Next: assemble the convective mass-flux profile from the plume (closure
+magnitude + entrainment/detrainment continuity → the interface flux `CM`), add
+detrainment deposition, apply this operator to potential temperature and
+moisture, and validate the resulting `dq_mc`/`dth_mc` *magnitudes* against the
+BOMEX fixture.
 
 ## First numerical validation against active convection (BOMEX)
 
