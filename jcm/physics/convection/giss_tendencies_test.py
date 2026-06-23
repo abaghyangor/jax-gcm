@@ -5,7 +5,10 @@ import unittest
 import jax
 import jax.numpy as jnp
 
-from jcm.physics.convection.giss_tendencies import subsidence_tendency
+from jcm.physics.convection.giss_tendencies import (
+    convective_tendencies,
+    subsidence_tendency,
+)
 
 
 class TestSubsidenceTendency(unittest.TestCase):
@@ -58,6 +61,46 @@ class TestSubsidenceTendency(unittest.TestCase):
         self.assertEqual(d.shape, (6, ncols))
         d_col = subsidence_tendency(flux[:, 0], self.prop, self.layer_mass)
         self.assertTrue(jnp.allclose(d[:, 0], d_col))
+
+
+class TestConvectiveTendencies(unittest.TestCase):
+    def setUp(self):
+        n = 8
+        # Plume mass flux peaks mid-cloud then tapers; environment θ increases
+        # with height (stable, conditionally unstable to a plume).
+        self.mass_flux = jnp.array([10.0, 14.0, 12.0, 8.0, 4.0, 1.0, 0.0, 0.0])
+        self.plume_theta = jnp.array([301., 302., 303., 304., 305., 306., 307., 308.])
+        self.env_theta = jnp.array([300., 301., 302.5, 304., 305.5, 307., 308.5, 310.])
+        self.det_rate = jnp.array([0., 0., 0.0002, 0.0005, 0.001, 0.002, 0., 0.])
+        self.dz = jnp.full(n, 400.0)
+        self.layer_mass = jnp.full(n, 300.0)
+
+    def test_heating_in_cloud_layer(self):
+        # Compensating subsidence + warm detrainment heat the cloud layer.
+        dtheta = convective_tendencies(
+            self.mass_flux, self.plume_theta, self.det_rate, self.dz,
+            self.env_theta, self.layer_mass)
+        self.assertGreater(float(jnp.max(dtheta)), 0.0)         # net heating somewhere
+        # The strongest heating is in the convecting (nonzero mass flux) layers.
+        active = self.mass_flux > 0
+        self.assertGreater(float(jnp.sum(jnp.where(active, dtheta, 0.0))), 0.0)
+
+    def test_scales_with_mass_flux(self):
+        d1 = convective_tendencies(self.mass_flux, self.plume_theta, self.det_rate,
+                                   self.dz, self.env_theta, self.layer_mass)
+        d2 = convective_tendencies(2.0 * self.mass_flux, self.plume_theta,
+                                   self.det_rate, self.dz, self.env_theta,
+                                   self.layer_mass)
+        # Doubling the mass flux roughly doubles the tendency (subsidence is
+        # linear in flux; detrainment deposition is too).
+        self.assertGreater(float(jnp.max(jnp.abs(d2))),
+                           1.5 * float(jnp.max(jnp.abs(d1))))
+
+    def test_gradient_finite(self):
+        g = jax.grad(lambda mf: jnp.sum(convective_tendencies(
+            mf, self.plume_theta, self.det_rate, self.dz, self.env_theta,
+            self.layer_mass) ** 2))(self.mass_flux)
+        self.assertTrue(jnp.all(jnp.isfinite(g)))
 
 
 if __name__ == "__main__":

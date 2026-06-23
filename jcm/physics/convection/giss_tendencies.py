@@ -63,3 +63,46 @@ def subsidence_tendency(interface_flux: jnp.ndarray,
 
     # Mass-weighted convergence -> intensive tendency.
     return (flux_below - flux_above) / layer_mass
+
+
+def convective_tendencies(mass_flux, plume_property, detrainment_rate,
+                          layer_thickness, env_property, layer_mass):
+    """Environmental tendency of a property from one plume (per step).
+
+    Combines the two environmental effects of a convective plume on a conserved
+    property (potential temperature for ``dth_mc``, specific humidity for
+    ``dq_mc``):
+
+    1. **Compensating subsidence** -- the plume's upward mass flux forces an
+       equal environmental subsidence, advected by :func:`subsidence_tendency`
+       (the environment sinks, so the interface flux is ``−mass_flux``).
+    2. **Detrainment deposition** -- where the plume sheds mass
+       (``DM = mass_flux · det · dz``) it deposits its own (warmer/moister)
+       property into the layer: ``DM·(plume − env)/MA``.
+
+    This is a single plume and omits precipitation/evaporation and the
+    entrainment-removal bookkeeping; the **absolute magnitude scales with the
+    cloud-base mass flux** (the closure ``fmp2``), so it is calibrated only once
+    that scale and the two-plume sum are wired in. Broadcasting-native; the
+    returned tendency is a change over the step the mass flux represents.
+
+    Args:
+        mass_flux: Plume mass at each level above cloud base [kg/m²], ``(n, ...)``.
+        plume_property: Plume property per level (θ [K] or q [kg/kg]), ``(n, ...)``.
+        detrainment_rate: Detrainment rate [1/m], ``(n, ...)``.
+        layer_thickness: Layer thickness ``dz`` [m], ``(n, ...)``.
+        env_property: Environmental property per level, ``(n, ...)``.
+        layer_mass: Layer air mass ``MA`` [kg/m²], ``(n, ...)``.
+
+    Returns:
+        Per-layer environmental tendency of the property, ``(n, ...)``.
+    """
+    # Interface mass flux (between layers i and i+1) for the subsidence advection.
+    mf_interface = 0.5 * (mass_flux[:-1] + mass_flux[1:])
+    subsidence = subsidence_tendency(-mf_interface, env_property, layer_mass)
+
+    # Detrainment deposition of the plume property into each layer.
+    detrained_mass = mass_flux * detrainment_rate * layer_thickness
+    deposition = detrained_mass * (plume_property - env_property) / layer_mass
+
+    return subsidence + deposition

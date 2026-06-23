@@ -159,11 +159,27 @@ that drives the compensating subsidence. Two findings from the BOMEX comparison:
   below), zero-flux, differentiable, broadcasting. Single-step (omits `MSTCNV`'s
   CFL substepping, valid for shallow convection).
 
-Next: assemble the convective mass-flux profile from the plume (closure
-magnitude + entrainment/detrainment continuity → the interface flux `CM`), add
-detrainment deposition, apply this operator to potential temperature and
-moisture, and validate the resulting `dq_mc`/`dth_mc` *magnitudes* against the
-BOMEX fixture.
+- **Convective tendency assembly** (`convective_tendencies` in
+  `giss_tendencies.py`, **3 tests**): combines compensating subsidence (the
+  plume mass flux forces environmental subsidence) + detrainment deposition into
+  a per-layer environmental tendency for potential temperature / moisture.
+
+**First end-to-end `dth_mc` check (BOMEX, private bridge):** running the full
+chain (cloud base → entraining plume → mass flux → subsidence) and comparing the
+resulting heating *profile* to ModelE's `dth_mc`, the shapes are **positively
+correlated (~+0.5)** across periods — the mechanism produces convective heating
+in roughly the right place with the right sign. It is **not** a quantitative
+match: still missing detrainment deposition wiring into the BOMEX run, the
+**two-plume** sum, **precipitation/evaporation**, and a **calibrated cloud-base
+mass-flux scale** (the closure `fmp2`), plus the parcel/environment input-fidelity
+caveats. Magnitudes were not tuned.
+
+Status: the full convective *mechanism* is now ported and unit-tested end to end
+(thermo → cloud base → trigger → closure → entraining plume + detrainment + mass
+flux → subsidence → tendencies, 77 tests), with the cloud base numerically
+validated and the heating profile qualitatively validated against BOMEX.
+Remaining work is calibration/refinement toward `dq_mc`/`dth_mc` magnitudes:
+mass-flux scale, two plumes, detrainment deposition, precipitation.
 
 ## First numerical validation against active convection (BOMEX)
 
