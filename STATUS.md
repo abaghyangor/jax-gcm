@@ -135,9 +135,24 @@ drag, `MSTCNV` lines 2921-2925) and the **implicit entrainment limiter**
   comparable quantity is the plume-diagnostic `mc_pl_max`, which is the blocked
   CACHED_SUBDD field. `contce` was **not** tuned to force agreement.
 
-Next: the two-plume structure, and the compensating subsidence + detrainment
-deposition that turn the plume mass flux into the environmental tendencies
-(`dq_mc`/`dth_mc`).
+The plume now also **tracks its mass** (entrainment grows it, detrainment sheds
+it) with ModelE's `MINFRAC·MA` mass-cap, and returns the **mass-flux profile**
+that drives the compensating subsidence. Two findings from the BOMEX comparison:
+
+- Investigated whether the **two-plume** structure or the **mass cap** would
+  close the steady-period cloud-top overshoot. Neither does: the more-entraining
+  plume still overshoots ~+7, and the mass cap is *inactive* here (the kinematic
+  `w²≤0` cap fires first). The residual overshoot's cause is not yet pinned —
+  likely the cloud-base updraft `w_base` / parcel-vs-environment fidelity of the
+  inputs we feed, and/or the two-plume mass weighting — and the strictly
+  comparable target (`mc_pl_max`) is the blocked plume diagnostic. `contce` and
+  inputs were **not** tuned to force a match.
+- Mass-flux tracking is nonetheless the right step: it is exactly what the
+  **environmental tendencies** need.
+
+Next: use the mass-flux profile to compute the compensating subsidence +
+detrainment deposition → `dq_mc`/`dth_mc`, and validate the *magnitudes* against
+the BOMEX fixture (the real target, rather than the finicky cloud-top proxy).
 
 ## First numerical validation against active convection (BOMEX)
 
