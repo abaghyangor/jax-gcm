@@ -221,7 +221,8 @@ def _saturation_adjust(mse, geopotential, q_total, pressure, phase="water",
 def entraining_plume_ascent(t_base, q_base, geopotential_base, p_base, w_base,
                             env_temperature, env_vapor, geopotential,
                             pressure, layer_thickness,
-                            contce=0.4, phase="water"):
+                            contce=0.4, phase="water",
+                            m_base=1.0, layer_mass=None, minfrac=0.01):
     """March a self-consistent entraining plume from cloud base to cloud top.
 
     Couples the pieces ported separately: at each level the plume (carried as
@@ -233,9 +234,14 @@ def entraining_plume_ascent(t_base, q_base, geopotential_base, p_base, w_base,
     levels conserves the plume's moist static energy; entrainment relaxes it
     toward the environment by the fractional entrained mass ``ε·dz``.
 
-    This is the single-plume ascent **without detrainment or precipitation**
-    (those are separate ports), so condensate accumulates as suspended water.
-    Cloud top is the first level where ``w² ≤ 0``.
+    The plume's **mass** is tracked through the ascent: entrainment grows it
+    (``×(1+ε·dz)``), detrainment sheds it (``×(1−det·dz)``), and the plume
+    terminates either kinematically (``w² ≤ 0``) or when its mass falls below
+    ``minfrac·layer_mass`` (``MSTCNV`` line 1676) -- the mass cap that stops a
+    plume which has detrained itself out of existence even while ``w²`` is still
+    positive. The returned mass-flux profile is the quantity that drives the
+    compensating subsidence (the eventual ``dq_mc``/``dth_mc`` tendencies).
+    Single plume, no precipitation yet; condensate accumulates as suspended water.
 
     Args (cloud-base scalars per column ``(...)``; profiles ``(n, ...)`` above
     cloud base, ordered upward):
@@ -246,17 +252,22 @@ def entraining_plume_ascent(t_base, q_base, geopotential_base, p_base, w_base,
         geopotential, pressure, layer_thickness: Φ [m²/s²], p [Pa], dz [m].
         contce: entrainment-strength scaling.
         phase: ``"water"`` or ``"ice"`` (static).
+        m_base: cloud-base plume mass [kg/m²] (e.g. the closure ``fmp2``).
+        layer_mass: layer air mass ``MA = dp/g`` [kg/m²], ``(n, ...)``; if given,
+            the plume terminates when its mass ``≤ minfrac·layer_mass``.
+        minfrac: minimum plume / layer mass fraction for the mass cap.
 
     Returns:
-        ``(parcel_temperature, condensate, buoyancy, w2, cloud_top)`` -- profiles
-        ``(n, ...)`` and the ``cloud_top`` level index ``(...)``.
+        ``(parcel_temperature, condensate, buoyancy, w2, mass_flux, cloud_top)``
+        -- profiles ``(n, ...)`` and the ``cloud_top`` level index ``(...)``.
     """
     h_base = SHA * t_base + geopotential_base + LHE * q_base
     qt_base = q_base
     w_base = w_base * 1.0
+    m_base = jnp.asarray(m_base) * jnp.ones_like(w_base)
 
     def step(carry, inp):
-        h_p, qt_p, w2_prev, w_prev = carry
+        h_p, qt_p, w2_prev, w_prev, m = carry
         t_env, q_env, phi, p, dz = inp
 
         # Saturation-adjust the (entrained, lifted) plume at this level.
@@ -296,14 +307,23 @@ def entraining_plume_ascent(t_base, q_base, geopotential_base, p_base, w_base,
         h_next = h_p + frac * (h_env - h_p)
         qt_next = qt_p + frac * (q_env - qt_p)
 
-        return (h_next, qt_next, w2, w), (t_p, qc_p, buoyancy, w2)
+        # Plume mass: entrainment adds (1+ε·dz), detrainment sheds (1−det·dz)
+        # (capped at 0.95/level, MSTCNV line 2967). The two are mutually
+        # exclusive per level (ent>0 XOR det>0), so the product does the right
+        # thing in both phases.
+        delta = jnp.minimum(det * dz, 0.95)
+        m_next = m * (1.0 + ent * dz) * (1.0 - delta)
 
-    _, (parcel_t, condensate, buoyancy, w2_prof) = jax.lax.scan(
-        step, (h_base, qt_base, w_base ** 2, w_base),
+        return (h_next, qt_next, w2, w, m_next), (t_p, qc_p, buoyancy, w2, m_next)
+
+    _, (parcel_t, condensate, buoyancy, w2_prof, mass_flux) = jax.lax.scan(
+        step, (h_base, qt_base, w_base ** 2, w_base, m_base),
         (env_temperature, env_vapor, geopotential, pressure, layer_thickness))
 
     n = env_temperature.shape[0]
     stopped = w2_prof <= 0.0
+    if layer_mass is not None:
+        stopped = stopped | (mass_flux <= minfrac * layer_mass)
     cloud_top = jnp.where(jnp.any(stopped, axis=0),
                           jnp.argmax(stopped, axis=0), n)
-    return parcel_t, condensate, buoyancy, w2_prof, cloud_top
+    return parcel_t, condensate, buoyancy, w2_prof, mass_flux, cloud_top

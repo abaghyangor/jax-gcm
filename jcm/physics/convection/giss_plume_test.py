@@ -51,7 +51,7 @@ def _conditionally_unstable_sounding(n=16):
     return dict(t_base=t_base, q_base=q_base, geopotential_base=jnp.array(0.0),
                 p_base=p_base, w_base=jnp.array(1.0),
                 env_temperature=env_t, env_vapor=env_q, geopotential=phi,
-                pressure=p, layer_thickness=dz)
+                pressure=p, layer_thickness=dz, m_base=jnp.array(1.0))
 
 # Cloud-base-like start (warm, moist marine cumulus) and levels above it (Pa).
 _T_BASE = jnp.array(295.0)
@@ -192,17 +192,33 @@ class TestEntrainingPlumeAscent(unittest.TestCase):
         return entraining_plume_ascent(contce=contce, **self.s)
 
     def test_buoyant_and_condenses_then_caps(self):
-        t_p, cond, buoy, w2, top = self._run()
+        t_p, cond, buoy, w2, mflux, top = self._run()
         self.assertGreater(float(buoy[0]), 0.0)           # buoyant above base
         self.assertGreater(float(jnp.max(cond)), 0.0)     # cloud condensate forms
         self.assertGreater(float(jnp.max(w2)), 1.0)       # a real updraft develops
         self.assertLess(int(top), self.s["pressure"].shape[0])  # plume terminates
+        self.assertGreater(float(mflux[0]), 0.0)          # nonzero mass flux
+
+    def test_mass_grows_by_entrainment(self):
+        # Entrainment adds mass through the buoyant layer, so the plume mass
+        # rises above its cloud-base value before any detrainment.
+        *_, mflux, _ = self._run()
+        self.assertGreater(float(jnp.max(mflux)), float(self.s["m_base"]))
+
+    def test_mass_cap_can_terminate_plume(self):
+        # With a tiny cloud-base mass and a generous threshold, the mass cap
+        # (not w^2) sets the cloud top -- exercises the MINFRAC termination.
+        s = dict(self.s, m_base=jnp.array(1.0),
+                 layer_mass=jnp.full_like(self.s["layer_thickness"], 50.0),
+                 minfrac=0.5)
+        *_, top = entraining_plume_ascent(**s)
+        self.assertLess(int(top), self.s["pressure"].shape[0])
 
     def test_more_entrainment_lowers_cloud_top(self):
         # The entrainment feedback: a more strongly entraining plume is diluted
         # faster, loses buoyancy sooner, and tops out lower.
-        _, _, _, _, top_low = self._run(contce=0.2)
-        _, _, _, _, top_high = self._run(contce=0.8)
+        *_, top_low = self._run(contce=0.2)
+        *_, top_high = self._run(contce=0.8)
         self.assertGreaterEqual(int(top_low), int(top_high))
 
     def test_cloud_top_monotonic_in_entrainment(self):
@@ -210,7 +226,7 @@ class TestEntrainingPlumeAscent(unittest.TestCase):
         # stable: cloud top is monotonically non-increasing in entrainment
         # strength (the explicit-clip version went non-monotonic at strong
         # entrainment -- the bug this fixed).
-        tops = [int(self._run(contce=ce)[4]) for ce in [0.2, 0.5, 1.0, 2.0, 4.0]]
+        tops = [int(self._run(contce=ce)[-1]) for ce in [0.2, 0.5, 1.0, 2.0, 4.0]]
         self.assertTrue(all(tops[i] >= tops[i + 1] for i in range(len(tops) - 1)),
                         msg=f"non-monotonic cloud tops: {tops}")
 
@@ -218,7 +234,7 @@ class TestEntrainingPlumeAscent(unittest.TestCase):
         def loss(t_base):
             s = dict(self.s)
             s["t_base"] = t_base
-            _, _, _, w2, _ = entraining_plume_ascent(**s)
+            *_, w2, _, _ = entraining_plume_ascent(**s)
             return jnp.sum(jnp.maximum(w2, 0.0))
         g = jax.grad(loss)(self.s["t_base"])
         self.assertTrue(jnp.isfinite(g))
