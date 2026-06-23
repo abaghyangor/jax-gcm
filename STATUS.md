@@ -98,8 +98,11 @@ In **jax-gcm** (this repo):
     single-plume march: the plume (carried as moist static energy + total water)
     is saturation-adjusted each level, its buoyancy drives the updraft and the
     entrainment that then dilutes it (buoyancy → updraft → entrainment feedback),
-    giving a physically-determined cloud top. Tests: buoyant, condenses, caps;
-    more entrainment lowers cloud top; differentiable.
+    giving a physically-determined cloud top. Includes buoyancy-flip
+    **detrainment** (`DET = −ENT` when negatively buoyant) and the **implicit
+    entrainment limiter** (`ε·dz/(1+ε·dz)`), which make the coupling stable
+    (cloud top monotonic in entrainment). Tests: buoyant, condenses, caps;
+    more entrainment lowers cloud top monotonically; differentiable.
   Remaining plume steps: detrainment closure, and the compensating subsidence
   that turns the plume mass flux into the environmental tendencies (`dq_mc`/
   `dth_mc`).
@@ -113,13 +116,28 @@ call, which the standard `SUBDD` request path does not resolve at init — out o
 scope for now.
 
 Instead the entraining ascent was checked against ModelE's convective **cloud
-top** (highest `cldmc > 0` level) using the existing oracle. Finding: at the
-nominal entrainment our plume **overshoots** ModelE's cloud top by ~10 levels;
-the mechanism is correct (stronger entrainment lowers the top toward ModelE),
-but quantitative agreement needs the missing pieces — **detrainment** (caps the
-plume when buoyancy is lost), the **implicit entrainment limiter** (`MSTCNV`
-line 2928; our explicit coupling destabilizes at strong entrainment), and the
-**two-plume** structure. This is the next porting target.
+top** (highest `cldmc > 0` level) using the existing oracle.
+
+The diagnosed missing pieces have since been ported (`giss_plume.py`): the
+**buoyancy-flip detrainment** (negative buoyancy → `DET = −ENT`, adding `(2/3)·det`
+drag, `MSTCNV` lines 2921-2925) and the **implicit entrainment limiter**
+(`ε·dz/(1+ε·dz)`, line 2928). Results:
+
+- **Stability fixed:** cloud top is now monotonic in entrainment strength (the
+  explicit-clip version went non-monotonic / unstable at strong entrainment).
+- The initial period matches ModelE's cloud top to within one level.
+- **Residual:** several quasi-steady periods still overshoot by ~10 levels at
+  the nominal (less-entraining) `contce`. This is attributable to (a) the
+  **two-plume** structure not yet ported — ModelE's convective cloud top is
+  set by both plumes, the shallower more-entraining one capping lower — and
+  (b) a **definitional mismatch**: we compare our *kinematic* plume top
+  (`w² ≤ 0`) against ModelE's *cloud-fraction* top (`cldmc > 0`); the strictly
+  comparable quantity is the plume-diagnostic `mc_pl_max`, which is the blocked
+  CACHED_SUBDD field. `contce` was **not** tuned to force agreement.
+
+Next: the two-plume structure, and the compensating subsidence + detrainment
+deposition that turn the plume mass flux into the environmental tendencies
+(`dq_mc`/`dth_mc`).
 
 ## First numerical validation against active convection (BOMEX)
 

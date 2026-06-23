@@ -106,6 +106,7 @@ def moist_adiabat_ascent(t_base: jnp.ndarray,
 # entraining plume); the 1/6 coefficients are Gregory's. ``_TEENY`` guards the
 # 1/w^2 entrainment rate at/below cloud base where w can be tiny.
 _SIXTH = 1.0 / 6.0
+_TWO_THIRDS = 2.0 / 3.0   # detrainment-drag coefficient in the Gregory w^2 law
 _TEENY = 1.0e-20
 
 
@@ -167,7 +168,7 @@ def updraft_velocity(buoyancy: jnp.ndarray,
         w2_prev, w_prev = carry
         b, dz, det_l = inputs
         ent = entrainment_rate(b, w_prev, contce)
-        w2tem = _SIXTH * GRAV * b - w_prev ** 2 * (2.0 * _SIXTH * det_l + ent)
+        w2tem = _SIXTH * GRAV * b - w_prev ** 2 * (_TWO_THIRDS * det_l + ent)
         w2 = w2_prev + 2.0 * dz * w2tem
         # Safe sqrt: above cloud top w2 <= 0, and a bare sqrt(max(w2,0)) has an
         # infinite derivative at 0 (NaN gradients). The double-``where`` keeps the
@@ -267,17 +268,30 @@ def entraining_plume_ascent(t_base, q_base, geopotential_base, p_base, w_base,
         tv_e = virtual_temperature(t_env, q_env, 0.0)
         buoyancy = (tv_p - tv_e) / tv_e
 
-        # Entrainment rate (buoyancy-sorting) and Gregory updraft update.
-        ent = entrainment_rate(buoyancy, w_prev, contce)
-        w2tem = _SIXTH * GRAV * buoyancy - w_prev ** 2 * ent
+        # Buoyancy-sorting rate. When the plume is negatively buoyant the rate
+        # goes negative and MSTCNV converts it to *detrainment* (DET = -ENT,
+        # ENT = 0; lines 2921-2925): the plume stops entraining and instead sheds
+        # mass, which adds strong drag to the updraft and caps the cloud.
+        rate = entrainment_rate(buoyancy, w_prev, contce)
+        ent = jnp.maximum(rate, 0.0)
+        det = jnp.maximum(-rate, 0.0)
+
+        # Gregory updraft with entrainment + detrainment drag.
+        w2tem = _SIXTH * GRAV * buoyancy - w_prev ** 2 * (_TWO_THIRDS * det + ent)
         w2 = w2_prev + 2.0 * dz * w2tem
         positive = w2 > 0.0
         w = jnp.where(positive, jnp.sqrt(jnp.where(positive, w2, 1.0)), 0.0)
         w = jnp.minimum(w, 50.0)
 
-        # Entrain environmental air into the plume for the next level: relax the
-        # conserved variables toward the environment by the entrained fraction.
-        frac = jnp.clip(ent * dz, 0.0, 1.0)
+        # Entrain environmental air for the next level. Implicit (bounded)
+        # mixing fraction ``ε·dz/(1+ε·dz)`` -- MSTCNV's implicit entrainment
+        # limiter (line 2928) in intensive form; smooth and always in [0,1), so
+        # the explicit ``clip`` discontinuity that destabilized strong
+        # entrainment is gone. Only the entraining (buoyant) part dilutes the
+        # plume; detrainment removes mass without changing the remaining plume's
+        # intensive properties.
+        e = ent * dz
+        frac = e / (1.0 + e)
         h_env = SHA * t_env + phi + LHE * q_env
         h_next = h_p + frac * (h_env - h_p)
         qt_next = qt_p + frac * (q_env - qt_p)

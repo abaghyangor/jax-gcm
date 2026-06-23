@@ -205,6 +205,15 @@ class TestEntrainingPlumeAscent(unittest.TestCase):
         _, _, _, _, top_high = self._run(contce=0.8)
         self.assertGreaterEqual(int(top_low), int(top_high))
 
+    def test_cloud_top_monotonic_in_entrainment(self):
+        # The implicit entrainment limiter + detrainment make the coupling
+        # stable: cloud top is monotonically non-increasing in entrainment
+        # strength (the explicit-clip version went non-monotonic at strong
+        # entrainment -- the bug this fixed).
+        tops = [int(self._run(contce=ce)[4]) for ce in [0.2, 0.5, 1.0, 2.0, 4.0]]
+        self.assertTrue(all(tops[i] >= tops[i + 1] for i in range(len(tops) - 1)),
+                        msg=f"non-monotonic cloud tops: {tops}")
+
     def test_gradient_finite(self):
         def loss(t_base):
             s = dict(self.s)
