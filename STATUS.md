@@ -174,12 +174,40 @@ match: still missing detrainment deposition wiring into the BOMEX run, the
 mass-flux scale** (the closure `fmp2`), plus the parcel/environment input-fidelity
 caveats. Magnitudes were not tuned.
 
-Status: the full convective *mechanism* is now ported and unit-tested end to end
-(thermo → cloud base → trigger → closure → entraining plume + detrainment + mass
-flux → subsidence → tendencies, 77 tests), with the cloud base numerically
-validated and the heating profile qualitatively validated against BOMEX.
-Remaining work is calibration/refinement toward `dq_mc`/`dth_mc` magnitudes:
-mass-flux scale, two plumes, detrainment deposition, precipitation.
+- **Cloud-base mass-flux closure** (`cloud_base_mass_flux` in
+  `giss_cloud_base.py`, **4 tests**): faithful port of `MSTCNV` `MASS_FLUX2` --
+  the 9-step bisection that finds the plume fraction `FPLUME` (and
+  `fmp2 = FPLUME·AML(lmin)`) which neutralises the cloud-base moist-static-energy
+  jump. **This sets the absolute scale** every tendency magnitude depends on.
+  Single cloud-base sub-level (`nlpi=1`); fixed-iteration bisection via
+  `jnp.where` (vmap/grad-safe); includes the precip re-evaporation correction.
+
+**Magnitude calibration (BOMEX, private bridge) -- partial:**
+
+* The closure produces **physical** values for well-triggered columns:
+  `FPLUME ≈ 0.04-0.14`, `fmp2 ≈ 2-8 kg/m²` (source = the moist boundary-layer
+  parcel, saturated when lifted; `lmin = kb-1`).
+* Fixing a real bug found here: compensating subsidence must be applied in
+  **advective** form `(M/MA)·(θ_above-θ)`, *not* as a fixed-mass flux-divergence
+  of `M·θ` -- because the convective mass flux diverges (detrainment) and
+  `θ≈300 K` turns `θ·ΔM` into a huge spurious source. Detrainment deposition now
+  uses ModelE's implicit `[0,1)` fraction limiter. Both are in
+  `convective_tendencies`.
+* With the closure wired in, `dth_mc` reaches the **right order of magnitude**
+  (~1 K/day vs ModelE's few K/day) but is **not** matched: roughly **5-7× low**
+  and **wrong profile shape** (all warming, no cooling dipole). The gap is the
+  missing tendency terms -- **condensational heating** (dominant warming, not yet
+  deposited), **evaporative cooling**, entrainment removal, the **two-plume**
+  sum -- plus the closure **under-triggers** on ~1/3 of periods (`fmp2≈0.1`),
+  where the marginal-column ascent is ill-conditioned.
+
+Status: the convective chain is ported and unit-tested end to end (thermo →
+cloud base → trigger → **closure (scale)** → entraining plume + detrainment +
+mass flux → advective subsidence + detrainment deposition → tendencies; **222
+tests**). Cloud base numerically validated; closure gives physical mass fluxes;
+`dth_mc` at the right order of magnitude. Remaining toward a clean magnitude
+match: the condensational-heating / evaporative-cooling tendency terms, the
+two-plume sum, and closure robustness on marginal columns.
 
 ## First numerical validation against active convection (BOMEX)
 
