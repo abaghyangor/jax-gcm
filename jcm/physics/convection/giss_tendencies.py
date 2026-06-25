@@ -74,20 +74,29 @@ def convective_tendencies(mass_flux, plume_property, detrainment_rate,
     ``dq_mc``):
 
     1. **Compensating subsidence** -- the plume's upward mass flux forces an
-       equal environmental subsidence, advected by :func:`subsidence_tendency`
-       (the environment sinks, so the interface flux is ``−mass_flux``).
-    2. **Detrainment deposition** -- where the plume sheds mass
-       (``DM = mass_flux · det · dz``) it deposits its own (warmer/moister)
-       property into the layer: ``DM·(plume − env)/MA``.
+       equal environmental subsidence that brings higher-``property`` air down
+       from above, in **advective** form ``(M/MA)·(prop[L+1] − prop[L])``. This
+       is used rather than a flux-divergence of ``M·prop`` because the convective
+       mass flux *diverges* (the plume detrains, so ``M`` falls with height): the
+       advective form conserves a uniform profile and so introduces no spurious
+       source where ``M`` changes, whereas a fixed-mass flux-divergence of
+       ``M·prop`` would (``prop ≈ 300 K`` makes the error enormous). ModelE gets
+       the same result by updating the layer mass as ``CM`` diverges through its
+       subsidence substeps.
+    2. **Detrainment deposition** -- where the plume sheds mass it deposits its
+       own (warmer/moister) property: ``DM·(plume − env)/MA``, with the detrained
+       *fraction* bounded to ``[0, 1)`` by ModelE's implicit limiter
+       ``δ = (det·dz)/(1 + det·dz)`` so it can never shed more than the plume's
+       own mass (the raw ``det`` diverges as ``w² → 0`` near cloud top).
 
-    This is a single plume and omits precipitation/evaporation and the
-    entrainment-removal bookkeeping; the **absolute magnitude scales with the
-    cloud-base mass flux** (the closure ``fmp2``), so it is calibrated only once
-    that scale and the two-plume sum are wired in. Broadcasting-native; the
+    Single plume; omits precipitation/evaporation and the entrainment-removal
+    bookkeeping. The **absolute magnitude scales with the cloud-base mass flux**
+    (the closure ``fmp2`` seeding ``mass_flux``). Broadcasting-native; the
     returned tendency is a change over the step the mass flux represents.
 
     Args:
-        mass_flux: Plume mass at each level above cloud base [kg/m²], ``(n, ...)``.
+        mass_flux: Plume mass flux leaving each level upward [kg/m²], ``(n, ...)``
+            (``mass_flux[L]`` is the flux through the top of layer ``L``).
         plume_property: Plume property per level (θ [K] or q [kg/kg]), ``(n, ...)``.
         detrainment_rate: Detrainment rate [1/m], ``(n, ...)``.
         layer_thickness: Layer thickness ``dz`` [m], ``(n, ...)``.
@@ -97,12 +106,21 @@ def convective_tendencies(mass_flux, plume_property, detrainment_rate,
     Returns:
         Per-layer environmental tendency of the property, ``(n, ...)``.
     """
-    # Interface mass flux (between layers i and i+1) for the subsidence advection.
-    mf_interface = 0.5 * (mass_flux[:-1] + mass_flux[1:])
-    subsidence = subsidence_tendency(-mf_interface, env_property, layer_mass)
+    # Advective compensating subsidence: layer L is warmed/dried by the higher-
+    # property air subsiding from layer L+1, at rate (M/MA)*(prop[L+1]-prop[L]).
+    # The top layer has no layer above (and the plume mass flux there is ~0).
+    zero = jnp.zeros((1,) + env_property.shape[1:], dtype=env_property.dtype)
+    prop_above_minus = jnp.concatenate(
+        [env_property[1:] - env_property[:-1], zero], axis=0)
+    subsidence = mass_flux * prop_above_minus / layer_mass
 
-    # Detrainment deposition of the plume property into each layer.
-    detrained_mass = mass_flux * detrainment_rate * layer_thickness
+    # Detrainment deposition of the plume property into each layer, with the
+    # detrained *fraction* bounded to [0, 1) by ModelE's implicit limiter (the
+    # raw det*dz diverges as w^2 -> 0 near cloud top; the plume can shed at most
+    # its own mass).
+    detrained_depth = detrainment_rate * layer_thickness
+    detrained_fraction = detrained_depth / (1.0 + detrained_depth)
+    detrained_mass = mass_flux * detrained_fraction
     deposition = detrained_mass * (plume_property - env_property) / layer_mass
 
     return subsidence + deposition
