@@ -201,13 +201,40 @@ caveats. Magnitudes were not tuned.
   sum -- plus the closure **under-triggers** on ~1/3 of periods (`fmp2≈0.1`),
   where the marginal-column ascent is ill-conditioned.
 
+**Root-cause of the magnitude gap (decomposition on BOMEX period 36):** the gap
+is **not** a missing condensation term -- it is **plume over-penetration**. A
+level-by-level decomposition shows:
+
+* My plume tops out at **L28** (top of troposphere); ModelE's `dth_mc` is
+  nonzero only up to **L14** (the trade inversion) and exactly zero above.
+* My plume mass flux **grows** upward (1.0 → 2.9 kg/m², entrainment-dominated);
+  ModelE's must **shrink** (its heating peaks at cloud base and decays upward).
+* At the inversion (L15-18) my plume *does* go negatively buoyant, but only by
+  **−0.47 K** -- short of the `max_dt_overshoot = 1 K` termination -- so its `w²`
+  coasts through the thin negative zone and **re-buoys at L20** (+1.4 K) into a
+  spurious second deep-convective layer. ModelE's `w²` instead dies in that zone.
+
+So the latent heat *is* in the plume (θ_pl−θ_env up to +2.4 K, condensate present);
+adding a condensation term would just deposit heat into too-deep levels and would
+not fix the ~5-7× low, wrong-shape `dth_mc`. The real lever is **cloud-top
+termination / the entrainment-detrainment balance** -- the same hard frontier
+flagged earlier. The dilution *form* is verified correct (entrained fraction
+`ε·dz/(1+ε·dz)` matches ModelE `EPLUME/MPLUME`; detrainment leaves intensive
+properties unchanged), so this is calibration of entrainment strength + porting
+ModelE's full set of `cloud_top` exit conditions (`MSTCNV` lines 1675-1724:
+`w²≤0`, `MPLUME≤MINFRAC·MA`, `MPLUME≤0.01·MPLUME_base`, and the
+`max_dt_overshoot` virtual-temp-deficit exit), not a single fix. Needs a
+plume-internal reference to calibrate against, which the current oracle (state +
+`dth_mc`/`dq_mc` only, no mass-flux/plume diagnostics) does not provide.
+
 Status: the convective chain is ported and unit-tested end to end (thermo →
 cloud base → trigger → **closure (scale)** → entraining plume + detrainment +
 mass flux → advective subsidence + detrainment deposition → tendencies; **222
 tests**). Cloud base numerically validated; closure gives physical mass fluxes;
-`dth_mc` at the right order of magnitude. Remaining toward a clean magnitude
-match: the condensational-heating / evaporative-cooling tendency terms, the
-two-plume sum, and closure robustness on marginal columns.
+`dth_mc` at the right order of magnitude. The remaining magnitude gap is now
+**precisely diagnosed as plume over-penetration** (above). Closing it needs
+cloud-top-termination calibration against a plume-internal reference (extra
+ModelE diagnostics), plus the two-plume sum.
 
 ## First numerical validation against active convection (BOMEX)
 
