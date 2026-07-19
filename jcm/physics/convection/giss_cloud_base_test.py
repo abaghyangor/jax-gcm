@@ -16,7 +16,6 @@ import jax.numpy as jnp
 from jcm.physics.convection import giss_thermodynamics as gt
 from jcm.physics.convection.giss_cloud_base import (
     cloud_base_instability,
-    cloud_base_mass_flux,
     cloud_base_triggers,
     dry_adiabatic_temperature,
     lifting_condensation_level,
@@ -154,56 +153,6 @@ class TestBroadcasting(unittest.TestCase):
                 t0[j], p0[j], q0[j], _P)
             self.assertEqual(int(cb_block[j]), int(cb_col))
             self.assertEqual(bool(cond_block[j]), bool(cond_col))
-
-
-class TestCloudBaseMassFlux(unittest.TestCase):
-    # A BOMEX-like cloud base: moist boundary-layer parcel, stable environment
-    # above. theta in K, q in kg/kg, air mass ~ dp/g in kg/m^2.
-    def setUp(self):
-        # Strongly stratified environment so the closure bisection lands in the
-        # interior (a near-neutral base would pin FPLUME at its 0/1 bounds).
-        self.theta = jnp.array([298.7, 301.5, 304.5])     # source parcel, +1, +2
-        self.q = jnp.array([0.0150, 0.0090, 0.0060])      # moist parcel, drier above
-        self.air_mass = jnp.array([104.0, 100.0, 96.0])
-        self.exner = jnp.array([0.957, 0.948])
-        self.pressure = jnp.array([93000.0, 91000.0])     # Pa
-
-    def test_fplume_physical_range(self):
-        fplume, fmp2 = cloud_base_mass_flux(
-            self.theta, self.q, self.air_mass, self.exner, self.pressure)
-        # The bisection lives in (0, 1); a moist unstable base gives a real plume.
-        self.assertGreater(float(fplume), 0.0)
-        self.assertLess(float(fplume), 1.0)
-        self.assertAlmostEqual(float(fmp2), float(fplume) * float(self.air_mass[0]),
-                               places=4)
-
-    def test_more_unstable_gives_larger_plume(self):
-        # A moister source parcel is more unstable -> a stronger closure plume.
-        f_dry, _ = cloud_base_mass_flux(
-            self.theta, self.q.at[0].set(0.0150), self.air_mass,
-            self.exner, self.pressure)
-        f_moist, _ = cloud_base_mass_flux(
-            self.theta, self.q.at[0].set(0.0190), self.air_mass,
-            self.exner, self.pressure)
-        self.assertGreater(float(f_moist), float(f_dry))
-
-    def test_gradient_finite(self):
-        g = jax.grad(lambda th: cloud_base_mass_flux(
-            th, self.q, self.air_mass, self.exner, self.pressure)[1])(self.theta)
-        self.assertTrue(jnp.all(jnp.isfinite(g)))
-
-    def test_broadcasting(self):
-        ncols = 4
-        theta = jnp.tile(self.theta[:, None], (1, ncols))
-        q = jnp.tile(self.q[:, None], (1, ncols))
-        am = jnp.tile(self.air_mass[:, None], (1, ncols))
-        ex = jnp.tile(self.exner[:, None], (1, ncols))
-        pr = jnp.tile(self.pressure[:, None], (1, ncols))
-        fpl, fmp2 = cloud_base_mass_flux(theta, q, am, ex, pr)
-        self.assertEqual(fpl.shape, (ncols,))
-        fpl0, _ = cloud_base_mass_flux(
-            self.theta, self.q, self.air_mass, self.exner, self.pressure)
-        self.assertTrue(jnp.allclose(fpl[0], fpl0))
 
 
 if __name__ == "__main__":

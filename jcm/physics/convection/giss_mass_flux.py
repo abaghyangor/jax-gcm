@@ -19,10 +19,13 @@ bisection, the layer mass redistribution, and the precip re-evaporation
 
 Validation status
 -----------------
-Structure is a faithful read of the Fortran, but the **magnitude is not yet
-validated** against a convectively active oracle (DYCOMS never triggers). The
-tests assert closure *behaviour* -- the bisection drives ``DMSE1`` toward zero,
-a more unstable column yields a larger mass flux -- not Fortran agreement.
+Structure is a faithful read of the Fortran. On the convectively active **BOMEX**
+oracle the closure produces physical values (``FPLUME ~ 0.04-0.14``,
+``fmp2 ~ 2-8 kg/m^2``) for well-triggered columns, and the downstream ``dth_mc``
+lands at the right order of magnitude (see ``STATUS.md``). It is not a
+level-by-level Fortran match; the unit tests assert closure *behaviour* -- the
+bisection drives ``DMSE1`` toward zero, a more unstable column yields a larger
+mass flux -- rather than exact agreement.
 
 JAX notes
 ---------
@@ -52,40 +55,44 @@ _N_ITER = 9          # fixed bisection count, as in MASS_FLUX2
 _FEVAP_FRAC = 0.005  # precip re-evaporation fraction of FPLUME (Fortran FEVAP)
 
 
-def cloud_base_mass_flux(theta_dn, q_dn,
-                         theta_up, q_up,
-                         theta_up2, q_up2,
-                         mass1, mass2, mass3,
-                         exner1, exner2,
-                         pressure1, pressure2,
-                         wm_dn=0.0, wm_up=0.0,
-                         phase: str = "water"):
+def cloud_base_mass_flux(theta, specific_humidity, air_mass, exner, pressure,
+                         condensate=None, phase: str = "water"):
     """Cloud-base plume mass fraction that neutralizes the cloud base.
 
-    Single-source-level (``nlpi=1``) port of ``MASS_FLUX2``. Inputs are intensive
-    per-layer quantities for the source layer (``lmin``) and the two layers above
-    (``lmin+1``, ``lmin+2``); the routine forms the mass-weighted ``SM = theta*mass``
-    internally to match the Fortran redistribution.
+    Single-source-level (``nlpi=1``) port of ``MASS_FLUX2``. Inputs are the
+    three-level cloud-base stencil, **vertical on axis 0**: the source layer
+    (``lmin``) and the two layers above (``lmin+1``, ``lmin+2``). The routine
+    forms the mass-weighted ``SM = theta*mass`` internally to match the Fortran
+    redistribution. Broadcasting-native: the trailing axes are horizontal.
 
     Args:
-        theta_dn, q_dn: Source-layer potential temperature [K] / specific
-            humidity [kg/kg].
-        theta_up, q_up: Layer-above (``lmin+1``) potential temperature / humidity.
-        theta_up2, q_up2: Second-layer-above (``lmin+2``) potential temperature /
-            humidity.
-        mass1, mass2, mass3: Layer air masses [kg/m^2] for ``lmin``, ``lmin+1``,
-            ``lmin+2``.
-        exner1, exner2: Exner function at ``lmin`` and ``lmin+1``.
-        pressure1, pressure2: Pressure [Pa] at ``lmin`` and ``lmin+1``.
-        wm_dn, wm_up: Condensate loading [kg/kg] at source and layer-above.
+        theta: Potential temperature [K], ``(3, ...)`` at ``[lmin, lmin+1,
+            lmin+2]``. ``theta[0]`` is the boundary-layer source parcel.
+        specific_humidity: Specific humidity [kg/kg], ``(3, ...)`` at the same
+            levels.
+        air_mass: Layer air mass [kg/m^2], ``(3, ...)`` at the same levels.
+        exner: Exner function, ``(2, ...)`` at ``[lmin, lmin+1]``.
+        pressure: Pressure [Pa], ``(2, ...)`` at ``[lmin, lmin+1]``.
+        condensate: Optional cloud water [kg/kg], ``(2, ...)`` at ``[lmin,
+            lmin+1]`` (defaults to zero -- the loading terms ``wm_dn``/``wm_up``).
         phase: ``"water"`` or ``"ice"`` (static).
 
     Returns:
         ``(fplume, fmp2, dmse1)`` -- the plume mass fraction, the plume mass
-        ``fplume*mass1`` [kg/m^2], and the residual cloud-base instability after
-        closure (≈0 when neutralized). ``fplume`` is returned raw; the caller
-        applies the ``MSTCNV`` limiters (``MINFRAC``, the ``0.5*ma`` caps).
+        ``fplume*air_mass[0]`` [kg/m^2], and the residual cloud-base instability
+        after closure (≈0 when neutralized). ``fplume`` is returned raw; the
+        caller applies the ``MSTCNV`` limiters (``MINFRAC``, the ``0.5*ma`` caps).
     """
+    # Unpack the three-level stencil (axis 0) into the per-level names the
+    # MASS_FLUX2 redistribution below is written in.
+    theta_dn, theta_up, theta_up2 = theta[0], theta[1], theta[2]
+    q_dn, q_up, q_up2 = specific_humidity[0], specific_humidity[1], specific_humidity[2]
+    mass1, mass2, mass3 = air_mass[0], air_mass[1], air_mass[2]
+    exner1, exner2 = exner[0], exner[1]
+    pressure1, pressure2 = pressure[0], pressure[1]
+    wm_dn = 0.0 if condensate is None else condensate[0]
+    wm_up = 0.0 if condensate is None else condensate[1]
+
     # In MASS_FLUX2 both SLH and SLHE are formed from LHE (= LHE/SHA),
     # regardless of the LHX phase passed in for the qsat calls.
     slh = LHE / SHA

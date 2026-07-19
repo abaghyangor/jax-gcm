@@ -50,8 +50,8 @@ ENVIRONMENT COLUMN (T, q, p, z)
 | Module | LOC | Tests | Role | Faithfulness* |
 |---|---|---|---|---|
 | `giss_thermodynamics.py` | 188 | 20 | `QSAT`, `d_ln_qsat_dt`, `virtual_temperature`, `moist_static_energy`, constants | ~95% |
-| `giss_cloud_base.py` | 310 | 17 | LCL detection (argmax over saturation), `DMSE` trigger, **+ a MASS_FLUX2 closure** | detection validated; trigger ~85% |
-| `giss_mass_flux.py` | 155 | 4 | Earlier MASS_FLUX2 closure (per-level arg signature); currently **orphaned** | ~80% |
+| `giss_cloud_base.py` | 197 | 13 | LCL detection (argmax over saturation), `DMSE` trigger | detection validated; trigger ~85% |
+| `giss_mass_flux.py` | 160 | 4 | **The** MASS_FLUX2 closure — `cloud_base_mass_flux` (three-level stencil, array API, returns `fplume, fmp2, dmse1`) | ~80% |
 | `giss_plume.py` | 329 | 22 | Moist adiabat, Gregory entrainment/updraft, `entraining_plume_ascent` (scan over MSE+qt) | ~70% (over-penetration) |
 | `giss_tendencies.py` | 126 | 9 | `subsidence_tendency`, `convective_tendencies` (advective subsidence + bounded detrainment) | ~75% |
 | `giss_mstcnv.py` | 172 | 9 | `GissConvection(PhysicsTerm)` composable wrapper — **SCAFFOLD, not yet assembled** | n/a |
@@ -104,8 +104,9 @@ JAX functions column-by-column via the private bridge (`oracle.read_state_field`
    and it re-buoys above the inversion. Root cause is cloud-top termination /
    entrainment calibration, which needs a plume-internal oracle to fix
    principledly (extra ModelE diagnostics). Dilution *form* is verified correct.
-3. **Duplicate closure** — `giss_mass_flux.py::cloud_base_mass_flux` (earlier,
-   orphaned) and `giss_cloud_base.py::cloud_base_mass_flux` (newer) are both
-   faithful `nlpi=1` MASS_FLUX2 ports with different signatures. Reconcile to one.
-4. **Closure under-triggers** on ~1/3 of marginal columns; **two-plume sum** not
+3. **Closure under-triggers** on ~1/3 of marginal columns; **two-plume sum** not
    assembled; stale DYCOMS docstring in `giss_mstcnv.py`.
+
+_(Resolved 2026-07: the duplicate MASS_FLUX2 closure was reconciled to a single
+`giss_mass_flux.py::cloud_base_mass_flux` with the three-level array API; the
+copy in `giss_cloud_base.py` was removed.)_
