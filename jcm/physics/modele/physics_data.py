@@ -30,12 +30,17 @@ class GissConvectionData:
             in **surface-first** (ModelE) order -- index 0 is the surface, and the
             sentinel value ``nlev`` means the surface parcel never saturates (no
             cloud base / no convection). Integer-valued.
+        cloud_base_mass_flux: Cloud-base convective plume mass ``fmp2`` [kg/m^2]
+            per column, ``(ncols,)`` (the ``MASS_FLUX2`` closure output; zero
+            where there is no cloud base). Sets the scale of the -- not yet wired
+            -- convective tendencies.
     """
 
     dq_mc: jnp.ndarray
     dth_mc: jnp.ndarray
     mcp: jnp.ndarray
     cloud_base: jnp.ndarray
+    cloud_base_mass_flux: jnp.ndarray
 
     @classmethod
     def zeros(cls, nodal_shape, nlev):
@@ -46,6 +51,7 @@ class GissConvectionData:
             dth_mc=jnp.zeros((nlev,) + nodal_shape),
             mcp=jnp.zeros(nodal_shape),
             cloud_base=jnp.zeros(nodal_shape, dtype=int),
+            cloud_base_mass_flux=jnp.zeros(nodal_shape),
         )
 
     @classmethod
@@ -55,14 +61,19 @@ class GissConvectionData:
             dth_mc=jnp.ones((nlev,) + nodal_shape),
             mcp=jnp.ones(nodal_shape),
             cloud_base=jnp.ones(nodal_shape, dtype=int),
+            cloud_base_mass_flux=jnp.ones(nodal_shape),
         )
 
-    def copy(self, dq_mc=None, dth_mc=None, mcp=None, cloud_base=None):
+    def copy(self, dq_mc=None, dth_mc=None, mcp=None, cloud_base=None,
+             cloud_base_mass_flux=None):
         return GissConvectionData(
             dq_mc=dq_mc if dq_mc is not None else self.dq_mc,
             dth_mc=dth_mc if dth_mc is not None else self.dth_mc,
             mcp=mcp if mcp is not None else self.mcp,
             cloud_base=cloud_base if cloud_base is not None else self.cloud_base,
+            cloud_base_mass_flux=(cloud_base_mass_flux
+                                  if cloud_base_mass_flux is not None
+                                  else self.cloud_base_mass_flux),
         )
 
     def isnan(self):

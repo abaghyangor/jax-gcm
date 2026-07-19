@@ -26,7 +26,12 @@ from jcm.physics_interface import PhysicsState, PhysicsTendency
 from jcm.forcing import ForcingData
 from jcm.terrain import TerrainData
 from jcm.physics.composable_physics import ComposablePhysics
-from jcm.physics.convection.giss_mstcnv import GissConvection
+from jcm.physics.convection.giss_mstcnv import (
+    GissConvection,
+    cloud_base_closure_mass_flux,
+)
+from jcm.physics.convection.giss_mass_flux import cloud_base_mass_flux
+from jcm.physics.convection.giss_thermodynamics import KAPA
 from jcm.physics.modele.params import GissConvectionParameters
 from jcm.physics.modele.physics_data import GissConvectionData
 
@@ -124,6 +129,43 @@ class TestGissConvectionTerm(unittest.TestCase):
         self.assertEqual(float(term.params.get_value().dtsrc), 900.0)
         self.assertTrue(term.allow_mc)
 
+    def _moist_column(self, nlev=12):
+        # JCM order: index 0 = top, last = surface. Warm moist surface parcel
+        # under a cooler troposphere -> a real cloud base.
+        pfull = jnp.linspace(20000.0, 100000.0, nlev)[:, None]        # (nlev, 1) Pa
+        temperature = jnp.linspace(230.0, 298.0, nlev)[:, None]
+        specific_humidity = jnp.full((nlev, 1), 16.0)                 # g/kg
+        state = PhysicsState.zeros(
+            (nlev, 1), temperature=temperature,
+            specific_humidity=specific_humidity)
+        # air_density = p/(Rd T); layer_thickness chosen so density*thickness =
+        # |dp|/g (a physical layer mass ~ tens-hundreds kg/m^2).
+        density = pfull / (287.0 * temperature)
+        dp = jnp.abs(jnp.gradient(pfull, axis=0))
+        thickness = dp / (_G * density)
+        diagnostics = {"pressure_full": pfull, "layer_thickness": thickness,
+                       "air_density": density}
+        return state, diagnostics
+
+    def test_mass_flux_zero_without_layer_mass(self):
+        # With pressure but no layer-mass diagnostics: cloud base is found but the
+        # closure mass flux stays zero (degraded diagnostic).
+        state, diag = self._moist_column()
+        _, out = self.term(state, {"pressure_full": diag["pressure_full"]}, None, None)
+        conv = out["convection"]
+        self.assertLess(int(conv.cloud_base[0]), 12)                  # cloud base found
+        self.assertTrue(jnp.all(conv.cloud_base_mass_flux == 0.0))    # but no mass flux
+
+    def test_mass_flux_with_full_diagnostics(self):
+        # With pressure + layer mass, the closure runs and returns a finite,
+        # non-negative cloud-base mass flux of the right shape.
+        state, diag = self._moist_column()
+        _, out = self.term(state, diag, None, None)
+        fmp2 = out["convection"].cloud_base_mass_flux
+        self.assertEqual(fmp2.shape, (1,))
+        self.assertTrue(jnp.all(jnp.isfinite(fmp2)))
+        self.assertTrue(jnp.all(fmp2 >= 0.0))
+
 
 class TestGissConvectionComposition(unittest.TestCase):
     """The term must compose and run inside ComposablePhysics."""
@@ -203,6 +245,61 @@ class TestGissScaffoldVsDycomsFixture(unittest.TestCase):
         self.assertTrue(np.allclose(np.asarray(conv.mcp).ravel(),
                                     data["mcp"].ravel()))
         self.assertTrue(jnp.all(tend.temperature == 0))
+
+
+class TestCloudBaseClosureMassFlux(unittest.TestCase):
+    """The (nlev,...) gather wrapper around the MASS_FLUX2 closure."""
+
+    def setUp(self):
+        # Surface-first column (index 0 = surface): warm moist surface, cooling
+        # and drying with height.
+        self.nlev = 8
+        self.t = jnp.array(
+            [300., 297., 294., 291., 288., 285., 282., 279.])[:, None]
+        self.q = jnp.array(
+            [0.018, 0.012, 0.010, 0.008, 0.006, 0.005, 0.004, 0.003])[:, None]
+        self.p = jnp.linspace(100000.0, 65000.0, self.nlev)[:, None]
+        self.air_mass = jnp.full((self.nlev, 1), 100.0)
+
+    def test_matches_hand_built_stencil(self):
+        # cloud_base = 2 -> source level lmin = 1 -> stencil [lmin, lmin+1, lmin+2]
+        # = levels [1, 2, 3], with the source (index 0) replaced by the surface.
+        cloud_base = jnp.array([2])
+        _, fmp2 = cloud_base_closure_mass_flux(
+            self.t, self.q, self.p, self.air_mass, cloud_base)
+
+        exner = (self.p / 100000.0) ** KAPA
+        theta = self.t / exner
+        theta3 = jnp.array([theta[0, 0], theta[2, 0], theta[3, 0]])   # index0 = surface
+        q3 = jnp.array([self.q[0, 0], self.q[2, 0], self.q[3, 0]])
+        air_mass3 = jnp.array([100.0, 100.0, 100.0])                  # levels 1,2,3
+        exner2 = jnp.array([exner[1, 0], exner[2, 0]])
+        pressure2 = jnp.array([self.p[1, 0], self.p[2, 0]])
+        _, fmp2_expected, _ = cloud_base_mass_flux(
+            theta3, q3, air_mass3, exner2, pressure2)
+
+        self.assertAlmostEqual(float(fmp2[0]), float(fmp2_expected), places=5)
+
+    def test_no_cloud_base_is_zero(self):
+        # Sentinel cloud base (== nlev) => no cloud => zero mass flux.
+        cloud_base = jnp.array([self.nlev])
+        fplume, fmp2 = cloud_base_closure_mass_flux(
+            self.t, self.q, self.p, self.air_mass, cloud_base)
+        self.assertEqual(float(fmp2[0]), 0.0)
+        self.assertEqual(float(fplume[0]), 0.0)
+
+    def test_broadcasting_matches_single_column(self):
+        cloud_base = jnp.array([2, 3])
+        t = jnp.concatenate([self.t, self.t + 1.0], axis=1)
+        q = jnp.concatenate([self.q, self.q], axis=1)
+        p = jnp.concatenate([self.p, self.p], axis=1)
+        am = jnp.concatenate([self.air_mass, self.air_mass], axis=1)
+        _, fmp2 = cloud_base_closure_mass_flux(t, q, p, am, cloud_base)
+        self.assertEqual(fmp2.shape, (2,))
+        # Column 0 must match running that single column alone.
+        _, fmp2_col0 = cloud_base_closure_mass_flux(
+            self.t, self.q, self.p, self.air_mass, jnp.array([2]))
+        self.assertAlmostEqual(float(fmp2[0]), float(fmp2_col0[0]), places=5)
 
 
 if __name__ == "__main__":

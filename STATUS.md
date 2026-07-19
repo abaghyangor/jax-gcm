@@ -236,6 +236,18 @@ tests**). Cloud base numerically validated; closure gives physical mass fluxes;
 cloud-top-termination calibration against a plume-internal reference (extra
 ModelE diagnostics), plus the two-plume sum.
 
+**Convection term — closure diagnostic wired in.** `GissConvection`
+(`giss_mstcnv.py`) is no longer a pure scaffold: it now diagnoses `cloud_base`
+and the closure `cloud_base_mass_flux` (`fmp2`) from the state, exposed in
+`GissConvectionData`. Broadcasting-native over `(nlev, ncols)` via
+`take_along_axis` (per-column cloud-base gather, no `vmap`), handling the JCM
+top-first ↔ GISS surface-first flip and g/kg↔kg/kg. Verified to **reproduce the
+standalone BOMEX closure** (cloud base within 1 level; `fmp2` 14.5/4.2/6.8 kg/m²
+for periods 12/36/47, matching the pre-relaxation closure values). **Tendencies
+remain zero** — the plume→subsidence→`dth_mc`/`dq_mc` chain is deliberately not
+wired in yet (it over-penetrates); when it is, it will be gated behind
+`allow_mc` (default off). 223 convection/modele tests pass.
+
 ## First numerical validation against active convection (BOMEX)
 
 We generated a **convectively active oracle** by running ModelE on the
