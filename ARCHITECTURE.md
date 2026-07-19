@@ -54,7 +54,7 @@ ENVIRONMENT COLUMN (T, q, p, z)
 | `giss_mass_flux.py` | 160 | 4 | **The** MASS_FLUX2 closure — `cloud_base_mass_flux` (three-level stencil, array API, returns `fplume, fmp2, dmse1`) | ~80% |
 | `giss_plume.py` | 329 | 22 | Moist adiabat, Gregory entrainment/updraft, `entraining_plume_ascent` (scan over MSE+qt) | ~70% (over-penetration) |
 | `giss_tendencies.py` | 126 | 9 | `subsidence_tendency`, `convective_tendencies` (advective subsidence + bounded detrainment) | ~75% |
-| `giss_mstcnv.py` | 172 | 9 | `GissConvection(PhysicsTerm)` composable wrapper — **SCAFFOLD, not yet assembled** | n/a |
+| `giss_mstcnv.py` | 240 | 14 | `GissConvection(PhysicsTerm)` — diagnoses `cloud_base` + closure `cloud_base_mass_flux` (validated); **tendencies still zero** (plume chain not wired) | integration validated |
 | `jcm/physics/modele/` | — | — | `GissConvectionParameters`, `GissConvectionData` structs | — |
 
 \* Faithfulness = subjective confidence the JAX matches MSTCNV's intent; only
@@ -95,10 +95,12 @@ JAX functions column-by-column via the private bridge (`oracle.read_state_field`
 
 ## Known issues / open work
 
-1. **Chain not assembled** — `GissConvection` is a scaffold that only imports
-   `lifting_condensation_level`; its docstring still references the old DYCOMS
-   oracle (stale — we moved to BOMEX). We have a validated library of functions,
-   not a live convection term.
+1. **Tendency chain not wired into the term** — `GissConvection` now diagnoses
+   `cloud_base` and the closure `cloud_base_mass_flux` (broadcasting-native via
+   `take_along_axis`; verified to reproduce the standalone BOMEX closure), but
+   still returns **zero tendencies**. Wiring the plume ascent → subsidence →
+   `dth_mc`/`dq_mc` is the next step, and will be gated behind `allow_mc`
+   (default off) because those tendencies over-penetrate (issue 2).
 2. **Plume over-penetration** (the magnitude blocker) — the plume tops out ~L28
    vs ModelE's L14 (trade inversion), its mass flux grows instead of shrinking,
    and it re-buoys above the inversion. Root cause is cloud-top termination /
