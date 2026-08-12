@@ -52,9 +52,9 @@ ENVIRONMENT COLUMN (T, q, p, z)
 | `giss_thermodynamics.py` | 188 | 20 | `QSAT`, `d_ln_qsat_dt`, `virtual_temperature`, `moist_static_energy`, constants | ~95% |
 | `giss_cloud_base.py` | 197 | 13 | LCL detection (argmax over saturation), `DMSE` trigger | detection validated; trigger ~85% |
 | `giss_mass_flux.py` | 160 | 4 | **The** MASS_FLUX2 closure — `cloud_base_mass_flux` (three-level stencil, array API, returns `fplume, fmp2, dmse1`) | ~80% |
-| `giss_plume.py` | 329 | 22 | Moist adiabat, Gregory entrainment/updraft, `entraining_plume_ascent` (scan over MSE+qt) | ~70% (over-penetration) |
+| `giss_plume.py` | ~430 | 28 | Moist adiabat, Gregory entrainment/updraft, `_plume_core`, `entraining_plume_ascent` (base-relative) + `plume_ascent_column` (full-column, traced-cloud-base launch) | ~75% |
 | `giss_tendencies.py` | 126 | 9 | `subsidence_tendency`, `convective_tendencies` (advective subsidence + bounded detrainment) | ~75% |
-| `giss_mstcnv.py` | 240 | 14 | `GissConvection(PhysicsTerm)` — diagnoses `cloud_base` + closure `cloud_base_mass_flux` (validated); **tendencies still zero** (plume chain not wired) | integration validated |
+| `giss_mstcnv.py` | ~330 | 18 | `GissConvection(PhysicsTerm)` — diagnoses `cloud_base`+`cloud_base_mass_flux`; under `allow_mc` runs the **full tendency chain** → `dth_mc`/`dq_mc` | integration validated; tendencies not magnitude-validated |
 | `jcm/physics/modele/` | — | — | `GissConvectionParameters`, `GissConvectionData` structs | — |
 
 \* Faithfulness = subjective confidence the JAX matches MSTCNV's intent; only
@@ -95,12 +95,16 @@ JAX functions column-by-column via the private bridge (`oracle.read_state_field`
 
 ## Known issues / open work
 
-1. **Tendency chain not wired into the term** — `GissConvection` now diagnoses
-   `cloud_base` and the closure `cloud_base_mass_flux` (broadcasting-native via
-   `take_along_axis`; verified to reproduce the standalone BOMEX closure), but
-   still returns **zero tendencies**. Wiring the plume ascent → subsidence →
-   `dth_mc`/`dq_mc` is the next step, and will be gated behind `allow_mc`
-   (default off) because those tendencies over-penetrate (issue 2).
+1. **Tendencies not magnitude-validated** — `GissConvection` now runs the full
+   chain under `allow_mc` (default off): closure → `plume_ascent_column` (launched
+   at the traced cloud base) → subsidence + detrainment deposition →
+   `dth_mc`/`dq_mc`. On BOMEX the peak `dth_mc` is within ~2× of ModelE for
+   well-triggered columns and the plume tops out near the inversion (the earlier
+   "over-penetration to L28" was largely an experiment bug — `fmp2` mis-fed as
+   `w_base`). Still: under-triggers on some columns; missing evaporative/
+   entrainment-removal cooling, so vertical shape is imperfect. Proper validation
+   needs the plume-internal ModelE oracle (issue 2). `_CONTCE`/`_CLOUD_BASE_W`
+   should graduate to differentiable `GissConvectionParameters` leaves.
 2. **Plume over-penetration** (the magnitude blocker) — the plume tops out ~L28
    vs ModelE's L14 (trade inversion), its mass flux grows instead of shrinking,
    and it re-buoys above the inversion. Root cause is cloud-top termination /

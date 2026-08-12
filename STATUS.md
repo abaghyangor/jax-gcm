@@ -243,10 +243,25 @@ and the closure `cloud_base_mass_flux` (`fmp2`) from the state, exposed in
 `take_along_axis` (per-column cloud-base gather, no `vmap`), handling the JCM
 top-first ↔ GISS surface-first flip and g/kg↔kg/kg. Verified to **reproduce the
 standalone BOMEX closure** (cloud base within 1 level; `fmp2` 14.5/4.2/6.8 kg/m²
-for periods 12/36/47, matching the pre-relaxation closure values). **Tendencies
-remain zero** — the plume→subsidence→`dth_mc`/`dq_mc` chain is deliberately not
-wired in yet (it over-penetrates); when it is, it will be gated behind
-`allow_mc` (default off). 223 convection/modele tests pass.
+for periods 12/36/47, matching the pre-relaxation closure values). 223
+convection/modele tests pass.
+
+**Convection term — full tendency path wired (under `allow_mc`).** The term now
+runs the complete chain when `allow_mc=True` (default off, mirroring ModelE
+`SCMopt%allowMC`): closure `fmp2` → `plume_ascent_column` (a new full-column
+entraining ascent *launched at the traced cloud base* via `jnp.where` masking,
+so JAX's static-shape constraint is respected) → compensating subsidence +
+detrainment deposition → `dth_mc`/`dq_mc`, returned as temperature/humidity
+tendencies (surface-first internally, flipped to JCM top-first). Differentiable,
+broadcasting-native, off→zero. On BOMEX the peak `dth_mc` is **within ~2× of
+ModelE** for well-triggered columns (+4.9/+9.2/+15.9 vs +9.1/+10.7/+7.1 K/day for
+periods 36/47/12) and the plume **tops out near the inversion** (~L10-15 vs
+ModelE ~L14) — the earlier "over-penetration to L28" was largely an experiment
+bug (`fmp2` was mis-fed as `w_base`, a huge initial updraft). Not yet
+magnitude-validated: under-triggers on some columns, missing evaporative/
+entrainment cooling (weak `dth_mc` minima). `_CONTCE`/`_CLOUD_BASE_W` are module
+constants that should become differentiable params. **233 convection/modele
+tests pass** (+10: 4 `allow_mc`, 6 `plume_ascent_column`).
 
 ## First numerical validation against active convection (BOMEX)
 
