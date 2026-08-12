@@ -166,6 +166,44 @@ class TestGissConvectionTerm(unittest.TestCase):
         self.assertTrue(jnp.all(jnp.isfinite(fmp2)))
         self.assertTrue(jnp.all(fmp2 >= 0.0))
 
+    # --- allow_mc tendency path (structural; magnitudes not validated) ---
+    def test_allow_mc_off_returns_zero_tendency(self):
+        state, diag = self._moist_column()
+        tend, _ = GissConvection(allow_mc=False)(state, diag, None, None)
+        self.assertTrue(jnp.all(tend.temperature == 0))
+        self.assertTrue(jnp.all(tend.specific_humidity == 0))
+
+    def test_allow_mc_produces_finite_heating(self):
+        # With convection on, the term produces finite tendencies and net
+        # heating somewhere in the column (compensating subsidence warms).
+        state, diag = self._moist_column()
+        tend, out = GissConvection(allow_mc=True)(state, diag, None, None)
+        self.assertTrue(jnp.all(jnp.isfinite(tend.temperature)))
+        self.assertTrue(jnp.all(jnp.isfinite(tend.specific_humidity)))
+        self.assertGreater(float(jnp.max(tend.temperature)), 0.0)
+        self.assertTrue(jnp.any(out["convection"].dth_mc != 0))
+
+    def test_allow_mc_zero_without_layer_mass(self):
+        # The tendency path needs layer-mass diagnostics; without them it is zero
+        # even though allow_mc is set (cloud base is still diagnosed).
+        state, diag = self._moist_column()
+        tend, out = GissConvection(allow_mc=True)(
+            state, {"pressure_full": diag["pressure_full"]}, None, None)
+        self.assertTrue(jnp.all(tend.temperature == 0))
+        self.assertLess(int(out["convection"].cloud_base[0]), 12)
+
+    def test_allow_mc_differentiable(self):
+        state, diag = self._moist_column()
+        term = GissConvection(allow_mc=True)
+
+        def loss(temperature):
+            s = state.copy(temperature=temperature)
+            tend, _ = term(s, diag, None, None)
+            return jnp.sum(tend.temperature ** 2)
+
+        g = jax.grad(loss)(state.temperature)
+        self.assertTrue(jnp.all(jnp.isfinite(g)))
+
 
 class TestGissConvectionComposition(unittest.TestCase):
     """The term must compose and run inside ComposablePhysics."""

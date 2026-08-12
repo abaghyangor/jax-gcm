@@ -20,6 +20,7 @@ from jcm.physics.convection.giss_thermodynamics import (
 from jcm.physics.convection.giss_plume import (
     _saturation_adjust,
     entraining_plume_ascent,
+    plume_ascent_column,
     entrainment_rate,
     moist_adiabat_ascent,
     saturated_lapse_rate_dlnp,
@@ -253,6 +254,83 @@ class TestBroadcasting(unittest.TestCase):
             t_col, cond_col = moist_adiabat_ascent(t_base[j], p_base[j], _P_ABOVE)
             self.assertTrue(jnp.allclose(t_block[:, j], t_col, atol=1e-4))
             self.assertTrue(jnp.allclose(cond_block[:, j], cond_col, atol=1e-6))
+
+
+class TestPlumeAscentColumn(unittest.TestCase):
+    """Full-column ascent launched at a traced cloud-base index."""
+
+    def setUp(self):
+        # Surface-first column (index 0 = surface); conditionally unstable.
+        self.nlev = 20
+        z = jnp.linspace(0.0, 4000.0, self.nlev)
+        self.p = jnp.linspace(100000.0, 60000.0, self.nlev)
+        self.t = 300.0 - 6.5e-3 * z
+        self.q = jnp.linspace(0.016, 0.002, self.nlev)
+        self.phi = z * GRAV
+        self.dz = jnp.full(self.nlev, z[1] - z[0])
+        self.cb = jnp.array(3)
+        tb = self.t[self.cb]
+        self.qb = saturation_specific_humidity(tb, self.p[self.cb])
+        self.tb = tb
+
+    def _run(self, cb):
+        return plume_ascent_column(
+            cb, self.t[cb] if cb < self.nlev else self.t[0],
+            self.qb, self.phi[jnp.clip(cb, 0, self.nlev - 1)],
+            jnp.array(0.5), jnp.array(5.0),
+            self.t, self.q, self.phi, self.p, self.dz, contce=0.6)
+
+    def test_dormant_below_and_at_cloud_base(self):
+        _, _, _, mass_flux, _, top = self._run(self.cb)
+        mf = mass_flux
+        # zero at/below the cloud base (levels <= 3), nonzero above.
+        self.assertTrue(jnp.all(mf[:self.cb + 1] == 0.0))
+        self.assertTrue(jnp.any(mf[self.cb + 1:] > 0.0))
+        self.assertGreater(int(top), int(self.cb))
+
+    def test_finite_everywhere(self):
+        pt, cond, buoy, mass_flux, det, top = self._run(self.cb)
+        for a in (pt, cond, buoy, mass_flux, det):
+            self.assertTrue(jnp.all(jnp.isfinite(a)))
+
+    def test_no_cloud_sentinel_is_all_zero(self):
+        # cloud_base == nlev (no cloud) -> the launch level is never reached.
+        _, _, _, mass_flux, det, top = self._run(jnp.array(self.nlev))
+        self.assertTrue(jnp.all(mass_flux == 0.0))
+        self.assertTrue(jnp.all(det == 0.0))
+
+    def test_no_revival_above_cloud_top(self):
+        # Once the plume stops (w2<=0), the mass flux stays zero above -- a
+        # re-buoyant layer cannot revive it.
+        _, _, _, mass_flux, _, top = self._run(self.cb)
+        top_i = int(top)
+        if top_i < self.nlev:
+            self.assertTrue(jnp.all(mass_flux[top_i + 1:] == 0.0))
+
+    def test_gradient_finite(self):
+        g = jax.grad(lambda tb: jnp.sum(plume_ascent_column(
+            self.cb, tb, self.qb, self.phi[self.cb], jnp.array(0.5),
+            jnp.array(5.0), self.t, self.q, self.phi, self.p, self.dz,
+            contce=0.6)[3]))(self.tb)
+        self.assertTrue(jnp.isfinite(g))
+
+    def test_broadcasting_matches_single_column(self):
+        ncols = 2
+        cb = jnp.array([3, 4])
+        tile = lambda a: jnp.stack([a, a], axis=1)
+        tb = jnp.array([self.t[3], self.t[4]])
+        qb = jnp.array([self.qb, self.qb])
+        phib = jnp.array([self.phi[3], self.phi[4]])
+        _, _, _, mf, _, _ = plume_ascent_column(
+            cb, tb, qb, phib, jnp.array(0.5), jnp.array(5.0),
+            tile(self.t), tile(self.q), tile(self.phi), tile(self.p),
+            tile(self.dz), contce=0.6)
+        self.assertEqual(mf.shape, (self.nlev, ncols))
+        # column 0 must match running it alone with cloud base 3
+        _, _, _, mf0, _, _ = plume_ascent_column(
+            jnp.array(3), self.t[3], self.qb, self.phi[3], jnp.array(0.5),
+            jnp.array(5.0), self.t, self.q, self.phi, self.p, self.dz, contce=0.6)
+        self.assertTrue(jnp.allclose(mf[:, 0], mf0, atol=1e-5))
 
 
 if __name__ == "__main__":
