@@ -92,6 +92,12 @@ JAX functions column-by-column via the private bridge (`oracle.read_state_field`
 - **Oracle limitation**: it stores state + `dth_mc`/`dq_mc` only — **no
   plume-internal diagnostics** (mass flux, plume `w²`, entrainment). Plume
   internals can only be inferred from downstream tendencies.
+- **Like-for-like single-column harness** (private bridge,
+  `single_column_harness.py`): runs the real JCM pipeline
+  (`MoistAirColumnState` → `GissConvection(allow_mc=True)`) on ModelE BOMEX
+  columns via pure-sigma coords (`sigma = p_3d/ps`, pressure matched to 0.4% in
+  the convective layer). Current verdict: peak `dth_mc` ~1.6× ModelE (magnitude
+  ~right), vertical shape poorly correlated (missing cooling terms).
 
 ## Known issues / open work
 
