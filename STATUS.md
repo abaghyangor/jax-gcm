@@ -263,6 +263,21 @@ entrainment cooling (weak `dth_mc` minima). `_CONTCE`/`_CLOUD_BASE_W` are module
 constants that should become differentiable params. **233 convection/modele
 tests pass** (+10: 4 `allow_mc`, 6 `plume_ascent_column`).
 
+**Single-column like-for-like harness (private bridge).** Following the
+supervisor's brief, `modele-jcm-bridge/single_column_harness.py` runs the **real
+JCM physics pipeline** (`MoistAirColumnState` → `GissConvection(allow_mc=True)`)
+on ModelE BOMEX columns and compares to ModelE. For a single column, pure-sigma
+JCM coords (`sigma = p_3d/ps`) reproduce ModelE's pressure to **0.4%** through the
+convective layer, so JCM derives `pressure_full`/`layer_thickness`/`air_density`
+itself. Findings across periods: peak `dth_mc` **median ~1.6× ModelE** (magnitude
+roughly right) but **vertical shape correlation ~−0.25** (poor — JCM is
+all-heating, missing ModelE's evaporative/entrainment cooling dipole); one period
+under-triggers. This quantifies the port's real state: *magnitude close, shape
+wrong (missing cooling terms)*. Harness tests (5) pass; skip without live oracle.
+Also surfaced a convention bug: the bridge's `oracle_to_physics_state` returns
+**surface-first**, but JCM/`GissConvection` expect **top-first** (flagged for a
+separate fix).
+
 ## First numerical validation against active convection (BOMEX)
 
 We generated a **convectively active oracle** by running ModelE on the
