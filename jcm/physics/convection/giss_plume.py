@@ -108,6 +108,7 @@ def moist_adiabat_ascent(t_base: jnp.ndarray,
 _SIXTH = 1.0 / 6.0
 _TWO_THIRDS = 2.0 / 3.0   # detrainment-drag coefficient in the Gregory w^2 law
 _TEENY = 1.0e-20
+_REMRAT = 0.333          # MSTCNV cap: entrained mass <= remrat * layer air mass
 
 
 def entrainment_rate(buoyancy: jnp.ndarray,
@@ -219,7 +220,7 @@ def _saturation_adjust(mse, geopotential, q_total, pressure, phase="water",
 
 
 def _plume_core(h_p, qt_p, w2_prev, w_prev, m, t_env, q_env, phi, p, dz,
-                contce, phase):
+                layer_mass, contce, phase):
     """One entraining-plume level: physics shared by the base-relative and
     full-column ascents.
 
@@ -228,6 +229,12 @@ def _plume_core(h_p, qt_p, w2_prev, w_prev, m, t_env, q_env, phi, p, dz,
     form its buoyancy, advance the Gregory updraft ``w²``, entrain/detrain, and
     return the next carry plus this level's diagnostics. See
     :func:`entraining_plume_ascent` for the physics rationale.
+
+    ``layer_mass`` [kg/m²] bounds the entrained mass to ``MSTCNV``'s limits (the
+    implicit limiter and the ``remrat``-fraction cap, lines 2928-2929): the
+    entrained mass is capped **relative to the layer air mass**, not the plume
+    mass, which is what stops the plume mass running away in a deep buoyant
+    column. Pass ``inf`` to disable the cap (recovering ``m·(1+ε·dz)``).
     """
     # Saturation-adjust the (entrained, lifted) plume at this level.
     t_p, qv_p, qc_p = _saturation_adjust(h_p, phi, qt_p, p, phase)
@@ -250,18 +257,24 @@ def _plume_core(h_p, qt_p, w2_prev, w_prev, m, t_env, q_env, phi, p, dz,
     w = jnp.where(positive, jnp.sqrt(jnp.where(positive, w2, 1.0)), 0.0)
     w = jnp.minimum(w, 50.0)
 
-    # Entrain environmental air for the next level (implicit bounded fraction
-    # ``ε·dz/(1+ε·dz)``); only the entraining part dilutes the plume.
+    # Dilution: the plume relaxes toward the environment by the implicit bounded
+    # fraction ``ε·dz/(1+ε·dz)`` (always in [0,1), no small denominator -- keeps
+    # the gradient finite). Only the entraining part dilutes.
     e = ent * dz
     frac = e / (1.0 + e)
     h_env = SHA * t_env + phi + LHE * q_env
     h_next = h_p + frac * (h_env - h_p)
     qt_next = qt_p + frac * (q_env - qt_p)
 
-    # Plume mass: entrainment adds ``(1+ε·dz)``, detrainment sheds ``(1−det·dz)``
-    # (capped at 0.95/level).
+    # Plume mass: the entrained mass added per level is bounded like MSTCNV --
+    # the implicit limiter then the ``remrat`` fraction cap, both **relative to
+    # the layer air mass** (not the plume mass), which stops the plume mass
+    # running away in a deep buoyant column. Detrainment then sheds ≤ 0.95/level.
+    entrained = m * e
+    entrained = entrained / (1.0 + entrained / layer_mass)
+    entrained = jnp.minimum(entrained, layer_mass * _REMRAT)
     delta = jnp.minimum(det * dz, 0.95)
-    m_next = m * (1.0 + ent * dz) * (1.0 - delta)
+    m_next = (m + entrained) * (1.0 - delta)
 
     return (h_next, qt_next, w2, w, m_next), (t_p, qc_p, buoyancy, w2, m_next, det)
 
@@ -314,15 +327,21 @@ def entraining_plume_ascent(t_base, q_base, geopotential_base, p_base, w_base,
     w_base = w_base * 1.0
     m_base = jnp.asarray(m_base) * jnp.ones_like(w_base)
 
+    # Per-level layer mass for the entrainment cap; ``inf`` (no ``layer_mass``
+    # supplied) disables the cap, recovering the uncapped ``m·(1+ε·dz)`` growth.
+    cap_mass = (jnp.full_like(env_temperature, jnp.inf)
+                if layer_mass is None else layer_mass)
+
     def step(carry, inp):
         h_p, qt_p, w2_prev, w_prev, m = carry
-        t_env, q_env, phi, p, dz = inp
+        t_env, q_env, phi, p, dz, ma = inp
         return _plume_core(h_p, qt_p, w2_prev, w_prev, m,
-                           t_env, q_env, phi, p, dz, contce, phase)
+                           t_env, q_env, phi, p, dz, ma, contce, phase)
 
     _, (parcel_t, condensate, buoyancy, w2_prof, mass_flux, _det) = jax.lax.scan(
         step, (h_base, qt_base, w_base ** 2, w_base, m_base),
-        (env_temperature, env_vapor, geopotential, pressure, layer_thickness))
+        (env_temperature, env_vapor, geopotential, pressure, layer_thickness,
+         cap_mass))
 
     n = env_temperature.shape[0]
     stopped = w2_prof <= 0.0
@@ -335,7 +354,8 @@ def entraining_plume_ascent(t_base, q_base, geopotential_base, p_base, w_base,
 
 def plume_ascent_column(cloud_base, t_base, q_base, geopotential_base, w_base,
                         m_base, env_temperature, env_vapor, geopotential,
-                        pressure, layer_thickness, contce=0.4, phase="water"):
+                        pressure, layer_thickness, layer_mass,
+                        contce=0.4, phase="water"):
     """Full-column entraining plume ascent launched at a (traced) cloud base.
 
     The composable ``GissConvection`` term has a **per-column cloud-base index**
@@ -367,6 +387,9 @@ def plume_ascent_column(cloud_base, t_base, q_base, geopotential_base, w_base,
             ``fmp2`` [kg/m²].
         env_temperature, env_vapor, geopotential, pressure, layer_thickness:
             environment profiles ``(nlev, ...)``.
+        layer_mass: layer air mass ``dp/g`` [kg/m²], ``(nlev, ...)`` -- bounds the
+            entrained mass (``MSTCNV`` remrat cap) so the plume mass cannot run
+            away in a deep buoyant column.
         contce: entrainment-strength scaling. phase: ``"water"``/``"ice"``.
 
     Returns:
@@ -381,7 +404,7 @@ def plume_ascent_column(cloud_base, t_base, q_base, geopotential_base, w_base,
 
     def step(carry, inp):
         h_p, qt_p, w2_prev, w_prev, m = carry
-        t_env, q_env, phi, p, dz, level = inp
+        t_env, q_env, phi, p, dz, ma, level = inp
         # Seed the plume from the boundary-layer source at the launch level.
         launch = level == launch_level
         h_p = jnp.where(launch, h_base, h_p)
@@ -391,7 +414,7 @@ def plume_ascent_column(cloud_base, t_base, q_base, geopotential_base, w_base,
         m = jnp.where(launch, m_base, m)
 
         next_carry, out = _plume_core(h_p, qt_p, w2_prev, w_prev, m,
-                                      t_env, q_env, phi, p, dz, contce, phase)
+                                      t_env, q_env, phi, p, dz, ma, contce, phase)
 
         # Below the launch level the plume does not exist: keep the carry and the
         # outputs at zero so nothing propagates up from the sub-cloud layer.
@@ -405,17 +428,25 @@ def plume_ascent_column(cloud_base, t_base, q_base, geopotential_base, w_base,
     _, (parcel_t, condensate, buoyancy, w2_prof, mass_flux, det) = jax.lax.scan(
         step, (zero, zero, zero, zero, zero),
         (env_temperature, env_vapor, geopotential, pressure, layer_thickness,
-         level_idx))
+         layer_mass, level_idx))
 
     # Cloud top = first in-cloud level where w² <= 0. Kill the plume there and
     # above (cumulative), so an over-penetrating re-buoyant layer cannot revive
     # it and the mass flux stays finite.
-    in_cloud = level_idx.reshape((nlev,) + (1,) * cloud_base.ndim) >= launch_level
+    lev = level_idx.reshape((nlev,) + (1,) * cloud_base.ndim)
+    in_cloud = lev >= launch_level
     stop = (in_cloud & (w2_prof <= 0.0)).astype(mass_flux.dtype)
     stopped_below = jnp.cumsum(stop, axis=0) - stop        # stops strictly below
     alive = in_cloud & (stopped_below == 0.0)
     mass_flux = jnp.where(alive, mass_flux, 0.0)
     det = jnp.where(alive, det, 0.0)
+
+    # The cloud-base layer itself carries the plume's cloud-base mass flux
+    # ``m_base`` (= fmp2): the plume ascends out of its top, so the compensating
+    # subsidence must warm/dry that layer. Without this the cloud-base level --
+    # where ModelE's convective tendency is *largest* -- gets nothing, because
+    # the ascent proper only starts one level up (``launch_level``).
+    mass_flux = jnp.where(lev == cloud_base, m_base, mass_flux)
 
     cloud_top = jnp.where(jnp.any(stop > 0, axis=0),
                           jnp.argmax(stop, axis=0), nlev)

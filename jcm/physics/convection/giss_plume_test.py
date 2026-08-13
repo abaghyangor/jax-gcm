@@ -268,6 +268,7 @@ class TestPlumeAscentColumn(unittest.TestCase):
         self.q = jnp.linspace(0.016, 0.002, self.nlev)
         self.phi = z * GRAV
         self.dz = jnp.full(self.nlev, z[1] - z[0])
+        self.aml = jnp.full(self.nlev, 100.0)      # layer air mass [kg/m^2]
         self.cb = jnp.array(3)
         tb = self.t[self.cb]
         self.qb = saturation_specific_humidity(tb, self.p[self.cb])
@@ -278,13 +279,15 @@ class TestPlumeAscentColumn(unittest.TestCase):
             cb, self.t[cb] if cb < self.nlev else self.t[0],
             self.qb, self.phi[jnp.clip(cb, 0, self.nlev - 1)],
             jnp.array(0.5), jnp.array(5.0),
-            self.t, self.q, self.phi, self.p, self.dz, contce=0.6)
+            self.t, self.q, self.phi, self.p, self.dz, self.aml, contce=0.6)
 
-    def test_dormant_below_and_at_cloud_base(self):
+    def test_dormant_below_carries_fmp2_at_cloud_base(self):
         _, _, _, mass_flux, _, top = self._run(self.cb)
         mf = mass_flux
-        # zero at/below the cloud base (levels <= 3), nonzero above.
-        self.assertTrue(jnp.all(mf[:self.cb + 1] == 0.0))
+        # Zero strictly below cloud base; the cloud-base level carries the seed
+        # mass flux (m_base=5.0); nonzero in the ascent above.
+        self.assertTrue(jnp.all(mf[:self.cb] == 0.0))
+        self.assertAlmostEqual(float(mf[self.cb]), 5.0, places=5)
         self.assertTrue(jnp.any(mf[self.cb + 1:] > 0.0))
         self.assertGreater(int(top), int(self.cb))
 
@@ -311,7 +314,7 @@ class TestPlumeAscentColumn(unittest.TestCase):
         g = jax.grad(lambda tb: jnp.sum(plume_ascent_column(
             self.cb, tb, self.qb, self.phi[self.cb], jnp.array(0.5),
             jnp.array(5.0), self.t, self.q, self.phi, self.p, self.dz,
-            contce=0.6)[3]))(self.tb)
+            self.aml, contce=0.6)[3]))(self.tb)
         self.assertTrue(jnp.isfinite(g))
 
     def test_broadcasting_matches_single_column(self):
@@ -324,12 +327,13 @@ class TestPlumeAscentColumn(unittest.TestCase):
         _, _, _, mf, _, _ = plume_ascent_column(
             cb, tb, qb, phib, jnp.array(0.5), jnp.array(5.0),
             tile(self.t), tile(self.q), tile(self.phi), tile(self.p),
-            tile(self.dz), contce=0.6)
+            tile(self.dz), tile(self.aml), contce=0.6)
         self.assertEqual(mf.shape, (self.nlev, ncols))
         # column 0 must match running it alone with cloud base 3
         _, _, _, mf0, _, _ = plume_ascent_column(
             jnp.array(3), self.t[3], self.qb, self.phi[3], jnp.array(0.5),
-            jnp.array(5.0), self.t, self.q, self.phi, self.p, self.dz, contce=0.6)
+            jnp.array(5.0), self.t, self.q, self.phi, self.p, self.dz,
+            self.aml, contce=0.6)
         self.assertTrue(jnp.allclose(mf[:, 0], mf0, atol=1e-5))
 
 
