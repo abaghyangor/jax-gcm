@@ -278,6 +278,20 @@ Also surfaced a convention bug: the bridge's `oracle_to_physics_state` returns
 **surface-first**, but JCM/`GissConvection` expect **top-first** (flagged for a
 separate fix).
 
+**Heating-location work (BOMEX shape).** The harness showed the shape mismatch is
+mostly *where the heating goes*, not missing cooling terms: ModelE's biggest
+`dth_mc`/`dq_mc` is right at the cloud-base level (where JCM produced zero), and
+JCM's heating peaks too high because the plume mass flux grows ~4× upward. Two
+fixes landed: (1) the cloud-base layer now carries the closure mass flux `fmp2`
+so it gets its compensating subsidence (median shape corr −0.25 → −0.15); (2)
+ported MSTCNV's entrainment caps (implicit limiter + `remrat=0.333` relative to
+*layer* mass) — faithful and important for deep convection, though it doesn't
+bind for shallow BOMEX so it doesn't move the shape here. **The dominant
+remaining gap (mass flux grows upward → heating peaks too high) is the
+entrainment/detrainment balance**, which can't be calibrated principledly without
+the plume-internal ModelE oracle (`mc_w`/`mc_m`, deferred). So matching the BOMEX
+*shape* is now blocked on that oracle. 233 convection/modele tests pass.
+
 ## First numerical validation against active convection (BOMEX)
 
 We generated a **convectively active oracle** by running ModelE on the

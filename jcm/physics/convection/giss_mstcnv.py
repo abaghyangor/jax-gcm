@@ -286,7 +286,8 @@ class GissConvection(PhysicsTerm):
 
         parcel_t, _cond, _buoy, mass_flux, det, _top = plume_ascent_column(
             cloud_base, t_base, q_base, at_base(phi),
-            jnp.asarray(_CLOUD_BASE_W), fmp2, t, q, phi, p, dz, contce=_CONTCE)
+            jnp.asarray(_CLOUD_BASE_W), fmp2, t, q, phi, p, dz, air_mass,
+            contce=_CONTCE)
 
         # The plume profiles are zero outside the live cloud; use the environment
         # there so qsat/theta stay finite (they are multiplied by a zero mass flux
