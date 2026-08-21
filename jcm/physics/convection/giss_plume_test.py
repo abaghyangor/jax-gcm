@@ -281,13 +281,16 @@ class TestPlumeAscentColumn(unittest.TestCase):
             jnp.array(0.5), jnp.array(5.0),
             self.t, self.q, self.phi, self.p, self.dz, self.aml, contce=0.6)
 
-    def test_dormant_below_carries_fmp2_at_cloud_base(self):
+    def test_sub_cloud_ramp_up_to_cloud_base(self):
         _, _, _, mass_flux, _, top = self._run(self.cb)
         mf = mass_flux
-        # Zero strictly below cloud base; the cloud-base level carries the seed
-        # mass flux (m_base=5.0); nonzero in the ascent above.
-        self.assertTrue(jnp.all(mf[:self.cb] == 0.0))
-        self.assertAlmostEqual(float(mf[self.cb]), 5.0, places=5)
+        # The plume draws its mass from the sub-cloud source layers, so the
+        # compensating-subsidence flux ramps monotonically up to the full seed
+        # mass (m_base=5.0) at cloud base, then the ascent continues above.
+        sub = mf[:self.cb + 1]
+        self.assertTrue(jnp.all(jnp.diff(sub) > 0.0))          # monotonic ramp
+        self.assertLess(float(sub[0]), 5.0)                    # small at surface
+        self.assertAlmostEqual(float(mf[self.cb]), 5.0, places=5)   # full at base
         self.assertTrue(jnp.any(mf[self.cb + 1:] > 0.0))
         self.assertGreater(int(top), int(self.cb))
 
