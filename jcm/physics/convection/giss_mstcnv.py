@@ -85,6 +85,14 @@ _P_REF = 100000.0
 _CONTCE = 0.6          # Gregory entrainment strength (more-entraining plume)
 _CLOUD_BASE_W = 0.5    # cloud-base updraft seed [m/s]
 
+# Cloud-base adjustment timescale [s]. ``MSTCNV`` relaxes the closure mass flux
+# toward neutrality over ``tadj`` rather than applying it all in one step:
+# ``FMP2 = FMP2 * min(1, dtime/tadj)`` (line 2769). The caller passes
+# ``tadj*seconds_per_hour``, so ``tadj`` is in **seconds** there; the default
+# ``tadjmc(1) = 1`` hour gives 3600 s, i.e. a factor of 0.5 at dtsrc = 1800 s.
+# Without this the scheme applies twice the convective mass flux per step.
+_TADJ_SECONDS = 3600.0
+
 
 def cloud_base_closure_mass_flux(temperature: jnp.ndarray,
                                  specific_humidity: jnp.ndarray,
@@ -284,9 +292,15 @@ class GissConvection(PhysicsTerm):
         t_base = theta_env[0] * at_base(exner)
         q_base = saturation_specific_humidity(t_base, at_base(p))
 
+        # Relax the closure mass flux over the cloud-base adjustment timescale
+        # (MSTCNV line 2769): only the fraction of the neutralising mass flux
+        # that fits in one physics step is applied. The `cloud_base_mass_flux`
+        # diagnostic stays the raw (pre-relaxation) closure value.
+        m_base = fmp2 * jnp.minimum(1.0, dtsrc / _TADJ_SECONDS)
+
         parcel_t, _cond, _buoy, mass_flux, det, _top = plume_ascent_column(
             cloud_base, t_base, q_base, at_base(phi),
-            jnp.asarray(_CLOUD_BASE_W), fmp2, t, q, phi, p, dz, air_mass,
+            jnp.asarray(_CLOUD_BASE_W), m_base, t, q, phi, p, dz, air_mass,
             contce=_CONTCE)
 
         # The plume profiles are zero outside the live cloud; use the environment
