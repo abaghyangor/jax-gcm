@@ -441,12 +441,30 @@ def plume_ascent_column(cloud_base, t_base, q_base, geopotential_base, w_base,
     mass_flux = jnp.where(alive, mass_flux, 0.0)
     det = jnp.where(alive, det, 0.0)
 
-    # The cloud-base layer itself carries the plume's cloud-base mass flux
-    # ``m_base`` (= fmp2): the plume ascends out of its top, so the compensating
-    # subsidence must warm/dry that layer. Without this the cloud-base level --
-    # where ModelE's convective tendency is *largest* -- gets nothing, because
-    # the ascent proper only starts one level up (``launch_level``).
-    mass_flux = jnp.where(lev == cloud_base, m_base, mass_flux)
+    # Sub-cloud source layers. The plume does not draw its cloud-base mass from
+    # the cloud-base layer alone: ``MSTCNV`` removes it from *every* boundary-layer
+    # source level, mass-weighted (``fpi = aml/sum(aml)``, line 2653;
+    # ``dmr(lll) = -mplume*fpi(...)``, line 1573), and the compensating
+    # subsidence ``CM`` accumulates upward from the lowest source level
+    # (``ltmin = min(ldmin, lmin0)``, line 2350). The subsidence mass flux
+    # therefore **ramps** from ~0 at the surface to the full ``m_base`` at cloud
+    # base. Without this ramp the sub-cloud layers get no tendency at all and the
+    # cloud-base layer -- where ModelE's tendency is *largest* -- comes out far
+    # too weak.
+    #
+    # Source levels are taken as everything at/below cloud base. ModelE bounds
+    # them by the boundary-layer top ``dcl`` and a 300 mb range (line 2630);
+    # for the shallow boundary layers this scheme targets those bounds rarely
+    # bind, so the simpler at-or-below-cloud-base window is used here.
+    # ``cloud_base == nlev`` is the "no cloud" sentinel: there is no plume, so no
+    # source layers and no subsidence anywhere.
+    has_cloud = cloud_base < nlev
+    sub_cloud = (lev <= cloud_base) & has_cloud
+    source_mass = jnp.where(sub_cloud, layer_mass, 0.0)
+    cumulative = jnp.cumsum(source_mass, axis=0)
+    total_source = jnp.sum(source_mass, axis=0)
+    ramp = m_base * cumulative / jnp.maximum(total_source, _TEENY)
+    mass_flux = jnp.where(sub_cloud, ramp, mass_flux)
 
     cloud_top = jnp.where(jnp.any(stop > 0, axis=0),
                           jnp.argmax(stop, axis=0), nlev)
