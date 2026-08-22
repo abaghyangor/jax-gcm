@@ -111,6 +111,15 @@ JAX functions column-by-column via the private bridge (`oracle.read_state_field`
    entrainment-removal cooling, so vertical shape is imperfect. Proper validation
    needs the plume-internal ModelE oracle (issue 2). `_CONTCE`/`_CLOUD_BASE_W`
    should graduate to differentiable `GissConvectionParameters` leaves.
+1b. **Closure magnitude** — the cloud-base plume mass is ~6 kg/m² vs ModelE's
+   35.4 (plume oracle). Two factors: base *selection* (ModelE's `LMIN` vs our
+   LCL — our trigger gates are less restrictive, so many levels qualify), and a
+   ~2.4× shortfall at the same level, most likely the omitted **source-parcel
+   surface-flux enhancement** (`mc_tqstar_fac=1`; needs `tstar`/`qstar`, which
+   the single-column harness does not supply). Downdrafts are ported for the
+   *updraft mass budget* only — the downdraft's own environmental effect
+   (descent + evaporation, i.e. ModelE's low-level cooling dipole) is not.
+
 2. **Plume over-penetration** (the magnitude blocker) — the plume tops out ~L28
    vs ModelE's L14 (trade inversion), its mass flux grows instead of shrinking,
    and it re-buoys above the inversion. Root cause is cloud-top termination /

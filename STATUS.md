@@ -278,6 +278,39 @@ Also surfaced a convention bug: the bridge's `oracle_to_physics_state` returns
 **surface-first**, but JCM/`GissConvection` expect **top-first** (flagged for a
 separate fix).
 
+**Plume oracle + downdraft port (the shape fix).** Patched ModelE to dump
+`MSTCNV`'s per-plume internals (the `mc_*` SUBDD variables are "solo"
+self-registering diagnostics this SCM config never emits; patch + recipe +
+reader live in the private bridge). What it showed, and what followed:
+
+* **One cloud base, one plume** fires per step (`lessent_scheme=2` sets
+  `mplumes(1)=0`). The port's single-base/single-plume structure is **correct** —
+  this refuted the multi-cloud-base hypothesis and the attempt built on it.
+* `w_base ≈ 0.57 m/s` (the port seeds 0.5 — fine).
+* ModelE's `LMIN` sits at the LCL or one level above, never below. The closure
+  was being evaluated at `cloud_base-1`, one to two levels too low, and it is
+  *very* level-sensitive (`fmp2` = 6.8/9.4/29.9 kg/m² at LCL-1/LCL/LCL+1).
+  Fixing to `lmin = cloud_base` took **peak heating from 0.7× to 1.0× ModelE**.
+* **The key mechanism we were missing:** ModelE's plume mass falls ~84× through
+  the cloud layer while its `w` *rises* (0.57→1.96). Buoyancy-sorting
+  detrainment cannot do that — it only acts when the plume is negatively buoyant,
+  which also decelerates it. The answer is **downdraft mass diversion**: where a
+  cloudy/clear *mixture* is negatively buoyant, `MPLUME = (1-fpl·ETADN)·MPLUME`
+  with the intensive properties unchanged, so the surviving core stays buoyant
+  and accelerates while its mass drops. Ported (`plume_mixing_fraction` =
+  `get_fpl`, plus the diversion in `_plume_core`), which moved **peak heating
+  height from 1.67 km to 0.68 km** (ModelE 0.40).
+
+Remaining magnitude gap, now quantified: our cloud-base plume mass is ~6 kg/m²
+vs ModelE's 35.4, from two separable factors — (a) base *selection* (ModelE's
+`LMIN` vs our LCL, ~3×; our trigger gates are less restrictive than ModelE's, so
+many levels qualify), and (b) a ~2.4× closure shortfall *at the same level*,
+most likely the **source-parcel surface-flux enhancement** (`mc_tqstar_fac=1` in
+the default preset warms/moistens the source parcel by `tstar`/`qstar`), which we
+omit. (b) needs surface-flux scales the single-column harness does not currently
+supply — a concrete blocker for the next step. With the downdraft diversion in
+and the closure still short, peak heating currently **undershoots at ~0.3×**.
+
 **Heating-location work (BOMEX shape).** The harness showed the shape mismatch is
 mostly *where the heating goes*, not missing cooling terms: ModelE's biggest
 `dth_mc`/`dq_mc` is right at the cloud-base level (where JCM produced zero), and
