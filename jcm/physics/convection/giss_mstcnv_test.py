@@ -30,7 +30,7 @@ from jcm.physics.convection.giss_mstcnv import (
     GissConvection,
     cloud_base_closure_mass_flux,
 )
-from jcm.physics.convection.giss_mass_flux import cloud_base_mass_flux
+from jcm.physics.convection.giss_mass_flux import cloud_base_mass_flux_column
 from jcm.physics.convection.giss_thermodynamics import KAPA
 from jcm.physics.modele.params import GissConvectionParameters
 from jcm.physics.modele.physics_data import GissConvectionData
@@ -289,35 +289,56 @@ class TestCloudBaseClosureMassFlux(unittest.TestCase):
     """The (nlev,...) gather wrapper around the MASS_FLUX2 closure."""
 
     def setUp(self):
-        # Surface-first column (index 0 = surface): warm moist surface, cooling
-        # and drying with height.
+        # Surface-first column (index 0 = surface). A convectively unstable
+        # profile: well-mixed moist boundary layer under a sharp inversion, so
+        # the blended source parcel is supersaturated when lifted -- which is
+        # what makes the MASS_FLUX2 closure return a real plume rather than
+        # bottoming out at its lower bisection bound.
         self.nlev = 8
         self.t = jnp.array(
-            [300., 297., 294., 291., 288., 285., 282., 279.])[:, None]
+            [299., 298.4, 297.8, 297.2, 292., 290., 288., 286.])[:, None]
         self.q = jnp.array(
-            [0.018, 0.012, 0.010, 0.008, 0.006, 0.005, 0.004, 0.003])[:, None]
-        self.p = jnp.linspace(100000.0, 65000.0, self.nlev)[:, None]
+            [0.0180, 0.0178, 0.0176, 0.0173, 0.0100, 0.0080, 0.0060,
+             0.0050])[:, None]
+        self.p = jnp.linspace(101000.0, 80000.0, self.nlev)[:, None]
         self.air_mass = jnp.full((self.nlev, 1), 100.0)
 
-    def test_matches_hand_built_stencil(self):
-        # cloud_base = 2 -> closure level lmin = 2 -> stencil [lmin, lmin+1,
-        # lmin+2] = levels [2, 3, 4], with the source (index 0) replaced by the
-        # surface parcel.
+    def test_matches_column_closure(self):
+        # The wrapper delegates to the multi-source (nlpi>1) MASS_FLUX2 closure,
+        # so it must agree with calling that directly on the same column.
         cloud_base = jnp.array([2])
         _, fmp2 = cloud_base_closure_mass_flux(
             self.t, self.q, self.p, self.air_mass, cloud_base)
 
         exner = (self.p / 100000.0) ** KAPA
         theta = self.t / exner
-        theta3 = jnp.array([theta[0, 0], theta[3, 0], theta[4, 0]])   # index0 = surface
-        q3 = jnp.array([self.q[0, 0], self.q[3, 0], self.q[4, 0]])
-        air_mass3 = jnp.array([100.0, 100.0, 100.0])                  # levels 2,3,4
-        exner2 = jnp.array([exner[2, 0], exner[3, 0]])
-        pressure2 = jnp.array([self.p[2, 0], self.p[3, 0]])
-        _, fmp2_expected, _ = cloud_base_mass_flux(
-            theta3, q3, air_mass3, exner2, pressure2)
+        _, fmp2_expected, _ = cloud_base_mass_flux_column(
+            theta, self.q, self.air_mass, exner, self.p, cloud_base)
 
-        self.assertAlmostEqual(float(fmp2[0]), float(fmp2_expected), places=5)
+        self.assertAlmostEqual(float(fmp2[0]), float(fmp2_expected[0]), places=5)
+
+    def test_boundary_layer_top_limits_source_blend(self):
+        # Restricting the source blend to the boundary layer excludes the drier
+        # air just below cloud base, giving a moister (more unstable) parcel and
+        # so a larger closure mass flux.
+        cloud_base = jnp.array([3])
+        _, fmp2_all = cloud_base_closure_mass_flux(
+            self.t, self.q, self.p, self.air_mass, cloud_base)
+        _, fmp2_bl = cloud_base_closure_mass_flux(
+            self.t, self.q, self.p, self.air_mass, cloud_base,
+            boundary_layer_top=jnp.array([2]))
+        self.assertGreater(float(fmp2_bl[0]), float(fmp2_all[0]))
+
+    def test_source_boost_increases_mass_flux(self):
+        # The tstar/qstar source-parcel enhancement makes the parcel warmer and
+        # moister, hence more unstable, hence a larger closure mass flux.
+        cloud_base = jnp.array([3])
+        _, plain = cloud_base_closure_mass_flux(
+            self.t, self.q, self.p, self.air_mass, cloud_base)
+        _, boosted = cloud_base_closure_mass_flux(
+            self.t, self.q, self.p, self.air_mass, cloud_base,
+            source_dtheta=0.05, source_dq=3.0e-4)
+        self.assertGreater(float(boosted[0]), float(plain[0]))
 
     def test_no_cloud_base_is_zero(self):
         # Sentinel cloud base (== nlev) => no cloud => zero mass flux.

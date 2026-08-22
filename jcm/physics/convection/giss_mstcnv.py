@@ -64,11 +64,12 @@ from jcm.terrain import TerrainData
 from jcm.physics.modele.params import GissConvectionParameters
 from jcm.physics.modele.physics_data import GissConvectionData
 from jcm.physics.convection.giss_cloud_base import lifting_condensation_level
-from jcm.physics.convection.giss_mass_flux import cloud_base_mass_flux
+from jcm.physics.convection.giss_mass_flux import cloud_base_mass_flux_column
 from jcm.physics.convection.giss_plume import plume_ascent_column
 from jcm.physics.convection.giss_tendencies import convective_tendencies
 from jcm.physics.convection.giss_thermodynamics import (
     KAPA,
+    SHA,
     saturation_specific_humidity,
 )
 
@@ -94,11 +95,53 @@ _CLOUD_BASE_W = 0.5    # cloud-base updraft seed [m/s]
 _TADJ_SECONDS = 3600.0
 
 
+def surface_flux_scales(sensible_heat_flux, evaporation, friction_velocity,
+                        surface_density, surface_specific_humidity,
+                        tqstar_factor: float = 1.0):
+    """Surface-layer ``tstar``/``qstar`` scales that enhance the source parcel.
+
+    ``MSTCNV`` warms and moistens the boundary-layer source parcel by the
+    surface-flux scales before running the closure (``CLOUDS_DRV.F90:642``)::
+
+        tstar = min(1,        max(0, SHF / (rho*cp*ustar)))
+        qstar = min(0.2*q_sfc, max(0, evap / (rho*ustar)))
+
+    scaled by ``mc_tqstar_fac`` (1.0 in the default preset). Both are floored at
+    zero -- only an *upward* surface flux enhances the parcel -- and capped, so a
+    strongly forced surface cannot run away.
+
+    This matters more than its size suggests: paired with the multi-source
+    closure (whose blended source humidity is nearly invariant during the
+    bisection) a ~0.2 g/kg moisture boost shifts the whole ``DMSE1`` curve, and
+    the latent term carries ``LHE/SHA ≈ 2490 K`` per kg/kg.
+
+    Args:
+        sensible_heat_flux: **Upward** sensible heat flux [W/m^2].
+        evaporation: Surface evaporation rate [kg/m^2/s].
+        friction_velocity: ``ustar`` [m/s].
+        surface_density: Surface air density [kg/m^3].
+        surface_specific_humidity: Surface specific humidity [kg/kg] (caps qstar).
+        tqstar_factor: ``mc_tqstar_fac``.
+
+    Returns:
+        ``(tstar, qstar)`` -- source-parcel temperature [K] and humidity [kg/kg]
+        enhancements.
+    """
+    scale = surface_density * jnp.maximum(friction_velocity, 1.0e-6)
+    tstar = jnp.clip(sensible_heat_flux / (scale * SHA), 0.0, 1.0)
+    qstar = jnp.clip(evaporation / scale, 0.0,
+                     0.2 * surface_specific_humidity)
+    return tqstar_factor * tstar, tqstar_factor * qstar
+
+
 def cloud_base_closure_mass_flux(temperature: jnp.ndarray,
                                  specific_humidity: jnp.ndarray,
                                  pressure: jnp.ndarray,
                                  air_mass: jnp.ndarray,
-                                 cloud_base: jnp.ndarray):
+                                 cloud_base: jnp.ndarray,
+                                 boundary_layer_top=None,
+                                 source_dtheta=0.0,
+                                 source_dq=0.0):
     """Cloud-base plume fraction / mass from the ``MASS_FLUX2`` closure.
 
     Broadcasting-native wrapper around
@@ -135,21 +178,10 @@ def cloud_base_closure_mass_flux(temperature: jnp.ndarray,
     exner = (pressure / _P_REF) ** KAPA
     theta = temperature / exner
 
-    # Closure level; clip so the 3-level stencil stays in range (masked out below
-    # when there is no cloud base anyway).
-    lmin = jnp.clip(cloud_base, 0, nlev - 3)
-
-    def gather(arr, size):
-        offsets = jnp.arange(size).reshape((size,) + (1,) * lmin.ndim)
-        return jnp.take_along_axis(arr, lmin[None, ...] + offsets, axis=0)
-
-    theta3 = gather(theta, 3).at[0].set(theta[0])        # source = surface parcel
-    q3 = gather(specific_humidity, 3).at[0].set(specific_humidity[0])
-    air_mass3 = gather(air_mass, 3)
-    exner2 = gather(exner, 2)
-    pressure2 = gather(pressure, 2)
-
-    fplume, fmp2, _ = cloud_base_mass_flux(theta3, q3, air_mass3, exner2, pressure2)
+    fplume, fmp2, _ = cloud_base_mass_flux_column(
+        theta, specific_humidity, air_mass, exner, pressure, cloud_base,
+        boundary_layer_top=boundary_layer_top,
+        source_dtheta=source_dtheta, source_dq=source_dq)
 
     has_cloud = cloud_base < nlev
     return jnp.where(has_cloud, fplume, 0.0), jnp.where(has_cloud, fmp2, 0.0)
@@ -355,6 +387,81 @@ class GissConvection(PhysicsTerm):
             return cloud_base, jnp.zeros(nodal_shape)
 
         air_mass = jnp.flip(density, axis=0) * jnp.flip(thickness, axis=0)
+        blt, dtheta, dq = self._source_parcel_inputs(
+            diagnostics, q_sf, jnp.flip(density, axis=0)[0], nlev)
+
+        # The closure runs at the level where **ModelE's** parcel -- the
+        # boundary-layer *blend*, not the surface air -- reaches saturation. The
+        # blend is drier than the surface parcel, so it saturates a level higher,
+        # and the closure is very level-sensitive, so using the surface LCL here
+        # evaluates it one level too low and the closure bottoms out. Validated
+        # against the ModelE closure oracle: the blend's LCL reproduces `LMIN` on
+        # 6 of 7 sampled BOMEX periods (the surface LCL on 2).
+        #
+        # The *reported* ``cloud_base`` stays the surface-parcel LCL, which is the
+        # quantity validated against ModelE's ``cldmc`` (47/48 exact).
+        closure_base = self._blended_parcel_cloud_base(t_sf, q_sf, p_sf,
+                                                       air_mass, blt, nlev)
         _, fmp2 = cloud_base_closure_mass_flux(
-            t_sf, q_sf, p_sf, air_mass, cloud_base)
+            t_sf, q_sf, p_sf, air_mass, closure_base,
+            boundary_layer_top=blt, source_dtheta=dtheta, source_dq=dq)
         return cloud_base, fmp2
+
+    def _blended_parcel_cloud_base(self, t_sf, q_sf, p_sf, air_mass,
+                                   boundary_layer_top, nlev):
+        """Level at which the mass-weighted boundary-layer blend saturates.
+
+        ``MSTCNV``'s source parcel is the ``fpi``-weighted blend of the
+        boundary-layer levels, so its saturation level -- not the surface
+        parcel's -- sets the closure level ``LMIN``.
+        """
+        level = jnp.arange(nlev).reshape((nlev,) + (1,) * (t_sf.ndim - 1))
+        top = nlev - 3 if boundary_layer_top is None else boundary_layer_top
+        weights = jnp.where(level <= top, air_mass, 0.0)
+        weights = weights / jnp.maximum(jnp.sum(weights, axis=0), 1.0e-20)
+        exner = (p_sf / _P_REF) ** KAPA
+        theta_blend = jnp.sum((t_sf / exner) * weights, axis=0)
+        q_blend = jnp.sum(q_sf * weights, axis=0)
+        base, _ = lifting_condensation_level(
+            theta_blend * exner[0], p_sf[0], q_blend, p_sf)
+        return jnp.clip(base, 0, nlev - 3)
+
+    def _source_parcel_inputs(self, diagnostics, q_surface_first,
+                              surface_density, nlev):
+        """Boundary-layer top and source-parcel enhancement, if available.
+
+        The closure blends its source parcel over the boundary layer and boosts
+        it by the surface-flux scales. Both inputs are read *optionally*:
+
+        * ``boundary_layer_height`` [m] (with ``height_full``) gives ``dcl``, the
+          level **below** the boundary-layer top -- ``MSTCNV`` excludes source
+          levels above it so a parcel displaced through the top is not mixed with
+          free-tropospheric air. Note the off-by-one: ``searchsorted`` returns the
+          insertion index, and ``dcl`` is one below it.
+        * ``surface`` (a ``SurfaceData``) supplies the fluxes for
+          :func:`surface_flux_scales`; ``ustar`` comes from the momentum fluxes,
+          ``ustar = sqrt(|tau|/rho)``.
+
+        Without them the closure falls back to blending over the whole sub-cloud
+        column with no surface enhancement, which under-computes the cloud-base
+        mass flux (see ``STATUS.md``).
+        """
+        height = diagnostics.get("height_full")
+        pbl_height = diagnostics.get("boundary_layer_height")
+        boundary_layer_top = None
+        if height is not None and pbl_height is not None:
+            height_sf = jnp.flip(height, axis=0)
+            below_top = jnp.sum(
+                (height_sf < pbl_height[None, ...]).astype(int), axis=0) - 1
+            boundary_layer_top = jnp.clip(below_top, 0, nlev - 3)
+
+        surface = diagnostics.get("surface")
+        if surface is None:
+            return boundary_layer_top, 0.0, 0.0
+        tau = jnp.sqrt(surface.momentum_flux_u ** 2
+                       + surface.momentum_flux_v ** 2)
+        ustar = jnp.sqrt(tau / jnp.maximum(surface_density, 1.0e-6))
+        dtheta, dq = surface_flux_scales(
+            surface.sensible_heat_flux, surface.evaporation, ustar,
+            surface_density, q_surface_first[0])
+        return boundary_layer_top, dtheta, dq
