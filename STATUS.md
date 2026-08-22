@@ -307,9 +307,28 @@ vs ModelE's 35.4, from two separable factors — (a) base *selection* (ModelE's
 many levels qualify), and (b) a ~2.4× closure shortfall *at the same level*,
 most likely the **source-parcel surface-flux enhancement** (`mc_tqstar_fac=1` in
 the default preset warms/moistens the source parcel by `tstar`/`qstar`), which we
-omit. (b) needs surface-flux scales the single-column harness does not currently
-supply — a concrete blocker for the next step. With the downdraft diversion in
-and the closure still short, peak heating currently **undershoots at ~0.3×**.
+omit. With the downdraft diversion in and the closure still short, peak heating
+currently **undershoots at ~0.3×**.
+
+*Two candidate explanations for the closure shortfall were tested against the
+oracle and neither resolved it* (recorded so they are not re-attempted):
+
+* **Source-parcel surface-flux enhancement** (`mc_tqstar_fac=1`; `tstar`/`qstar`
+  computed from the oracle's `shflx`/`lhflx`/`ustar` per `CLOUDS_DRV.F90:642`).
+  Real but small: `tstar ≈ 0.029 K`, `qstar ≈ 0.19 g/kg`, raising `fmp2` by only
+  **~16%** (29.9 → 34.5 vs ModelE's 70.7), not the ~2.4× hypothesised.
+* **Multi-source-level (`nlpi>1`) closure.** Implemented and tested: it makes
+  things *worse* — the `fpi`-weighted blend over levels up to cloud base is
+  **less** unstable than the surface parcel (it mixes in the drier air just below
+  cloud base), and `fmp2` collapses toward zero on periods 36/47. ModelE's
+  BL-top zeroing (`fpi(...)=0` above `dcl`, line 2655) does not rescue this here
+  because `dcl == lmin` for these periods, so it never triggers. ModelE also
+  applies `tstar`/`qstar` and a `qboost` to each source level before calling
+  `MASS_FLUX2`; reproducing the blend faithfully needs those. The implementation
+  was reverted rather than shipped.
+
+So the ~2× closure shortfall is **not yet explained**. It is the last identified
+blocker on matching BOMEX magnitude.
 
 **Heating-location work (BOMEX shape).** The harness showed the shape mismatch is
 mostly *where the heating goes*, not missing cooling terms: ModelE's biggest
