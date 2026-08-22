@@ -108,10 +108,17 @@ def cloud_base_closure_mass_flux(temperature: jnp.ndarray,
 
     All profile inputs are **surface-first** ``(nlev, ...)`` (index 0 = surface);
     ``cloud_base`` ``(...)`` is the lifting-condensation-level index (the sentinel
-    ``nlev`` means no cloud base). The closure source level is ``lmin =
-    cloud_base - 1``; the stencil spans ``[lmin, lmin+1, lmin+2]`` and its source
-    level (index 0) is replaced by the **surface** parcel -- the boundary-layer
-    air that actually feeds the plume, matching the BOMEX validation.
+    ``nlev`` means no cloud base). The stencil spans ``[lmin, lmin+1, lmin+2]``
+    and its source level (index 0) is replaced by the **surface** parcel -- the
+    boundary-layer air that actually feeds the plume.
+
+    The closure level is ``lmin = cloud_base``. This is set by the plume oracle
+    (``modele_patches/`` in the bridge repo): ModelE's ``LMIN`` for the plume that
+    actually fires sits at the LCL or one level above it across the BOMEX
+    periods, never below. The closure is *very* sensitive to this -- on period 47
+    it returns ``fmp2`` of 6.8 / 9.4 / 29.9 kg/m² at ``lmin`` = LCL-1 / LCL / LCL+1
+    -- so evaluating it a level or two low (as ``cloud_base - 1`` did) badly
+    under-computes the cloud-base mass flux.
 
     Args:
         temperature: Temperature [K], ``(nlev, ...)``.
@@ -128,9 +135,9 @@ def cloud_base_closure_mass_flux(temperature: jnp.ndarray,
     exner = (pressure / _P_REF) ** KAPA
     theta = temperature / exner
 
-    # Source level; clip so the 3-level stencil stays in range (masked out below
+    # Closure level; clip so the 3-level stencil stays in range (masked out below
     # when there is no cloud base anyway).
-    lmin = jnp.clip(cloud_base - 1, 0, nlev - 3)
+    lmin = jnp.clip(cloud_base, 0, nlev - 3)
 
     def gather(arr, size):
         offsets = jnp.arange(size).reshape((size,) + (1,) * lmin.ndim)

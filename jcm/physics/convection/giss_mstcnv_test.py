@@ -300,19 +300,20 @@ class TestCloudBaseClosureMassFlux(unittest.TestCase):
         self.air_mass = jnp.full((self.nlev, 1), 100.0)
 
     def test_matches_hand_built_stencil(self):
-        # cloud_base = 2 -> source level lmin = 1 -> stencil [lmin, lmin+1, lmin+2]
-        # = levels [1, 2, 3], with the source (index 0) replaced by the surface.
+        # cloud_base = 2 -> closure level lmin = 2 -> stencil [lmin, lmin+1,
+        # lmin+2] = levels [2, 3, 4], with the source (index 0) replaced by the
+        # surface parcel.
         cloud_base = jnp.array([2])
         _, fmp2 = cloud_base_closure_mass_flux(
             self.t, self.q, self.p, self.air_mass, cloud_base)
 
         exner = (self.p / 100000.0) ** KAPA
         theta = self.t / exner
-        theta3 = jnp.array([theta[0, 0], theta[2, 0], theta[3, 0]])   # index0 = surface
-        q3 = jnp.array([self.q[0, 0], self.q[2, 0], self.q[3, 0]])
-        air_mass3 = jnp.array([100.0, 100.0, 100.0])                  # levels 1,2,3
-        exner2 = jnp.array([exner[1, 0], exner[2, 0]])
-        pressure2 = jnp.array([self.p[1, 0], self.p[2, 0]])
+        theta3 = jnp.array([theta[0, 0], theta[3, 0], theta[4, 0]])   # index0 = surface
+        q3 = jnp.array([self.q[0, 0], self.q[3, 0], self.q[4, 0]])
+        air_mass3 = jnp.array([100.0, 100.0, 100.0])                  # levels 2,3,4
+        exner2 = jnp.array([exner[2, 0], exner[3, 0]])
+        pressure2 = jnp.array([self.p[2, 0], self.p[3, 0]])
         _, fmp2_expected, _ = cloud_base_mass_flux(
             theta3, q3, air_mass3, exner2, pressure2)
 
