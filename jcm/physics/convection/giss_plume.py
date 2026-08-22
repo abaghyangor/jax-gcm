@@ -33,8 +33,10 @@ import jax
 import jax.numpy as jnp
 
 from jcm.physics.convection.giss_thermodynamics import (
+    DELTX,
     GRAV,
     LHE,
+    LHS,
     RGAS,
     RVAP,
     SHA,
@@ -109,6 +111,7 @@ _SIXTH = 1.0 / 6.0
 _TWO_THIRDS = 2.0 / 3.0   # detrainment-drag coefficient in the Gregory w^2 law
 _TEENY = 1.0e-20
 _REMRAT = 0.333          # MSTCNV cap: entrained mass <= remrat * layer air mass
+_ETADN = 1.0 / 3.0       # MSTCNV ETADN0: updraft fraction diverted to a downdraft
 
 
 def entrainment_rate(buoyancy: jnp.ndarray,
@@ -219,8 +222,88 @@ def _saturation_adjust(mse, geopotential, q_total, pressure, phase="water",
     return t, q_vapor, q_cond
 
 
+def plume_mixing_fraction(t_env, q_env, condensate_env,
+                          t_plume, q_plume, condensate_plume,
+                          pressure, phase="water"):
+    """Plume fraction of a downdraft-forming mixture -- ``MSTCNV`` ``get_fpl``.
+
+    A downdraft forms where a **mixture** of cloudy and clear air is negatively
+    buoyant: evaporating the plume's condensate into entrained dry air cools the
+    mixture until it sinks. This returns the plume fraction ``fpl`` of that
+    mixture, which sets how much updraft mass is diverted downward
+    (``MSTCNV`` line ~3027).
+
+    Faithful port of ``get_fpl``: two 2-step Newton solves give the mixing
+    fraction at neutral buoyancy (``fpl_neut``) and the fraction that exactly
+    evaporates all the mixture's condensate (``fpl_min``, the most negatively
+    buoyant mixture); the scheme uses the midpoint (its "option 1"). Returns 0
+    -- no downdraft -- under ``get_fpl``'s bailouts: the plume is not buoyant
+    (overshoot), there is no moist-static-energy contrast, there is no moisture
+    contrast, or the neutral mixture would hold no condensate.
+
+    Broadcasting-native; all inputs share a shape. Units: K, kg/kg, Pa.
+    """
+    latent_heat = LHE if phase == "water" else LHS
+    slh = latent_heat / SHA
+
+    tv_plume = t_plume * (1.0 + DELTX * q_plume - condensate_plume)
+    tv_env = t_env * (1.0 + DELTX * q_env - condensate_env)
+    dq_total = q_plume + condensate_plume - q_env - condensate_env
+    dmse = t_plume - t_env + slh * (q_plume - q_env)
+
+    # ``get_fpl``'s bailouts. The same conditions guard the divisions below, so
+    # the arithmetic stays finite even where we end up returning zero.
+    no_downdraft = ((tv_plume <= tv_env)
+                    | (jnp.abs(dmse) < 1.0e-3)
+                    | (jnp.abs(dq_total) < 1.0e-6 * jnp.abs(q_plume)))
+    dmse_safe = jnp.where(jnp.abs(dmse) < 1.0e-3, 1.0, dmse)
+    dq_safe = jnp.where(jnp.abs(dq_total) < _TEENY, 1.0, dq_total)
+
+    # Mixing fraction at neutral buoyancy, including virtual-temperature effects.
+    dqt_by_dmse = dq_safe / dmse_safe
+    fac2 = 1.0 + DELTX - slh * dqt_by_dmse
+    t_neutral = t_env
+    for _ in range(2):
+        qst = saturation_specific_humidity(t_neutral, pressure, phase)
+        fac = (1.0 + fac2 * qst
+               - (t_neutral - t_env - slh * q_env) * dqt_by_dmse
+               - (q_env + condensate_env))
+        slope = fac + t_neutral * (fac2 * qst * d_ln_qsat_dt(t_neutral, phase)
+                                   - dqt_by_dmse)
+        slope = jnp.where(jnp.abs(slope) < _TEENY, 1.0, slope)
+        t_neutral = t_neutral - (t_neutral * fac - tv_env) / slope
+    qst_neutral = saturation_specific_humidity(t_neutral, pressure, phase)
+    fpl_neutral = jnp.clip(
+        (t_neutral - t_env + slh * (qst_neutral - q_env)) / dmse_safe, 0.0, 1.0)
+
+    # No downdraft if the neutral mixture holds no condensate to evaporate.
+    condensate_neutral = (fpl_neutral * (q_plume + condensate_plume)
+                          + (1.0 - fpl_neutral) * (q_env + condensate_env)
+                          - qst_neutral)
+    interior = (fpl_neutral != 0.0) & (fpl_neutral != 1.0)
+    no_downdraft = no_downdraft | (interior & (condensate_neutral < 0.0))
+
+    # Mixing fraction that exactly evaporates the mixture's condensate.
+    fac_evap = (t_plume - t_env
+                - slh * (condensate_plume - condensate_env)) / dq_safe
+    t_mix = t_env
+    for _ in range(2):
+        qst = saturation_specific_humidity(t_mix, pressure, phase)
+        slope = fac_evap * qst * d_ln_qsat_dt(t_mix, phase) - 1.0
+        slope = jnp.where(jnp.abs(slope) < _TEENY, -1.0, slope)
+        t_mix = t_mix - (t_env - slh * condensate_env
+                         + fac_evap * (qst - q_env - condensate_env) - t_mix) / slope
+    fpl_min = jnp.clip(
+        (saturation_specific_humidity(t_mix, pressure, phase)
+         - q_env - condensate_env) / dq_safe, 0.0, 1.0)
+
+    # ``get_fpl`` option 1: halfway between neutral and most-negative buoyancy.
+    fpl = 0.5 * (fpl_neutral + fpl_min)
+    return jnp.where(no_downdraft, 0.0, fpl)
+
+
 def _plume_core(h_p, qt_p, w2_prev, w_prev, m, t_env, q_env, phi, p, dz,
-                layer_mass, contce, phase):
+                layer_mass, downdraft_allowed, contce, phase):
     """One entraining-plume level: physics shared by the base-relative and
     full-column ascents.
 
@@ -275,6 +358,23 @@ def _plume_core(h_p, qt_p, w2_prev, w_prev, m, t_env, q_env, phi, p, dz,
     entrained = jnp.minimum(entrained, layer_mass * _REMRAT)
     delta = jnp.minimum(det * dz, 0.95)
     m_next = (m + entrained) * (1.0 - delta)
+
+    # Downdraft mass diversion. Where a plume/environment mixture is negatively
+    # buoyant, ``MSTCNV`` initiates a downdraft carrying ``fpl*ETADN`` of the
+    # updraft mass (line ~3053): ``MPLUME = FLEFT*MPLUME`` with
+    # ``FLEFT = 1 - fpl*ETADN``. The *intensive* plume properties are unchanged
+    # (``SMP``/``QMP`` are scaled by the same FLEFT), so the surviving core stays
+    # just as buoyant and keeps accelerating even as its mass drops -- which is
+    # exactly what the ModelE plume oracle shows (mass falls ~84x through the
+    # cloud layer while w rises 0.57 -> 1.96 m/s). Buoyancy-sorting detrainment
+    # alone cannot do that, since it only acts when the plume is *negatively*
+    # buoyant and therefore decelerating.
+    #
+    # ``MSTCNV`` starts downdrafts two levels above cloud base
+    # (``if(L-LMIN.gt.1)``); ``downdraft_allowed`` carries that per-level gate.
+    fpl = plume_mixing_fraction(t_env, q_env, 0.0, t_p, qv_p, qc_p, p, phase)
+    fpl = jnp.where(downdraft_allowed, fpl, 0.0)
+    m_next = m_next * (1.0 - fpl * _ETADN)
 
     return (h_next, qt_next, w2, w, m_next), (t_p, qc_p, buoyancy, w2, m_next, det)
 
@@ -334,14 +434,20 @@ def entraining_plume_ascent(t_base, q_base, geopotential_base, p_base, w_base,
 
     def step(carry, inp):
         h_p, qt_p, w2_prev, w_prev, m = carry
-        t_env, q_env, phi, p, dz, ma = inp
+        t_env, q_env, phi, p, dz, ma, downdraft_ok = inp
         return _plume_core(h_p, qt_p, w2_prev, w_prev, m,
-                           t_env, q_env, phi, p, dz, ma, contce, phase)
+                           t_env, q_env, phi, p, dz, ma, downdraft_ok,
+                           contce, phase)
+
+    # Profiles here start at the first in-cloud level, so MSTCNV's "downdrafts
+    # begin two levels above cloud base" gate is index >= 1.
+    downdraft_gate = jnp.arange(env_temperature.shape[0]).reshape(
+        (-1,) + (1,) * (env_temperature.ndim - 1)) >= 1
 
     _, (parcel_t, condensate, buoyancy, w2_prof, mass_flux, _det) = jax.lax.scan(
         step, (h_base, qt_base, w_base ** 2, w_base, m_base),
         (env_temperature, env_vapor, geopotential, pressure, layer_thickness,
-         cap_mass))
+         cap_mass, jnp.broadcast_to(downdraft_gate, env_temperature.shape)))
 
     n = env_temperature.shape[0]
     stopped = w2_prof <= 0.0
@@ -413,8 +519,10 @@ def plume_ascent_column(cloud_base, t_base, q_base, geopotential_base, w_base,
         w_prev = jnp.where(launch, w_base, w_prev)
         m = jnp.where(launch, m_base, m)
 
+        # MSTCNV starts downdrafts two levels above cloud base (L-LMIN > 1).
         next_carry, out = _plume_core(h_p, qt_p, w2_prev, w_prev, m,
-                                      t_env, q_env, phi, p, dz, ma, contce, phase)
+                                      t_env, q_env, phi, p, dz, ma,
+                                      level >= cloud_base + 2, contce, phase)
 
         # Below the launch level the plume does not exist: keep the carry and the
         # outputs at zero so nothing propagates up from the sub-cloud layer.
