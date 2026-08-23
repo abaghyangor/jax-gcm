@@ -27,21 +27,41 @@ from jcm.physics.convection import giss_bsort as bs
 # kew, frem
 _ORACLE = {
     "ceiling": dict(
-        mplume=51.78002, ent=0.004, det=0.0, ma=114.139, lag=51.78002,
-        mpb=51.78002, gzl=104.5873, delz=104.5267, buoy=0.002612452,
-        bdzsum=0.1472851, kew=23.11038, frem=0.418349),
+        mplume=51.78002, ent=0.004, det=0.0, ma=114.139,
+        lag=51.78002, mpb=51.78002, gzl=104.5873, delz=104.5267,
+        buoy=0.002612452, bdzsum=0.1472851, kew=23.11038, frem=0.418349,
+        smp=2155.917, qmp=0.8344364, wmp=0.0306781,
+        senv=41.55117, qenv=0.01419186, tvl=295.343,
+        plk=7.047142, pres=91782.26,
+        plume_out=40.94896, detrained=32.49318, downdraft=0.0,
+        mixbuoy=[-0.0003713399, -4.448836e-05, 0.001291898]),
     "interior": dict(
-        mplume=49.80765, ent=0.002373484, det=0.0, ma=145.2678, lag=51.78002,
-        mpb=51.78002, gzl=138.7207, delz=136.0888, buoy=0.002362324,
-        bdzsum=0.5112552, kew=44.57142, frem=0.3421566),
+        mplume=49.80765, ent=0.002373484, det=0.0, ma=145.2678,
+        lag=51.78002, mpb=51.78002, gzl=138.7207, delz=136.0888,
+        buoy=0.002362324, bdzsum=0.5112552, kew=44.57142, frem=0.3421566,
+        smp=2079.185, qmp=0.749384, wmp=0.02899073,
+        senv=41.67797, qenv=0.01280588, tvl=293.6729,
+        plk=6.991814, pres=89289.23,
+        plume_out=41.12595, detrained=25.08094, downdraft=0.0,
+        mixbuoy=[-0.000454143, -0.0006783077, 0.0008232186]),
     "floor": dict(
-        mplume=23.86885, ent=0.0005, det=0.0, ma=238.6542, lag=51.78002,
-        mpb=51.78002, gzl=237.6995, delz=237.0469, buoy=0.001210612,
-        bdzsum=1.355113, kew=39.80636, frem=0.2941929),
+        mplume=23.86885, ent=0.0005, det=0.0, ma=238.6542,
+        lag=51.78002, mpb=51.78002, gzl=237.6995, delz=237.0469,
+        buoy=0.001210612, bdzsum=1.355113, kew=39.80636, frem=0.2941929,
+        smp=1005.529, qmp=0.3215634, wmp=0.01914901,
+        senv=42.17594, qenv=0.008228802, tvl=290.8705,
+        plk=6.862273, pres=83641.74,
+        plume_out=16.8468, detrained=0.0, downdraft=9.858854,
+        mixbuoy=[-0.002642248, -0.002767787, -0.001156702]),
     "overshoot": dict(
-        mplume=16.8468, ent=0.0, det=0.001809418, ma=269.783, lag=51.78002,
-        mpb=51.78002, gzl=276.6867, delz=276.3319, buoy=-0.001605852,
-        bdzsum=-0.08094228, kew=-50.86821, frem=0.500642),
+        mplume=16.8468, ent=0.0, det=0.001809418, ma=269.783,
+        lag=51.78002, mpb=51.78002, gzl=276.6867, delz=276.3319,
+        buoy=-0.001605852, bdzsum=-0.08094228, kew=-50.86821, frem=0.500642,
+        smp=713.1072, qmp=0.2176886, wmp=0.01345424,
+        senv=42.56336, qenv=0.005121686, tvl=290.4641,
+        plk=6.803096, pres=81148.71,
+        plume_out=8.412587, detrained=8.434217, downdraft=0.0,
+        mixbuoy=[-0.001605912]),
 }
 
 _PRESSURE = 9.5e4  # Pa; only affects the (unreachable here) iplume==1 floor.
@@ -221,3 +241,137 @@ class TestBlendAirMasses(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSortBlends(unittest.TestCase):
+    """The sorting itself, against the same real BOMEX levels.
+
+    The four fixtures cover all three fates: ``ceiling``/``interior`` detrain
+    part of the blend air, ``floor`` sends its negative blends to the downdraft,
+    and ``overshoot`` has blends below the downdraft threshold that detrain
+    anyway because the plume is overshooting.
+    """
+
+    def _sorted(self, case):
+        o = _ORACLE[case]
+        env, upd, uf, ef, _ = bs.blend_air_masses(
+            jnp.array(o["mplume"]), jnp.array(o["mpb"]), jnp.array(o["lag"]),
+            jnp.array(o["ent"]), jnp.array(o["det"]), jnp.array(o["gzl"]),
+            jnp.array(o["ma"]))
+        return o, bs.sort_blends(
+            jnp.array(o["mplume"]), jnp.array(o["smp"]), jnp.array(o["qmp"]),
+            jnp.array(o["wmp"]), jnp.array(o["senv"]), jnp.array(o["qenv"]),
+            env, upd, uf, ef, jnp.array(o["plk"]), jnp.array(o["pres"]),
+            jnp.array(o["tvl"]), jnp.array(o["buoy"])), env
+
+    def test_mass_budget_matches_oracle(self):
+        for case in _ORACLE:
+            o, r, _ = self._sorted(case)
+            for got, want, label in (
+                    (r.plume_mass, o["plume_out"], "plume"),
+                    (r.detrained_mass, o["detrained"], "detrained"),
+                    (r.downdraft_mass, o["downdraft"], "downdraft")):
+                if want > 0.0:
+                    self.assertAlmostEqual(float(got) / want, 1.0, delta=1e-4,
+                                           msg=f"{case}/{label}")
+                else:
+                    self.assertLess(float(got), 1e-6, msg=f"{case}/{label}")
+
+    def test_mixture_buoyancy_matches_oracle(self):
+        # Absolute, not relative: mixbuoy is a small difference of two ~290 K
+        # virtual temperatures, and the decision threshold it is compared
+        # against is ~1.7e-4, so absolute agreement is what matters.
+        for case, o in _ORACLE.items():
+            _, r, _ = self._sorted(case)
+            for blend, want in enumerate(o["mixbuoy"]):
+                self.assertAlmostEqual(
+                    float(r.mixture_buoyancy[blend]), want, delta=5e-6,
+                    msg=f"{case}/blend{blend}")
+
+    def test_conserves_mass(self):
+        # Everything entering the level -- the plume plus the entrained
+        # environmental air -- must leave it via exactly one of the three fates.
+        for case in _ORACLE:
+            o, r, env = self._sorted(case)
+            total_in = o["mplume"] + float(env)
+            total_out = (float(r.plume_mass) + float(r.detrained_mass)
+                         + float(r.downdraft_mass))
+            self.assertAlmostEqual(total_out / total_in, 1.0, delta=1e-6,
+                                   msg=case)
+
+    def test_conserves_water_because_evaporation_is_only_a_test(self):
+        # ModelE evaporates each blend purely to decide its buoyancy, then hands
+        # back the untouched pre-evaporation properties. If the port applied the
+        # evaporation to the returned blend instead, vapour would be created
+        # here and this invariant would break.
+        for case in _ORACLE:
+            o, r, env = self._sorted(case)
+            water_in = o["qmp"] + float(env) * o["qenv"]
+            water_out = (float(r.plume_water) + float(r.detrained_water)
+                         + float(r.downdraft_water))
+            self.assertAlmostEqual(water_out / water_in, 1.0, delta=1e-6,
+                                   msg=case)
+            condensate_out = (float(r.plume_condensate)
+                              + float(r.detrained_condensate)
+                              + float(r.downdraft_condensate))
+            # Environmental air brings no condensate.
+            self.assertAlmostEqual(condensate_out / o["wmp"], 1.0, delta=1e-5,
+                                   msg=case)
+
+    def test_overshoot_guard_diverts_downdraft_air_to_detrainment(self):
+        # This fixture's blend is below the downdraft threshold, so without the
+        # guard it would seed a downdraft. Because the plume is overshooting it
+        # must detrain instead.
+        o, r, _ = self._sorted("overshoot")
+        threshold = bs._NEGATIVE_BUOYANCY / o["tvl"]
+        self.assertLess(o["mixbuoy"][0], threshold)   # would qualify
+        self.assertEqual(float(r.downdraft_mass), 0.0)
+        self.assertGreater(float(r.detrained_mass), 0.0)
+
+    def test_buoyant_blends_rejoin_and_grow_the_plume(self):
+        # The ceiling fixture has one clearly positive blend; the plume it
+        # returns must exceed what was retained after the set-aside.
+        o, r, _ = self._sorted("ceiling")
+        retained = o["mplume"] * (1.0 - o["frem"])
+        self.assertGreater(float(r.plume_mass), retained)
+
+    def test_column_matches_vectorized(self):
+        keys = ("mplume", "mpb", "lag", "ent", "det", "gzl", "ma", "smp", "qmp",
+                "wmp", "senv", "qenv", "plk", "pres", "tvl", "buoy")
+        v = {k: jnp.array([_ORACLE[c][k] for c in _ORACLE]) for k in keys}
+
+        def run(get):
+            env, upd, uf, ef, _ = bs.blend_air_masses(
+                get("mplume"), get("mpb"), get("lag"), get("ent"), get("det"),
+                get("gzl"), get("ma"))
+            return bs.sort_blends(
+                get("mplume"), get("smp"), get("qmp"), get("wmp"), get("senv"),
+                get("qenv"), env, upd, uf, ef, get("plk"), get("pres"),
+                get("tvl"), get("buoy"))
+
+        column = run(lambda k: v[k])
+        block = run(lambda k: v[k][:, None] * jnp.ones((1, 3)))
+        self.assertLess(
+            float(jnp.max(jnp.abs(column.plume_mass[:, None]
+                                  - block.plume_mass))), 1e-4)
+        self.assertLess(
+            float(jnp.max(jnp.abs(column.detrained_mass[:, None]
+                                  - block.detrained_mass))), 1e-4)
+
+    def test_gradient_finite(self):
+        o = _ORACLE["interior"]
+
+        def f(plume_mass):
+            env, upd, uf, ef, _ = bs.blend_air_masses(
+                plume_mass, jnp.array(o["mpb"]), jnp.array(o["lag"]),
+                jnp.array(o["ent"]), jnp.array(o["det"]), jnp.array(o["gzl"]),
+                jnp.array(o["ma"]))
+            r = bs.sort_blends(
+                plume_mass, jnp.array(o["smp"]), jnp.array(o["qmp"]),
+                jnp.array(o["wmp"]), jnp.array(o["senv"]), jnp.array(o["qenv"]),
+                env, upd, uf, ef, jnp.array(o["plk"]), jnp.array(o["pres"]),
+                jnp.array(o["tvl"]), jnp.array(o["buoy"]))
+            return r.plume_mass
+
+        grad = jax.grad(f)(jnp.array(o["mplume"]))
+        self.assertTrue(bool(jnp.isfinite(grad)))

@@ -36,9 +36,13 @@ helpers intended for use inside the ascent scan, so their inputs have shape
 ``nmix``.
 """
 
+from typing import NamedTuple
+
 import jax.numpy as jnp
 
 import jcm.constants as c
+from jcm.physics.convection.giss_thermodynamics import (
+    DELTX, LHE, LHS, SHA, condensate_evaporation)
 
 # Fraction of the buoyancy force that goes into vertical kinetic energy. ModelE
 # applies only a sixth while the parcel is buoyant, but the full force once it
@@ -265,3 +269,161 @@ def blend_air_masses(plume_mass: jnp.ndarray,
 
     return (environment_air, updraft_air, updraft_factor, environment_factor,
             fupd)
+
+
+# Virtual-temperature thresholds the sorted blends are tested against, in K
+# before division by the environment's virtual temperature (MSTCNV.F90).
+_POSITIVE_BUOYANCY = 0.05    # above this a blend rejoins the updraft
+_NEGATIVE_BUOYANCY = -0.2    # below this it seeds the downdraft
+# Once the plume itself is this negatively buoyant it is overshooting, and
+# downdraft formation is switched off -- negative blends detrain locally
+# instead. Omitting this guard misroutes blends on exactly the levels where the
+# plume is dying (verified: 1566/1572 without it, 1572/1572 with it).
+_OVERSHOOT_BUOYANCY = -0.25
+
+
+class SortedBlends(NamedTuple):
+    """Outcome of sorting one level's blends.
+
+    ``*_mass``/``*_heat``/``*_water``/``*_condensate`` are extensive. The three
+    fates partition the blend air exactly, and together with the retained plume
+    they conserve mass: ``plume_mass + detrained_mass + downdraft_mass`` equals
+    the incoming plume mass plus the entrained environmental air.
+    """
+    plume_mass: jnp.ndarray
+    plume_heat: jnp.ndarray
+    plume_water: jnp.ndarray
+    plume_condensate: jnp.ndarray
+    detrained_mass: jnp.ndarray
+    detrained_heat: jnp.ndarray
+    detrained_water: jnp.ndarray
+    detrained_condensate: jnp.ndarray
+    downdraft_mass: jnp.ndarray
+    downdraft_heat: jnp.ndarray
+    downdraft_water: jnp.ndarray
+    downdraft_condensate: jnp.ndarray
+    mixture_buoyancy: jnp.ndarray
+
+
+def sort_blends(plume_mass: jnp.ndarray,
+                plume_heat: jnp.ndarray,
+                plume_water: jnp.ndarray,
+                plume_condensate: jnp.ndarray,
+                environment_heat: jnp.ndarray,
+                environment_water: jnp.ndarray,
+                environment_air: jnp.ndarray,
+                updraft_air: jnp.ndarray,
+                updraft_factor: jnp.ndarray,
+                environment_factor: jnp.ndarray,
+                exner: jnp.ndarray,
+                pressure: jnp.ndarray,
+                environment_virtual_temperature: jnp.ndarray,
+                buoyancy: jnp.ndarray,
+                phase: str = "water") -> SortedBlends:
+    """Build the blend spectrum, evaporate, and sort each blend by buoyancy.
+
+    This is the step that makes the scheme what it is. ModelE first *removes*
+    ``updraft_air`` from the plume, builds blends of it with entrained
+    environmental air, and then only returns the blends that turn out buoyant.
+    Everything else is gone: strongly negative blends seed the downdraft and the
+    rest detrain. That asymmetry -- remove first, return conditionally -- is
+    what lets plume mass decay smoothly with height.
+
+    The evaporation is a **test only**. ModelE evaporates each blend's
+    condensate to see whether the resulting cooling makes it negatively buoyant,
+    but the mass that rejoins the updraft carries its *original* heat, water and
+    condensate (``MSTCNV.F90``: the branches add back the untouched extensive
+    ``smmix``/``qmmix``/``wmmix``). Actual phase change is handled by the
+    microphysics, not here, so applying the evaporation to the returned
+    properties would double-count it.
+
+    Args:
+        plume_mass: ``mplume`` entering the level [kg/m^2].
+        plume_heat: ``smp``, extensive heat content (potential-temperature-like).
+        plume_water: ``qmp``, extensive water vapour.
+        plume_condensate: ``wmp``, extensive condensate.
+        environment_heat: ``senv``, *intensive* environmental heat.
+        environment_water: ``qenv``, *intensive* environmental humidity.
+        environment_air: Entrained environmental air [kg/m^2].
+        updraft_air: Updraft air set aside for sorting [kg/m^2].
+        updraft_factor: Per-blend share of ``updraft_air``, leading axis
+            ``NMIX``.
+        environment_factor: Per-blend share of ``environment_air``.
+        exner: ``plk(l)``, ModelE's ``p[mb]**KAPA``.
+        pressure: Level pressure [**Pa**].
+        environment_virtual_temperature: ``tvl(l)`` [K].
+        buoyancy: Plume buoyancy at this level, for the overshooting guard.
+        phase: ``"water"`` or ``"ice"``. Static.
+
+    Returns:
+        A :class:`SortedBlends`.
+    """
+    latent_heat = LHE if phase == "water" else LHS
+    slh = latent_heat / SHA
+
+    # Remove the set-aside air from the plume. What survives is the part that
+    # never participates in mixing at this level.
+    removed_fraction = updraft_air / jnp.maximum(plume_mass, _TEENY)
+    retained = 1.0 - removed_fraction
+    set_aside_heat = plume_heat * removed_fraction
+    set_aside_water = plume_water * removed_fraction
+    set_aside_condensate = plume_condensate * removed_fraction
+
+    # Environmental air carries no condensate into the blends.
+    entrained_heat = environment_air * environment_heat
+    entrained_water = environment_air * environment_water
+
+    # Per-blend extensive amounts. `updraft_factor`/`environment_factor` lead
+    # with the NMIX axis, so these do too.
+    blend_mass = updraft_factor * updraft_air + environment_factor * environment_air
+    blend_heat = (updraft_factor * set_aside_heat
+                  + environment_factor * entrained_heat)
+    blend_water = (updraft_factor * set_aside_water
+                   + environment_factor * entrained_water)
+    blend_condensate = updraft_factor * set_aside_condensate
+
+    # Intensive properties. Zero-mass blends (the overshooting branch's unused
+    # slots) divide safely and end up strongly negative, but since they carry no
+    # mass their fate has no effect.
+    safe_mass = jnp.maximum(blend_mass, _TEENY)
+    blend_t = blend_heat / safe_mass
+    blend_q = blend_water / safe_mass
+    blend_condensate_intensive = blend_condensate / safe_mass
+
+    evaporated, _ = condensate_evaporation(
+        blend_t, blend_q, exner, 1.0, pressure, blend_condensate_intensive,
+        phase)
+    test_t = blend_t - slh * evaporated / exner
+    test_q = blend_q + evaporated
+    test_condensate = blend_condensate_intensive - evaporated
+
+    virtual_t = test_t * exner * (1.0 + DELTX * test_q)
+    mixture_buoyancy = ((virtual_t - environment_virtual_temperature)
+                        / environment_virtual_temperature - test_condensate)
+
+    overshooting = buoyancy <= _OVERSHOOT_BUOYANCY / environment_virtual_temperature
+    rejoins = mixture_buoyancy > _POSITIVE_BUOYANCY / environment_virtual_temperature
+    to_downdraft = (
+        (mixture_buoyancy < _NEGATIVE_BUOYANCY / environment_virtual_temperature)
+        & ~overshooting & ~rejoins)
+    detrains = ~rejoins & ~to_downdraft
+
+    def _gather(mask, field):
+        return jnp.sum(jnp.where(mask, field, 0.0), axis=0)
+
+    return SortedBlends(
+        plume_mass=plume_mass * retained + _gather(rejoins, blend_mass),
+        plume_heat=plume_heat * retained + _gather(rejoins, blend_heat),
+        plume_water=plume_water * retained + _gather(rejoins, blend_water),
+        plume_condensate=(plume_condensate * retained
+                          + _gather(rejoins, blend_condensate)),
+        detrained_mass=_gather(detrains, blend_mass),
+        detrained_heat=_gather(detrains, blend_heat),
+        detrained_water=_gather(detrains, blend_water),
+        detrained_condensate=_gather(detrains, blend_condensate),
+        downdraft_mass=_gather(to_downdraft, blend_mass),
+        downdraft_heat=_gather(to_downdraft, blend_heat),
+        downdraft_water=_gather(to_downdraft, blend_water),
+        downdraft_condensate=_gather(to_downdraft, blend_condensate),
+        mixture_buoyancy=mixture_buoyancy,
+    )
