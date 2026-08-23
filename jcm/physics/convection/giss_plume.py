@@ -112,6 +112,9 @@ _TWO_THIRDS = 2.0 / 3.0   # detrainment-drag coefficient in the Gregory w^2 law
 _TEENY = 1.0e-20
 _REMRAT = 0.333          # MSTCNV cap: entrained mass <= remrat * layer air mass
 _ETADN = 1.0 / 3.0       # MSTCNV ETADN0: updraft fraction diverted to a downdraft
+# Detrainment depth large enough that det*dz/(1+det*dz) saturates at 1, used to
+# express MSTCNV's total cloud-top detrainment as a rate.
+_TOTAL_DETRAINMENT = 1.0e6
 
 
 def entrainment_rate(buoyancy: jnp.ndarray,
@@ -564,6 +567,20 @@ def plume_ascent_column(cloud_base, t_base, q_base, geopotential_base, w_base,
     alive = in_cloud & (stopped_below == 0.0)
     mass_flux = jnp.where(alive, mass_flux, 0.0)
     det = jnp.where(alive, det, 0.0)
+
+    # Cloud-top dump. When the plume stops, ``MSTCNV`` detrains **all** of its
+    # remaining mass and moisture into the top layer
+    # (``DSM(LMAX)+=SMP``/``DQM(LMAX)+=QMP``, lines 1981-1983). Without it the
+    # plume's remaining water simply disappears -- the scheme stops conserving
+    # moisture, and the cloud layer ends up net *drying* where ModelE moistens
+    # it. Expressed as a detrainment rate large enough that the
+    # ``det*dz/(1+det*dz)`` fraction saturates at 1, i.e. total detrainment.
+    dead_above = jnp.concatenate(
+        [~alive[1:], jnp.ones((1,) + alive.shape[1:], dtype=bool)], axis=0)
+    at_top = alive & dead_above
+    det = jnp.where(at_top,
+                    _TOTAL_DETRAINMENT / jnp.maximum(layer_thickness, _TEENY),
+                    det)
 
     # Sub-cloud source layers. The plume does not draw its cloud-base mass from
     # the cloud-base layer alone: ``MSTCNV`` removes it from *every* boundary-layer
