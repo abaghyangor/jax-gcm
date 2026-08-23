@@ -20,6 +20,7 @@ import unittest
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from jcm.physics.convection import giss_bsort as bs
 
@@ -374,4 +375,169 @@ class TestSortBlends(unittest.TestCase):
             return r.plume_mass
 
         grad = jax.grad(f)(jnp.array(o["mplume"]))
+        self.assertTrue(bool(jnp.isfinite(grad)))
+
+
+# One real BOMEX column (period 1), levels 10-16. Columns follow the dump's
+# layout; see modele_patches/README.md in the bridge repo.
+_COLUMN = dict(
+    level=[10, 11, 12, 13, 14, 15, 16],
+    cloud_base=10, enteff=0.67,
+    mplume=[51.78002, 40.9490, 49.80765, 41.1260, 32.3701, 23.8688, 16.8468],
+    wcu=[0.6661229, 0.8595595, 1.006440, 1.261636, 1.548336, 1.632314, 0.0],
+    ent=[0.004, 0.004, 0.002373484, 0.001860267, 0.001478261, 0.0005, 0.0],
+    lag=[51.78002] * 7,
+    ma=[114.139, 124.5152, 145.2678, 176.3966, 207.5254, 238.6542, 269.783],
+    gzl=[104.5873, 114.9679, 138.7207, 168.0, 202.0, 237.6995, 276.6867],
+    delz=[104.5267, 114.9, 136.0888, 166.0, 200.0, 237.0469, 276.3319],
+    zl=[871.95, 981.82, 1107.44, 1259.26, 1443.48, 1662.34, 1918.88],
+    senv=[41.55117, 41.6, 41.67797, 41.8, 41.95, 42.17594, 42.56336],
+    qenv=[0.01419186, 0.0135, 0.01280588, 0.0115, 0.0100, 0.008228802,
+          0.005121686],
+    tvl=[295.343, 294.5, 293.6729, 292.5, 291.5, 290.8705, 290.4641],
+    plk=[7.047142, 7.02, 6.991814, 6.94, 6.90, 6.862273, 6.803096],
+    pres=[91782.26, 90500.0, 89289.23, 87000.0, 85000.0, 83641.74, 81148.71],
+    smp=2155.917, qmp=0.8344364, wmp=0.0306781,
+    detrained0=32.49318, downdraft0=0.0,
+)
+_NLEV = 24
+
+
+def _column_profile(key, fill=0.0):
+    a = [fill] * _NLEV
+    for i, lev in enumerate(_COLUMN["level"]):
+        a[lev] = _COLUMN[key][i]
+    return jnp.array(a)
+
+
+def _run_column(**overrides):
+    kwargs = dict(
+        cloud_base=jnp.array(_COLUMN["cloud_base"]),
+        cloud_base_mass=jnp.array(_COLUMN["mplume"][0]),
+        cloud_base_heat=jnp.array(_COLUMN["smp"]),
+        cloud_base_water=jnp.array(_COLUMN["qmp"]),
+        cloud_base_condensate=jnp.array(_COLUMN["wmp"]),
+        environment_heat=_column_profile("senv", 41.5),
+        environment_water=_column_profile("qenv", 0.005),
+        environment_virtual_temperature=_column_profile("tvl", 300.0),
+        layer_mass=_column_profile("ma", 1.0),
+        layer_depth=_column_profile("gzl", 1.0),
+        layer_thickness=_column_profile("delz", 1.0),
+        height=_column_profile("zl", 3000.0),
+        exner=_column_profile("plk", 7.0),
+        pressure=_column_profile("pres", 9.0e4),
+        entrainment_efficiency=jnp.array(_COLUMN["enteff"]))
+    kwargs.update(overrides)
+    return bs.plume_ascent(**kwargs)
+
+
+class TestPlumeAscent(unittest.TestCase):
+    """The ascent driver: seeding, the 1 km lookback, and termination.
+
+    Scope note: this exercises the driver's own plumbing, and the **cloud-base
+    level against the oracle**, where the plume state is known exactly. It does
+    *not* chain the whole column against ModelE, because between plume levels
+    ModelE also condenses (``get_dq_cond``) and runs
+    ``CONVECTIVE_MICROPHYSICS`` to remove precipitation, neither of which is
+    ported yet. The per-level bsort physics is validated separately over all
+    536 oracle levels; see ``BSORT_PORT_PLAN.md``.
+    """
+
+    def test_cloud_base_level_matches_oracle(self):
+        r = _run_column()
+        base = _COLUMN["cloud_base"]
+        self.assertAlmostEqual(float(r.plume_mass[base]) / _COLUMN["mplume"][0],
+                               1.0, delta=1e-5)
+        self.assertAlmostEqual(float(r.vertical_velocity[base])
+                               / _COLUMN["wcu"][0], 1.0, delta=1e-3)
+        self.assertAlmostEqual(float(r.entrainment[base]) / _COLUMN["ent"][0],
+                               1.0, delta=1e-5)
+        self.assertAlmostEqual(float(r.detrained_mass[base])
+                               / _COLUMN["detrained0"], 1.0, delta=1e-4)
+        self.assertEqual(float(r.downdraft_mass[base]), _COLUMN["downdraft0"])
+
+    def test_levels_below_cloud_base_are_inactive(self):
+        r = _run_column()
+        base = _COLUMN["cloud_base"]
+        self.assertFalse(bool(jnp.any(r.active[:base])))
+        self.assertEqual(float(jnp.sum(r.plume_mass[:base])), 0.0)
+        self.assertEqual(float(jnp.sum(r.detrained_mass[:base])), 0.0)
+
+    def test_lag_falls_back_to_cloud_base_within_one_km(self):
+        # This column never climbs a full kilometre above its base, so every
+        # level's lookback must fall back to the cloud-base mass.
+        r = _run_column()
+        for i, lev in enumerate(_COLUMN["level"]):
+            if not bool(r.active[lev]):
+                continue
+            self.assertAlmostEqual(float(r.mass_lag[lev])
+                                   / _COLUMN["mplume"][0], 1.0, delta=1e-5,
+                                   msg=f"level {lev}")
+
+    def test_lag_selects_the_highest_level_more_than_one_km_below(self):
+        # Stretch the column so the lookback reaches past 1 km. At the level
+        # 1 km above the base the walk should land on a stored level, and the
+        # value it returns must be the mass that entered that level.
+        tall = jnp.array([0.0] * 10 + [i * 400.0 for i in range(14)])
+        r = _run_column(height=tall)
+        base = _COLUMN["cloud_base"]
+        # tall[base]=0, tall[base+3]=1200 > 1000, so level base+3 looks back to
+        # base; level base+4 (1600) can reach base+1 (400).
+        if bool(r.active[base + 4]):
+            self.assertAlmostEqual(
+                float(r.mass_lag[base + 4]) / float(r.plume_mass[base + 1]),
+                1.0, delta=1e-5)
+        self.assertAlmostEqual(
+            float(r.mass_lag[base + 3]) / float(r.plume_mass[base]), 1.0,
+            delta=1e-5)
+
+    def test_terminates_when_plume_shrinks_below_cloud_base_fraction(self):
+        # A tiny seed relative to its own cloud-base mass cannot survive: the
+        # 1% test fires on the state entering the second level.
+        r = _run_column(cloud_base_mass=jnp.array(1.0e-3),
+                        cloud_base_heat=jnp.array(_COLUMN["smp"] * 1e-3 / 51.78),
+                        cloud_base_water=jnp.array(_COLUMN["qmp"] * 1e-3 / 51.78),
+                        cloud_base_condensate=jnp.array(0.0))
+        self.assertLessEqual(int(jnp.sum(r.active)), 2)
+
+    def test_once_dead_stays_dead(self):
+        r = _run_column()
+        active = np.asarray(r.active)
+        if active.any():
+            first, last = active.argmax(), len(active) - active[::-1].argmax()
+            self.assertTrue(active[first:last].all(),
+                            "active levels must be contiguous")
+
+    def test_column_matches_vectorized(self):
+        single = _run_column()
+
+        def widen(x):
+            return x[:, None] * jnp.ones((1, 3)) if x.ndim else x
+        block = bs.plume_ascent(
+            cloud_base=jnp.full((3,), _COLUMN["cloud_base"]),
+            cloud_base_mass=jnp.full((3,), _COLUMN["mplume"][0]),
+            cloud_base_heat=jnp.full((3,), _COLUMN["smp"]),
+            cloud_base_water=jnp.full((3,), _COLUMN["qmp"]),
+            cloud_base_condensate=jnp.full((3,), _COLUMN["wmp"]),
+            environment_heat=widen(_column_profile("senv", 41.5)),
+            environment_water=widen(_column_profile("qenv", 0.005)),
+            environment_virtual_temperature=widen(
+                _column_profile("tvl", 300.0)),
+            layer_mass=widen(_column_profile("ma", 1.0)),
+            layer_depth=widen(_column_profile("gzl", 1.0)),
+            layer_thickness=widen(_column_profile("delz", 1.0)),
+            height=widen(_column_profile("zl", 3000.0)),
+            exner=widen(_column_profile("plk", 7.0)),
+            pressure=widen(_column_profile("pres", 9.0e4)),
+            entrainment_efficiency=jnp.full((3,), _COLUMN["enteff"]))
+        self.assertLess(float(jnp.max(jnp.abs(
+            single.plume_mass[:, None] - block.plume_mass))), 1e-4)
+        self.assertLess(float(jnp.max(jnp.abs(
+            single.detrained_mass[:, None] - block.detrained_mass))), 1e-4)
+
+    def test_gradient_finite(self):
+        def f(cloud_base_mass):
+            return jnp.sum(_run_column(cloud_base_mass=cloud_base_mass)
+                           .detrained_mass)
+        grad = jax.grad(f)(jnp.array(_COLUMN["mplume"][0]))
         self.assertTrue(bool(jnp.isfinite(grad)))

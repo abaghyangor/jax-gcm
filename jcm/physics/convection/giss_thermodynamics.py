@@ -244,7 +244,13 @@ def condensate_evaporation(dry_static_energy: jnp.ndarray,
     latent_heat = LHE if phase == "water" else LHS
     slh = latent_heat / SHA
 
-    parcel_t = dry_static_energy * exner / mass
+    # `saturation_vapor_pressure` clips its argument to the fit's valid range,
+    # but `d_ln_qsat_dt = L/(Rv*T^2)` does not, and a caller can legitimately
+    # hand this routine a degenerate parcel (a zero-mass blend, an inactive
+    # column). At T -> 0 that term is infinite: harmless in value, since it only
+    # divides, but it makes the gradient NaN and the NaN survives being masked
+    # out downstream. Clip to the same floor the saturation fit uses.
+    parcel_t = jnp.maximum(dry_static_energy * exner / mass, _MK_ICE_TMIN)
     remaining_water = water_mass
     dqsum = jnp.zeros_like(parcel_t)
 

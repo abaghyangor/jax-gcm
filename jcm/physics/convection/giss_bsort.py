@@ -39,6 +39,7 @@ helpers intended for use inside the ascent scan, so their inputs have shape
 from typing import NamedTuple
 
 import jax.numpy as jnp
+from jax import lax
 
 import jcm.constants as c
 from jcm.physics.convection.giss_thermodynamics import (
@@ -80,6 +81,24 @@ NMIX = 3
 _UPDRAFT_FRACTION_MAX = 0.99999
 
 _TEENY = 1e-20
+
+
+def _safe_divide(numerator, denominator, fallback=0.0):
+    """Divide only where the denominator is strictly positive.
+
+    The usual ``x / maximum(d, tiny)`` guard is finite in *value* but carries a
+    derivative of order ``1/tiny``, which overflows to NaN under ``grad`` and
+    then survives every downstream mask. Selecting the branch on both the
+    numerator and the denominator keeps the degenerate case out of the gradient
+    entirely.
+
+    Degenerate denominators are routine here rather than exceptional: a
+    terminated plume, an inactive column and an empty blend all reach these
+    expressions with zero mass.
+    """
+    usable = denominator > 0.0
+    return jnp.where(usable, numerator / jnp.where(usable, denominator, 1.0),
+                     fallback)
 
 
 def buoyancy_work_increments(buoyancy: jnp.ndarray,
@@ -149,11 +168,18 @@ def entrainment_rate(buoyancy: jnp.ndarray,
     buoyant = kew > denominator
 
     # `jnp.where` evaluates both branches, so the ratio must be safe even where
-    # it is discarded: ModelE never reaches the sqrt with a non-positive
-    # denominator (verified 0/502 on the oracle), but an unguarded sqrt of a
-    # negative would still poison the gradient here.
-    safe_denominator = jnp.where(buoyant, denominator, 1.0)
-    ratio = jnp.where(buoyant, kew / safe_denominator, 1.0)
+    # it is discarded. Two ways it can go wrong, both invisible in the forward
+    # value and both fatal to the gradient:
+    #   - the non-buoyant branch would take the sqrt of a negative ratio;
+    #   - a *terminated* plume has zero mass, hence a zero denominator, while
+    #     still carrying kew > 0 from when it was alive -- so `buoyant` is true
+    #     and the division is by zero.
+    # ModelE reaches the sqrt with a non-positive denominator on 0/502 live
+    # levels, so restricting the division to a strictly positive denominator
+    # changes nothing physical; it only keeps the dead levels differentiable.
+    usable = buoyant & (denominator > 0.0)
+    safe_denominator = jnp.where(usable, denominator, 1.0)
+    ratio = jnp.where(usable, kew / safe_denominator, 1.0)
 
     ent = jnp.minimum(_MAX_DILUTION, jnp.sqrt(ratio) - 1.0) / layer_thickness
     ent = jnp.where(buoyant, ent, -_DET_RATE / layer_thickness)
@@ -231,31 +257,30 @@ def blend_air_masses(plume_mass: jnp.ndarray,
 
     # Blending ratios, drifting toward complete mixing as the plume thins.
     reference_weight = jnp.minimum(
-        1.0, plume_mass / jnp.maximum(plume_mass_lag, _TEENY))
-    fupd_full_mixing = plume_mass / jnp.maximum(
-        plume_mass + environment_air, _TEENY)
+        1.0, _safe_divide(plume_mass, plume_mass_lag))
+    fupd_full_mixing = _safe_divide(plume_mass,
+                                    plume_mass + environment_air)
     fupd = (reference_weight * fupd_reference
             + (1.0 - reference_weight) * fupd_full_mixing)
 
     # Updraft air implied by those ratios and the entrained environmental air.
     environment_share = jnp.sum(frac * (1.0 - fupd), axis=0)
-    updraft_air = environment_air * (
-        1.0 / jnp.maximum(environment_share, _TEENY) - 1.0)
+    updraft_air = environment_air * _safe_divide(
+        1.0 - environment_share, environment_share)
 
     # Never set aside more updraft air than the plume holds; ModelE scales the
     # entrained air back by the same factor, which is a reduction of the
     # effective entrainment rate.
     updraft_air_max = _UPDRAFT_FRACTION_MAX * plume_mass
     excessive = updraft_air > updraft_air_max
-    rescale = jnp.where(excessive, updraft_air_max / jnp.maximum(
-        updraft_air, _TEENY), 1.0)
+    rescale = jnp.where(excessive,
+                        _safe_divide(updraft_air_max, updraft_air, 1.0), 1.0)
     environment_air = environment_air * rescale
     updraft_air = jnp.where(excessive, updraft_air_max, updraft_air)
 
     fupd_average = jnp.sum(frac * fupd, axis=0)
-    updraft_factor = frac * fupd / jnp.maximum(fupd_average, _TEENY)
-    environment_factor = (frac * (1.0 - fupd)
-                          / jnp.maximum(1.0 - fupd_average, _TEENY))
+    updraft_factor = _safe_divide(frac * fupd, fupd_average)
+    environment_factor = _safe_divide(frac * (1.0 - fupd), 1.0 - fupd_average)
 
     # Overshooting: one blend of pure updraft air, no environmental air.
     overshoot_updraft_air = plume_mass * jnp.minimum(
@@ -363,7 +388,7 @@ def sort_blends(plume_mass: jnp.ndarray,
 
     # Remove the set-aside air from the plume. What survives is the part that
     # never participates in mixing at this level.
-    removed_fraction = updraft_air / jnp.maximum(plume_mass, _TEENY)
+    removed_fraction = _safe_divide(updraft_air, plume_mass)
     retained = 1.0 - removed_fraction
     set_aside_heat = plume_heat * removed_fraction
     set_aside_water = plume_water * removed_fraction
@@ -385,10 +410,18 @@ def sort_blends(plume_mass: jnp.ndarray,
     # Intensive properties. Zero-mass blends (the overshooting branch's unused
     # slots) divide safely and end up strongly negative, but since they carry no
     # mass their fate has no effect.
-    safe_mass = jnp.maximum(blend_mass, _TEENY)
-    blend_t = blend_heat / safe_mass
-    blend_q = blend_water / safe_mass
-    blend_condensate_intensive = blend_condensate / safe_mass
+    # An empty blend has no intensive properties, and dividing by a floor would
+    # hand the saturation calculation a zero temperature. That is finite-valued
+    # (`qsat` clamps) but not differentiable: `d(ln qsat)/dT = L/(Rv*T^2)` blows
+    # up, and the resulting NaN survives being masked out later. Give empty
+    # blends the environment's properties instead -- physically what a blend of
+    # no air is, and harmless because it carries no mass to any fate.
+    occupied = blend_mass > 0.0
+    safe_mass = jnp.where(occupied, blend_mass, 1.0)
+    blend_t = jnp.where(occupied, blend_heat / safe_mass, environment_heat)
+    blend_q = jnp.where(occupied, blend_water / safe_mass, environment_water)
+    blend_condensate_intensive = jnp.where(
+        occupied, blend_condensate / safe_mass, 0.0)
 
     evaporated, _ = condensate_evaporation(
         blend_t, blend_q, exner, 1.0, pressure, blend_condensate_intensive,
@@ -427,3 +460,244 @@ def sort_blends(plume_mass: jnp.ndarray,
         downdraft_condensate=_gather(to_downdraft, blend_condensate),
         mixture_buoyancy=mixture_buoyancy,
     )
+
+
+def vertical_velocity(kew: jnp.ndarray,
+                      plume_mass: jnp.ndarray,
+                      environment_air: jnp.ndarray) -> jnp.ndarray:
+    """Updraft speed, diluted by the air about to be entrained [m/s].
+
+    ModelE carries vertical momentum extensively as ``mw = sqrt(2*kew*mplume)``
+    and converts to an intensive speed by dividing by the *post-entrainment*
+    mass. The dilution is therefore applied here, before the sorting, using the
+    incoming plume mass -- which is why entraining a lot of air slows the plume
+    even on a level where it stays buoyant.
+
+    Args:
+        kew: Running buoyancy-work integral at this level. Clipped at zero: a
+            negative integral means the plume has no kinetic energy left, not an
+            imaginary velocity.
+        plume_mass: Plume mass entering the level [kg/m^2].
+        environment_air: Environmental air being entrained [kg/m^2].
+
+    Returns:
+        Updraft speed [m/s].
+    """
+    # `sqrt` has an infinite derivative at zero, and zero is a perfectly normal
+    # argument here: it is what a terminated plume (no mass, no kinetic energy)
+    # produces. Selecting the branch before taking the root keeps the gradient
+    # finite, which an outer `jnp.maximum` alone would not do.
+    energy = 2.0 * jnp.maximum(kew, 0.0) * plume_mass
+    moving = energy > 0.0
+    momentum = jnp.where(moving, jnp.sqrt(jnp.where(moving, energy, 1.0)), 0.0)
+    return _safe_divide(momentum, plume_mass + environment_air)
+
+
+def kinetic_energy(vertical_velocity_: jnp.ndarray,
+                   plume_mass: jnp.ndarray) -> jnp.ndarray:
+    """Rebuild ``kew`` from the updraft speed once the plume mass has changed.
+
+    The counterpart to :func:`vertical_velocity`, applied at the end of the
+    level: the speed is held fixed while the mass is replaced by the
+    post-sorting value, so ``kew`` is carried into the next level consistently
+    with the mass that survived.
+
+    Args:
+        vertical_velocity_: Updraft speed at this level [m/s].
+        plume_mass: Plume mass **after** sorting [kg/m^2].
+
+    Returns:
+        Buoyancy-work integral to carry upward.
+    """
+    return 0.5 * vertical_velocity_ ** 2 * plume_mass
+
+
+# Plume termination thresholds (MSTCNV.F90, checked at the top of each level).
+_MIN_PLUME_FRACTION = 5.0e-4      # MINFRAC: mplume vs the layer's own mass
+_MIN_CLOUD_BASE_FRACTION = 0.01   # bsort-specific: mplume vs its cloud-base mass
+_MAX_OVERSHOOT_DT = 1.0           # max_dt_overshoot [K], before /tvl
+
+# Distance below the current level at which `mplume_lag` is sampled.
+_LAG_DISTANCE = 1.0e3
+
+
+class PlumeAscent(NamedTuple):
+    """Per-level results of one plume's ascent. All arrays are ``(nlev, *horiz)``."""
+    plume_mass: jnp.ndarray          # mass entering each level
+    mass_lag: jnp.ndarray            # mplume_lag: mass ~1 km below
+    vertical_velocity: jnp.ndarray
+    entrainment: jnp.ndarray
+    detrainment: jnp.ndarray
+    entrained_air: jnp.ndarray       # environmental air drawn in
+    detrained_mass: jnp.ndarray
+    detrained_heat: jnp.ndarray
+    detrained_water: jnp.ndarray
+    detrained_condensate: jnp.ndarray
+    downdraft_mass: jnp.ndarray
+    downdraft_heat: jnp.ndarray
+    downdraft_water: jnp.ndarray
+    downdraft_condensate: jnp.ndarray
+    active: jnp.ndarray              # bool: this level was processed
+
+
+def plume_ascent(cloud_base: jnp.ndarray,
+                 cloud_base_mass: jnp.ndarray,
+                 cloud_base_heat: jnp.ndarray,
+                 cloud_base_water: jnp.ndarray,
+                 cloud_base_condensate: jnp.ndarray,
+                 environment_heat: jnp.ndarray,
+                 environment_water: jnp.ndarray,
+                 environment_virtual_temperature: jnp.ndarray,
+                 layer_mass: jnp.ndarray,
+                 layer_depth: jnp.ndarray,
+                 layer_thickness: jnp.ndarray,
+                 height: jnp.ndarray,
+                 exner: jnp.ndarray,
+                 pressure: jnp.ndarray,
+                 entrainment_efficiency: jnp.ndarray,
+                 iplume: int = 2,
+                 phase: str = "water") -> PlumeAscent:
+    """Run one buoyancy-sorting plume from cloud base to termination.
+
+    Ties together the per-level pieces: the energy closure sets an entrainment
+    rate, that sizes the blend spectrum, the blends are sorted by buoyancy, and
+    what rejoins becomes the plume entering the next level. Two running
+    integrals (``kew``, ``bdzsum``) and the plume's own properties are carried
+    upward.
+
+    **Termination.** ModelE ``exit``s the ascent loop; a scan cannot, so the
+    plume is masked dead instead and contributes nothing thereafter. The
+    conditions are checked on the state *entering* a level, matching ModelE
+    (``MSTCNV.F90``): the previous level's ``w`` fell to zero, the plume shrank
+    below ``MINFRAC`` of the layer mass or 1% of its cloud-base mass, or it
+    became more than ``max_dt_overshoot`` colder than its surroundings.
+
+    **``mplume_lag``.** ModelE walks back *down* the column to the first level
+    more than 1 km below, which a scan cannot index because those levels are
+    already behind it. Rather than a fixed-length ring buffer, the full incoming
+    mass history is carried -- ``nlev`` floats per column, and the profile is
+    small enough that the ``O(nlev^2)`` total work is irrelevant. This is exact
+    for any layer spacing, whereas a buffer would silently truncate wherever
+    layers are thin. The floor of the walk is ``cloud_base - 1``, whose stored
+    value is the cloud-base mass.
+
+    Args:
+        cloud_base: Index of the first in-cloud level, per column.
+        cloud_base_mass: Plume mass there [kg/m^2].
+        cloud_base_heat: Extensive heat content there.
+        cloud_base_water: Extensive water vapour there.
+        cloud_base_condensate: Extensive condensate there.
+        environment_heat: ``senv``, intensive, ``(nlev, *horiz)``.
+        environment_water: ``qenv``, intensive.
+        environment_virtual_temperature: ``tvl`` [K].
+        layer_mass: ``ma`` [kg/m^2].
+        layer_depth: ``gzl`` [m], used to convert rates to per-layer amounts.
+        layer_thickness: ``delz = ma/rho0`` [m], used by the energy closure.
+            ModelE keeps these two distinct; they are not interchangeable.
+        height: ``zl`` [m], for the 1 km lookback.
+        exner: ``plk``.
+        pressure: [**Pa**].
+        entrainment_efficiency: ``enteff``.
+        iplume: Plume index (static).
+        phase: ``"water"`` or ``"ice"`` (static).
+
+    Returns:
+        A :class:`PlumeAscent`.
+    """
+    nlev = layer_mass.shape[0]
+    horiz = layer_mass.shape[1:]
+    level_axis = jnp.arange(nlev).reshape((nlev,) + (1,) * len(horiz))
+    zeros = jnp.zeros(horiz)
+
+    def step(carry, level_inputs):
+        (mass, heat, water, condensate, kew, bdzsum, previous_w, alive,
+         history) = carry
+        (level, senv, qenv, tvl, ma, gzl, delz, zl, plk, pres) = level_inputs
+
+        # Seed the plume on the level where it is born.
+        at_base = level == cloud_base
+        mass = jnp.where(at_base, cloud_base_mass, mass)
+        heat = jnp.where(at_base, cloud_base_heat, heat)
+        water = jnp.where(at_base, cloud_base_water, water)
+        condensate = jnp.where(at_base, cloud_base_condensate, condensate)
+        kew = jnp.where(at_base, 0.0, kew)
+        bdzsum = jnp.where(at_base, 0.0, bdzsum)
+        alive = alive | at_base
+
+        safe_mass = jnp.maximum(mass, _TEENY)
+        parcel_virtual_t = ((heat / safe_mass) * plk
+                            * (1.0 + DELTX * water / safe_mass))
+        buoyancy = ((parcel_virtual_t - tvl) / tvl - condensate / safe_mass)
+
+        # Entry conditions, on the state arriving at this level.
+        survives = (
+            (level >= cloud_base) & alive
+            & (at_base | (previous_w > 0.0))
+            & (mass > _MIN_PLUME_FRACTION * ma)
+            & (mass > _MIN_CLOUD_BASE_FRACTION * cloud_base_mass)
+            & (buoyancy > -_MAX_OVERSHOOT_DT / tvl))
+
+        # Record the mass entering this level; ModelE's `mplumearr(l) = mplume`
+        # is likewise the incoming value, not the post-sorting one.
+        history = jnp.where(level_axis == level, mass, history)
+
+        d_kew, d_bdzsum = buoyancy_work_increments(
+            buoyancy, mass, delz, entrainment_efficiency)
+        kew_here = kew + d_kew
+        bdzsum_here = bdzsum + d_bdzsum
+
+        ent, det = entrainment_rate(
+            buoyancy, mass, delz, kew_here, bdzsum_here, pres, iplume)
+
+        # `mplume_lag`: highest stored level that is more than 1 km below, or
+        # the cloud-base mass if the plume has not yet climbed that far.
+        eligible = ((level_axis >= cloud_base) & (level_axis < level)
+                    & (zl - height > _LAG_DISTANCE))
+        found = jnp.any(eligible, axis=0)
+        chosen = jnp.max(jnp.where(eligible, level_axis, -1), axis=0)
+        lag = jnp.sum(jnp.where(level_axis == chosen, history, 0.0), axis=0)
+        lag = jnp.where(found, lag, cloud_base_mass)
+
+        environment_air, updraft_air, updraft_factor, environment_factor, _ = (
+            blend_air_masses(mass, cloud_base_mass, lag, ent, det, gzl, ma))
+        w = vertical_velocity(kew_here, mass, environment_air)
+        sorted_blends = sort_blends(
+            mass, heat, water, condensate, senv, qenv, environment_air,
+            updraft_air, updraft_factor, environment_factor, plk, pres, tvl,
+            buoyancy, phase)
+
+        def keep(value):
+            return jnp.where(survives, value, 0.0)
+
+        next_mass = jnp.where(survives, sorted_blends.plume_mass, mass)
+        carry = (next_mass,
+                 jnp.where(survives, sorted_blends.plume_heat, heat),
+                 jnp.where(survives, sorted_blends.plume_water, water),
+                 jnp.where(survives, sorted_blends.plume_condensate,
+                           condensate),
+                 jnp.where(survives, kinetic_energy(w, next_mass), kew),
+                 jnp.where(survives, bdzsum_here, bdzsum),
+                 jnp.where(survives, w, previous_w),
+                 survives,
+                 history)
+        outputs = (keep(mass), keep(lag), keep(w), keep(ent), keep(det),
+                   keep(environment_air),
+                   keep(sorted_blends.detrained_mass),
+                   keep(sorted_blends.detrained_heat),
+                   keep(sorted_blends.detrained_water),
+                   keep(sorted_blends.detrained_condensate),
+                   keep(sorted_blends.downdraft_mass),
+                   keep(sorted_blends.downdraft_heat),
+                   keep(sorted_blends.downdraft_water),
+                   keep(sorted_blends.downdraft_condensate),
+                   survives)
+        return carry, outputs
+
+    initial = (zeros, zeros, zeros, zeros, zeros, zeros, zeros,
+               jnp.zeros(horiz, dtype=bool), jnp.zeros((nlev,) + horiz))
+    _, outputs = lax.scan(
+        step, initial,
+        (level_axis, environment_heat, environment_water,
+         environment_virtual_temperature, layer_mass, layer_depth,
+         layer_thickness, height, exner, pressure))
+    return PlumeAscent(*outputs)
