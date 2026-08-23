@@ -38,9 +38,10 @@ ENVIRONMENT COLUMN (T, q, p, z)
    ├─ where is cloud base? ...... giss_cloud_base.py       lifting condensation level
    ├─ does convection trigger? .. giss_cloud_base.py       moist-static-energy instability (DMSE)
    ├─ HOW STRONG (the scale) .... giss_mass_flux.py        MASS_FLUX2 bisection -> FPLUME, fmp2
-   │                              giss_cloud_base.py        (DUPLICATE closure — see Known issues)
+   │                                                        (multi-source BL blend + tstar/qstar)
    ├─ lift the plume ............ giss_plume.py            moist adiabat + Gregory entrainment
-   │                                                        + Gregory updraft w², cloud top
+   │                                                        + updraft w², downdraft diversion,
+   │                                                        cloud top + total detrainment dump
    └─ effect on environment ..... giss_tendencies.py       advective compensating subsidence
                                                             + detrainment deposition -> dth_mc/dq_mc
 ```
@@ -51,10 +52,10 @@ ENVIRONMENT COLUMN (T, q, p, z)
 |---|---|---|---|---|
 | `giss_thermodynamics.py` | 188 | 20 | `QSAT`, `d_ln_qsat_dt`, `virtual_temperature`, `moist_static_energy`, constants | ~95% |
 | `giss_cloud_base.py` | 197 | 13 | LCL detection (argmax over saturation), `DMSE` trigger | detection validated; trigger ~85% |
-| `giss_mass_flux.py` | 160 | 4 | **The** MASS_FLUX2 closure — `cloud_base_mass_flux` (three-level stencil, array API, returns `fplume, fmp2, dmse1`) | ~80% |
-| `giss_plume.py` | ~430 | 28 | Moist adiabat, Gregory entrainment/updraft, `_plume_core`, `entraining_plume_ascent` (base-relative) + `plume_ascent_column` (full-column, traced-cloud-base launch) | ~75% |
-| `giss_tendencies.py` | 126 | 9 | `subsidence_tendency`, `convective_tendencies` (advective subsidence + bounded detrainment) | ~75% |
-| `giss_mstcnv.py` | ~330 | 18 | `GissConvection(PhysicsTerm)` — diagnoses `cloud_base`+`cloud_base_mass_flux`; under `allow_mc` runs the **full tendency chain** → `dth_mc`/`dq_mc` | integration validated; tendencies not magnitude-validated |
+| `giss_mass_flux.py` | ~300 | 4 | MASS_FLUX2 closure: `cloud_base_mass_flux` (single-source) and **`cloud_base_mass_flux_column`** (multi-source `nlpi>1` — BL blend, per-level removal, subsidence cascade, BL-top zeroing). The multi-source form is what the term uses | validated vs closure oracle (0.63–0.82×) |
+| `giss_plume.py` | ~560 | 28 | Moist adiabat, Gregory entrainment/updraft, `_plume_core`, `entraining_plume_ascent` + `plume_ascent_column` (traced-cloud-base launch, sub-cloud ramp), **`plume_mixing_fraction`** (`get_fpl`) + downdraft mass diversion, cloud-top dump | validated vs plume oracle |
+| `giss_tendencies.py` | 126 | 9 | `subsidence_tendency`, `convective_tendencies` (advective subsidence + bounded detrainment incl. cloud-top dump) | ~80% |
+| `giss_mstcnv.py` | ~470 | 20 | `GissConvection(PhysicsTerm)` — diagnoses `cloud_base`+`cloud_base_mass_flux`; under `allow_mc` runs the full chain → `dth_mc`/`dq_mc`. Also `surface_flux_scales` (tstar/qstar) and `convective_velocity_scale` (w*) | heating validated; moisture partial |
 | `jcm/physics/modele/` | — | — | `GissConvectionParameters`, `GissConvectionData` structs | — |
 
 \* Faithfulness = subjective confidence the JAX matches MSTCNV's intent; only
@@ -69,8 +70,15 @@ cloud-base *detection* is numerically oracle-validated.
   dependent branches. Discontinuous triggers (cloud-base index, level selection)
   are `argmax`-based — gradients flow through the thermodynamics, not the index.
 - **Faithful ports with documented assumptions**: each function's docstring
-  states scope and simplifications (e.g. closure is single-source-level
-  `nlpi=1`; subsidence single-step, no CFL substepping).
+  states scope and simplifications (e.g. subsidence is single-step with no CFL
+  substepping; the downdraft's descent/evaporation is not ported).
+- **The closure's source parcel is the boundary-layer blend**, not surface air,
+  and the *plume is seeded with the same parcel*. Seeding the plume with surface
+  air re-saturated at cloud base discards its moisture excess, so it starts
+  marginally buoyant and — since entrainment goes as `B/w²` — dilutes and dies
+  early. The closure is also evaluated at the level where that **blend**
+  saturates (it is drier than surface air, so it saturates a level higher), which
+  is what reproduces ModelE's `LMIN`.
 - **Compensating subsidence is advective** `(M/MA)·(prop_above − prop)`, *not* a
   fixed-mass flux-divergence of `M·prop`: the convective mass flux diverges
   (detrainment), and `prop≈300 K` makes `prop·ΔM` a huge spurious source. ModelE
@@ -85,49 +93,52 @@ cumulus case, capture state + convective tendencies to NetCDF, and compare the
 JAX functions column-by-column via the private bridge (`oracle.read_state_field`,
 `read_convection_field`, `to_columns`).
 
-- **Cloud base**: strong quantitative pass — within 1 level for all 48 periods,
-  exact for 38/48.
-- **`dth_mc` magnitude**: right order (~1 K/day vs ModelE's few K/day) but not
-  matched — see Known issues.
-- **Oracle limitation**: it stores state + `dth_mc`/`dq_mc` only — **no
-  plume-internal diagnostics** (mass flux, plume `w²`, entrainment). Plume
-  internals can only be inferred from downstream tendencies.
+- **Cloud base**: within 1 level for all 48 periods, exact for 47/48 (through the
+  full pipeline; the standalone LCL algorithm on raw oracle pressure gets 38/48).
+- **`dth_mc` (heating)**: vertical shape correlation **+0.85**, peak magnitude
+  median **0.85×** ModelE (IQR 0.59–1.71). Cloud tops 15/15/16/16 vs ModelE's
+  16/17/18/20.
+- **`dq_mc` (moisture)**: partial. Column-integrated tendency −2.7 to −8.2
+  kg/m²/day vs ModelE's −1.4 to −1.7 (which matches its precipitation), so the
+  scheme still loses water; see Known issues.
+- **Three ModelE oracles** (patches + recipes in the bridge's `modele_patches/`):
+  the **plume oracle** (per-level `mc_w`/`mc_m`/ent/det), the **closure oracle**
+  (`MASS_FLUX2`'s `fplume`/`fmp2`/`dmse` + its source parcel), and the
+  **bisection trace** (per-iteration `DMSE1` and intermediates). These turned the
+  port from inference into direct comparison and refuted several plausible
+  hypotheses (multi-cloud-base summation, condensation-heating, condensate
+  loading). Units traps recorded there: `CCM` is kg/m² despite a `units='mb'`
+  label, and ModelE's `PLK = p[mb]**KAPA` so its `S` is θ/1000^κ.
 - **Like-for-like single-column harness** (private bridge,
   `single_column_harness.py`): runs the real JCM pipeline
   (`MoistAirColumnState` → `GissConvection(allow_mc=True)`) on ModelE BOMEX
   columns via pure-sigma coords (`sigma = p_3d/ps`, pressure matched to 0.4% in
-  the convective layer). Current verdict: peak `dth_mc` ~1.6× ModelE (magnitude
-  ~right), vertical shape poorly correlated (missing cooling terms).
+  the convective layer). It must also supply `boundary_layer_height` and a
+  `surface` record — without them the multi-source closure blends in dry air
+  below cloud base and bottoms out.
 
 ## Known issues / open work
 
-1. **Tendencies not magnitude-validated** — `GissConvection` now runs the full
-   chain under `allow_mc` (default off): closure → `plume_ascent_column` (launched
-   at the traced cloud base) → subsidence + detrainment deposition →
-   `dth_mc`/`dq_mc`. On BOMEX the peak `dth_mc` is within ~2× of ModelE for
-   well-triggered columns and the plume tops out near the inversion (the earlier
-   "over-penetration to L28" was largely an experiment bug — `fmp2` mis-fed as
-   `w_base`). Still: under-triggers on some columns; missing evaporative/
-   entrainment-removal cooling, so vertical shape is imperfect. Proper validation
-   needs the plume-internal ModelE oracle (issue 2). `_CONTCE`/`_CLOUD_BASE_W`
+1. **Moisture budget** — the scheme still loses water: column-integrated `dq_mc`
+   is −2.7 to −8.2 kg/m²/day where ModelE is −1.4 to −1.7 (its precipitation),
+   and we have no precipitation at all. The two biggest leaks are fixed (the
+   cloud-top detrainment dump, `MSTCNV:1981-1983`, and detraining the plume's
+   condensate rather than only its vapour). What remains: **precipitation**
+   (`CONDP`) and the **downdraft's descent/evaporation**, neither ported.
+   `mcp` in `GissConvectionData` is consequently always zero. Note the upward
+   moisture transport is now ~0.60× ModelE's, which matches the closure ratio —
+   so much of the residual is issue 2, not separate moisture physics.
+2. **Closure still ~0.63–0.82× ModelE.** The multi-source closure plus the
+   `tstar`/`qstar` enhancement closed most of the original ~2.2× shortfall. The
+   residual is consistent with a ~0.15 g/kg source-humidity offset that is
+   plausibly an oracle state-timing artifact (SUBDD `q` is written after physics
+   has modified the column), so this may be near the floor of what this oracle
+   can validate.
+3. **Per-period spread** — peak heating IQR 0.59–1.71: early periods overshoot,
+   late ones undershoot, and ModelE's peak rises through the run while ours
+   falls. Not yet explained.
+4. **Not ported at all**: precipitation/microphysics, downdraft descent,
+   convective momentum transport, tracer transport, ice phase, and the
+   subsidence CFL substepping.
+5. **Tunables** `_CONTCE`, `_CLOUD_BASE_W`, `_ETADN` are module constants and
    should graduate to differentiable `GissConvectionParameters` leaves.
-1b. **Closure magnitude** — the cloud-base plume mass is ~6 kg/m² vs ModelE's
-   35.4 (plume oracle). Two factors: base *selection* (ModelE's `LMIN` vs our
-   LCL — our trigger gates are less restrictive, so many levels qualify), and a
-   ~2.4× shortfall at the same level, most likely the omitted **source-parcel
-   surface-flux enhancement** (`mc_tqstar_fac=1`; needs `tstar`/`qstar`, which
-   the single-column harness does not supply). Downdrafts are ported for the
-   *updraft mass budget* only — the downdraft's own environmental effect
-   (descent + evaporation, i.e. ModelE's low-level cooling dipole) is not.
-
-2. **Plume over-penetration** (the magnitude blocker) — the plume tops out ~L28
-   vs ModelE's L14 (trade inversion), its mass flux grows instead of shrinking,
-   and it re-buoys above the inversion. Root cause is cloud-top termination /
-   entrainment calibration, which needs a plume-internal oracle to fix
-   principledly (extra ModelE diagnostics). Dilution *form* is verified correct.
-3. **Closure under-triggers** on ~1/3 of marginal columns; **two-plume sum** not
-   assembled; stale DYCOMS docstring in `giss_mstcnv.py`.
-
-_(Resolved 2026-07: the duplicate MASS_FLUX2 closure was reconciled to a single
-`giss_mass_flux.py::cloud_base_mass_flux` with the three-level array API; the
-copy in `giss_cloud_base.py` was removed.)_
