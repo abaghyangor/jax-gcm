@@ -193,9 +193,9 @@ column, not just on final tendencies. This is what makes the rewrite tractable.
 | phase | deliverable | oracle check |
 |---|---|---|
 | 0 | **done** — dump extended with `enteff`, `mplume_lag`, `gzl`, `delz`, `buoy`, `bdzsum`, `kew`, and the per-blend `mixbuoy`/`airmix`/fate; rerun; §3 re-derived from it (see §5a) | — |
-| 1 | `get_dq_evap` port + tests | standalone; compare against a Fortran-driver dump or hand-computed cases |
-| 2 | Entrainment closure §3.1 as a pure function | `ent(l)`, `det(l)` per level vs dump — **target already verified exact** |
-| 3 | Blend sizing §3.2 | `frem`, `envairm`, `updairm`, `updfac`, `envfac` — **target already verified exact** |
+| 1 | **done** — `condensate_evaporation` in `giss_thermodynamics.py` + 8 tests | matches a literal transcription of the Fortran loop in the Newton interior and at both clips |
+| 2 | **done** — `entrainment_rate` in `giss_bsort.py` | `ent` **536/536**, `det` **536/536** vs dump, max rel 2.4e-6 |
+| 3 | **done** — `blend_air_masses` in `giss_bsort.py` | `envairm` 518/518 entraining, `updairm` **536/536**, `fupd`/`updfac`/`envfac` **1554/1554** |
 | 4 | Sorting + mass budget §3.4–3.5 | `addback`, `to_downdraft`, `detrained_local`, `mplume_out` — the budget must close to ~1e-7 as ModelE's does |
 | 5 | `w` §3.3 | `wcu(l)` |
 | 6 | Rewire `giss_tendencies.py` to the new detrainment sources (`dm`, `dmr`, `ddr`) | BOMEX heating/moistening profiles vs `dth_mc`/`dq_mc` |

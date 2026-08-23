@@ -181,3 +181,106 @@ class TestBroadcasting(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCondensateEvaporation(unittest.TestCase):
+    """``get_dq_evap`` (``CLOUDS_COM.F90:903``), the blend-evaporation step.
+
+    The reference here is the Fortran loop transcribed literally into Python
+    floats, so these check the port's arithmetic rather than re-deriving the
+    scheme from itself. Cases are chosen to exercise the Newton interior
+    (large ``condensate``, so the clip does not bind) as well as both clips.
+    """
+
+    PL = 95000.0                        # Pa
+    PLK = (95000.0 / 100.0) ** 0.28622  # ModelE PLK = p[mb]**KAPA
+
+    def _reference(self, sm, qm, cond, phase="water"):
+        latent = gt.LHE if phase == "water" else gt.LHS
+        slh = latent / gt.SHA
+        qmt, tp, dqsum = qm, sm * self.PLK, 0.0
+        for _ in range(3):
+            qst = float(gt.saturation_specific_humidity(
+                jnp.array(tp), jnp.array(self.PL), phase))
+            dq = (qmt - qst) / (1.0 + slh * qst * latent / (gt.RVAP * tp ** 2))
+            tp += slh * dq
+            qmt -= dq
+            dqsum -= dq
+        dqsum = max(0.0, min(dqsum, cond))
+        return dqsum, (dqsum / cond if cond > 0 else 0.0)
+
+    def _call(self, t, q, cond, phase="water"):
+        return gt.condensate_evaporation(
+            jnp.array(t / self.PLK), jnp.array(q), self.PLK, 1.0, self.PL,
+            cond, phase)
+
+    def test_matches_fortran_loop_in_newton_interior(self):
+        # condensate = 0.05 kg/kg is far more than any blend can evaporate, so
+        # the result is the unclipped three-iteration solve.
+        for t, q in [(295.0, 0.010), (300.0, 0.020), (288.0, 0.002),
+                     (292.0, 0.014)]:
+            got, fevp = self._call(t, q, 0.05)
+            want, want_fevp = self._reference(t / self.PLK, q, 0.05)
+            # Relative, not absolute: JAX runs float32 here while the reference
+            # loop is float64, and `dq` is a difference of two similar numbers,
+            # so the near-neutral cases lose several digits to cancellation.
+            self.assertAlmostEqual(float(got) / want, 1.0, delta=1e-3)
+            self.assertAlmostEqual(float(fevp) / want_fevp, 1.0, delta=1e-3)
+            self.assertGreater(want_fevp, 0.0)   # genuinely interior
+            self.assertLess(want_fevp, 1.0)
+
+    def test_supersaturated_parcel_evaporates_nothing(self):
+        # q above qsat makes every dq positive (condensation), so dqsum < 0 and
+        # the lower clip fires: this routine never condenses.
+        got, fevp = self._call(295.0, 0.030, 1e-3)
+        self.assertEqual(float(got), 0.0)
+        self.assertEqual(float(fevp), 0.0)
+
+    def test_capped_by_available_condensate(self):
+        # A very dry, warm parcel wants far more evaporation than it holds.
+        cond = 1e-4
+        got, fevp = self._call(300.0, 0.001, cond)
+        self.assertAlmostEqual(float(got) / cond, 1.0, delta=1e-6)
+        self.assertAlmostEqual(float(fevp), 1.0, delta=1e-6)
+
+    def test_zero_condensate_is_safe(self):
+        got, fevp = self._call(295.0, 0.010, 0.0)
+        self.assertEqual(float(got), 0.0)
+        self.assertEqual(float(fevp), 0.0)
+        self.assertTrue(bool(jnp.isfinite(fevp)))
+
+    def test_ice_phase_evaporates_more_than_water(self):
+        # At the same subsaturation, qsat over ice is lower, so a parcel that is
+        # subsaturated w.r.t. both evaporates less into the ice case.
+        t, q, cond = 250.0, 1e-4, 0.05
+        water, _ = self._call(t, q, cond, "water")
+        ice, _ = self._call(t, q, cond, "ice")
+        self.assertGreater(float(water), float(ice))
+        self.assertAlmostEqual(
+            float(ice), self._reference(t / self.PLK, q, cond, "ice")[0],
+            delta=1e-8)
+
+    def test_column_matches_vectorized(self):
+        # Broadcasting-native: vertical on axis 0, trailing axes broadcast.
+        t = jnp.array([295.0, 292.0, 288.0])
+        q = jnp.array([0.010, 0.014, 0.002])
+        cond = jnp.full((3,), 0.05)
+        col = gt.condensate_evaporation(
+            t / self.PLK, q, self.PLK, 1.0, self.PL, cond)[0]
+        block = gt.condensate_evaporation(
+            (t / self.PLK)[:, None] * jnp.ones((1, 4)),
+            q[:, None] * jnp.ones((1, 4)), self.PLK, 1.0, self.PL,
+            cond[:, None] * jnp.ones((1, 4)))[0]
+        self.assertLess(float(jnp.max(jnp.abs(col[:, None] - block))), 1e-12)
+
+    def test_gradient_finite_and_nonzero(self):
+        def f(sm):
+            return gt.condensate_evaporation(
+                sm, jnp.array(0.010), self.PLK, 1.0, self.PL, 0.05)[0]
+        sm = jnp.array(295.0 / self.PLK)
+        grad = jax.grad(f)(sm)
+        self.assertTrue(bool(jnp.isfinite(grad)))
+        # Warmer parcel -> higher qsat -> more evaporation.
+        self.assertGreater(float(grad), 0.0)
+        check_vjp(f, lambda s: jax.vjp(f, s), (sm,), atol=1e-2, rtol=1e-2,
+                  eps=1e-3)
