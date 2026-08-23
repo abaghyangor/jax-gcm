@@ -199,7 +199,7 @@ column, not just on final tendencies. This is what makes the rewrite tractable.
 | 4 | **done** — `sort_blends` in `giss_bsort.py` | `mplume_out`, `detrained`, `downdraft` all **536/536**, max rel 8.2e-7; mass conservation 3.6e-16 |
 | 5 | **done** — `vertical_velocity` / `kinetic_energy` | `wcu(l)` **536/536**, max rel 6.7e-7 |
 | 5a | **done** — `plume_ascent` driver (scan, lookback, termination) | `mplume_lag` **536/536**; cloud-base level exact |
-| 5b | **blocked** — inter-level condensation + precipitation (see §5b) | — |
+| 5b | **partly done** — `condensation` + `resaturate_plume`; precipitation outstanding (see §5b) | heat and vapour **484/484** across all level transitions |
 | 6 | Rewire `giss_tendencies.py` to the new detrainment sources (`dm`, `dmr`, `ddr`) | BOMEX heating/moistening profiles vs `dth_mc`/`dq_mc` |
 
 ## 5b. What blocks a full-column chain
@@ -217,14 +217,42 @@ Measured on the first BOMEX column, the plume entering level 11 carries
 **0.0049 less total water** than sorting alone predicts, and correspondingly
 more condensate and heat. That is the precipitation and the latent release.
 
-So the remaining work before the column closes is a **condensation +
-precipitation step**, not more sorting. `giss_plume.py`'s `_plume_core` already
-does parcel lift and saturation adjustment and is the natural starting point;
-the microphysics is a separate ModelE routine and is the larger unknown.
+### What the inter-level step decomposes into
 
-Until then the honest statement is: *every per-level bsort formula is verified
-against ModelE, and the driver's own plumbing is verified, but the column is
-not yet closed end to end.*
+Dumping bsort's *output* state as well as its input made this exactly
+separable, and the split is cleaner than expected:
+
+* **Plume mass is untouched** between levels — 484/484 transitions carry it
+  over unchanged. The microphysics moves water, not air.
+* **Re-saturation sets heat and vapour exactly.** ModelE does not condense
+  incrementally: it evaporates *all* existing condensate back to vapour, then
+  recomputes the split from scratch at the new level. `resaturate_plume` +
+  `condensation` reproduce the oracle's heat and vapour **484/484** to ~1e-6,
+  and conserve total water to 2e-16.
+* **The entire remaining gap is one scalar per level:** the condensate we keep
+  and ModelE rains out. Median **16.6%** of the condensate, max 62.5% — which
+  is 0.17–8.5% of the plume's total water per level.
+
+So the column is blocked on **precipitation only**, and its size is now known
+rather than guessed.
+
+### The precipitation piece
+
+`CONVECTIVE_MICROPHYSICS` (`MSTCNV.F90:6462-6814`, ~350 lines) is a scheme in
+its own right: Marshall-Palmer size distributions, cloud-droplet number
+concentration, graupel fraction, particle volume/area/fall-speed, and an ice
+habit selection. It also takes aerosol-derived `CDNC` as input, so it reaches
+outside `MSTCNV`.
+
+This is a scoping decision rather than a mechanical next step, and it is worth
+making deliberately: it is comparable in size to the bsort port just completed,
+and it is a *microphysics* scheme rather than the convection routine the
+deliverable names.
+
+Until it is ported the honest statement is: *every per-level bsort formula and
+the inter-level re-saturation are verified against ModelE, and the driver's own
+plumbing is verified, but the column is not closed end to end because
+precipitation is missing.*
 
 Phase 0 first: `enteff` in particular is **not** a constant *in general* — it is
 set at `MSTCNV.F90:1645–1665` from `closure2` (itself a per-step condition,

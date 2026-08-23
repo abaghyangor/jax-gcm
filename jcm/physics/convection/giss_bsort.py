@@ -43,7 +43,7 @@ from jax import lax
 
 import jcm.constants as c
 from jcm.physics.convection.giss_thermodynamics import (
-    DELTX, LHE, LHS, SHA, condensate_evaporation)
+    DELTX, LHE, LHS, SHA, condensate_evaporation, condensation)
 
 # Fraction of the buoyancy force that goes into vertical kinetic energy. ModelE
 # applies only a sixth while the parcel is buoyant, but the full force once it
@@ -701,3 +701,54 @@ def plume_ascent(cloud_base: jnp.ndarray,
          environment_virtual_temperature, layer_mass, layer_depth,
          layer_thickness, height, exner, pressure))
     return PlumeAscent(*outputs)
+
+
+def resaturate_plume(plume_mass: jnp.ndarray,
+                     plume_heat: jnp.ndarray,
+                     plume_water: jnp.ndarray,
+                     plume_condensate: jnp.ndarray,
+                     exner: jnp.ndarray,
+                     pressure: jnp.ndarray,
+                     phase: str = "water",
+                     previous_phase: str = None):
+    """Re-partition the plume between vapour and condensate at a new level.
+
+    Run on arrival at each level, before the sorting. ModelE does not
+    incrementally condense: it **evaporates all existing condensate back into
+    vapour**, then recomputes the split from scratch at the new level's
+    pressure (``MSTCNV.F90``, around the ``get_dq_cond`` call). Total water is
+    therefore conserved exactly here, and only its division between phases --
+    and the heat that division releases -- changes.
+
+    Verified against the oracle over all 484 BOMEX level transitions: the
+    resulting vapour and heat match ModelE to ~1e-6 relative. The condensate
+    does *not* match, and is not expected to: precipitation is removed
+    afterwards by the microphysics, which is a separate routine.
+
+    Args:
+        plume_mass: ``mplume`` [kg/m^2], unchanged by this step.
+        plume_heat: ``smp``, extensive.
+        plume_water: ``qmp``, extensive vapour.
+        plume_condensate: ``wmp``, extensive condensate.
+        exner: ``plk`` at the **new** level.
+        pressure: [**Pa**] at the new level.
+        phase: Phase at the new level (static).
+        previous_phase: Phase used when the condensate formed, for the
+            evaporation term. ModelE uses ``VLAT(l-1)`` here against ``PLK(l)``,
+            so the two can differ across a freezing level. Defaults to
+            ``phase``.
+
+    Returns:
+        ``(heat, water, condensate)`` after re-saturation.
+    """
+    previous_latent = (LHE if (previous_phase or phase) == "water" else LHS)
+    latent = LHE if phase == "water" else LHS
+
+    # Undo the previous level's condensation, returning all water to vapour.
+    heat = plume_heat - previous_latent * plume_condensate / SHA / exner
+    water = plume_water + plume_condensate
+
+    condensed, _ = condensation(heat, water, exner, plume_mass, pressure, phase)
+    return (heat + (latent / SHA) * condensed / exner,
+            water - condensed,
+            condensed)
