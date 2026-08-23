@@ -388,6 +388,25 @@ tendency conversion is ~1.7× high. Shape correlation is unchanged at **+0.85**.
 So the remaining error is now localized to the **plume/tendency stage**, not the
 closure, and the earlier "0.85× agreement" was fortuitous.
 
+**The ~1.9× heating overshoot is the plume's mass shedding, not the tendency
+conversion.** With the closure validated (`fmp2` 0.98–1.10× ModelE) and the
+pre-convection comparison in place, the per-level comparison is unambiguous: the
+heating overshoot **tracks the mass-flux overshoot level by level**.
+
+| level | ModelE `M` | JCM `M` | M ratio | `dth` ratio |
+|---|---|---|---|---|
+| 6 | 35.4 | 45.3 | 1.28 | 1.44 |
+| 10 | 10.1 | 23.8 | 2.37 | 2.18 |
+| 12 | 6.7 | 18.0 | 2.70 | 2.75 |
+
+So **the mass-flux → tendency conversion is correct**; the plume simply carries
+too much mass aloft. ModelE sheds **18–36% per level** (35→6.5 over eight
+levels, ×5.4); we shed **~12–13%** (45→13.8, ×3.3). Note the implied `fpl` from
+ModelE's shedding exceeds 1 at some levels, so it is shedding through *both* the
+downdraft diversion **and** buoyancy detrainment — our `plume_mixing_fraction`
+and/or buoyancy detrainment is too weak, and our entrainment (which adds mass)
+may be partly offsetting it. That is the next target.
+
 **Open: the moisture tendency.** `dth_mc` now matches well, but `dq_mc` has the
 **wrong sign above cloud base** — ModelE *moistens* the cloud layer (+1.5 to
 +1.9 g/kg/day mean) while we *dry* it (−2.7 to −8.3). Checked by hand at period
