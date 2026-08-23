@@ -541,3 +541,62 @@ class TestPlumeAscent(unittest.TestCase):
                            .detrained_mass)
         grad = jax.grad(f)(jnp.array(_COLUMN["mplume"][0]))
         self.assertTrue(bool(jnp.isfinite(grad)))
+
+
+class TestResaturatePlume(unittest.TestCase):
+    """The inter-level step: evaporate everything, re-condense at the new level.
+
+    The fixture is a real BOMEX transition (level 10 -> 11 of the first column):
+    the plume state leaving ``plume_ent_det_w2_bsort`` at one level, and the
+    state ModelE hands it at the next.
+    """
+
+    OUT_HEAT, OUT_WATER, OUT_CONDENSATE = 1704.724, 0.6546861, 0.02265676
+    MASS, EXNER, PRESSURE = 40.94896, 7.021307, 90612.06
+    EXPECT_HEAT, EXPECT_WATER = 1707.956, 0.6455845
+    ORACLE_CONDENSATE = 0.0268701
+
+    def _run(self):
+        return bs.resaturate_plume(
+            jnp.array(self.MASS), jnp.array(self.OUT_HEAT),
+            jnp.array(self.OUT_WATER), jnp.array(self.OUT_CONDENSATE),
+            jnp.array(self.EXNER), jnp.array(self.PRESSURE))
+
+    def test_heat_and_vapour_match_oracle(self):
+        heat, water, _ = self._run()
+        self.assertAlmostEqual(float(heat) / self.EXPECT_HEAT, 1.0, delta=1e-5)
+        self.assertAlmostEqual(float(water) / self.EXPECT_WATER, 1.0,
+                               delta=1e-5)
+
+    def test_total_water_is_conserved(self):
+        # The step only re-partitions; it neither creates nor destroys water.
+        # Precipitation is removed afterwards, by the microphysics.
+        _, water, condensate = self._run()
+        before = self.OUT_WATER + self.OUT_CONDENSATE
+        self.assertAlmostEqual(float(water + condensate) / before, 1.0,
+                               delta=1e-6)
+
+    def test_condensate_exceeds_oracle_by_the_precipitated_amount(self):
+        # Documents the known gap: without the microphysics the plume keeps
+        # condensate ModelE would have rained out. If this ever starts matching,
+        # precipitation has been ported and the assertion should be tightened.
+        _, _, condensate = self._run()
+        self.assertGreater(float(condensate), self.ORACLE_CONDENSATE)
+        self.assertLess(float(condensate) / self.ORACLE_CONDENSATE, 1.5)
+
+    def test_column_matches_vectorized(self):
+        args = (self.MASS, self.OUT_HEAT, self.OUT_WATER, self.OUT_CONDENSATE,
+                self.EXNER, self.PRESSURE)
+        single = bs.resaturate_plume(*[jnp.array(a) for a in args])
+        block = bs.resaturate_plume(*[jnp.full((4,), a) for a in args])
+        for a, b in zip(single, block):
+            self.assertLess(float(jnp.max(jnp.abs(a - b))), 1e-6)
+
+    def test_gradient_finite(self):
+        def f(water):
+            return bs.resaturate_plume(
+                jnp.array(self.MASS), jnp.array(self.OUT_HEAT), water,
+                jnp.array(self.OUT_CONDENSATE), jnp.array(self.EXNER),
+                jnp.array(self.PRESSURE))[2]
+        grad = jax.grad(f)(jnp.array(self.OUT_WATER))
+        self.assertTrue(bool(jnp.isfinite(grad)))

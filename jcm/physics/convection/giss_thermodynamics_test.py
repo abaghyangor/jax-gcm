@@ -284,3 +284,64 @@ class TestCondensateEvaporation(unittest.TestCase):
         self.assertGreater(float(grad), 0.0)
         check_vjp(f, lambda s: jax.vjp(f, s), (sm,), atol=1e-2, rtol=1e-2,
                   eps=1e-3)
+
+
+class TestCondensation(unittest.TestCase):
+    """``get_dq_cond`` (``CLOUDS_COM.F90:861``), the mirror of the evaporation.
+
+    Shares the Newton loop with :class:`TestCondensateEvaporation`; what differs
+    is the sign convention and the clip, so the tests concentrate on those.
+    """
+
+    PL = 90000.0
+    PLK = (90000.0 / 100.0) ** 0.28622
+
+    def _call(self, t, q, mass=1.0):
+        return gt.condensation(jnp.array(t / self.PLK * mass), jnp.array(q),
+                               self.PLK, mass, self.PL)
+
+    def test_supersaturated_parcel_condenses(self):
+        qsat = float(gt.saturation_specific_humidity(
+            jnp.array(295.0), jnp.array(self.PL)))
+        got, fcond = self._call(295.0, qsat * 1.5)
+        self.assertGreater(float(got), 0.0)
+        self.assertGreater(float(fcond), 0.0)
+        self.assertLess(float(fcond), 1.0)
+
+    def test_subsaturated_parcel_condenses_nothing(self):
+        # The lower clip: this routine never evaporates.
+        got, fcond = self._call(295.0, 1e-4)
+        self.assertEqual(float(got), 0.0)
+        self.assertEqual(float(fcond), 0.0)
+
+    def test_cannot_condense_more_vapour_than_present(self):
+        got, _ = self._call(220.0, 1e-3)   # very cold: wants to condense it all
+        self.assertLessEqual(float(got), 1e-3 + 1e-12)
+
+    def test_zero_vapour_is_safe(self):
+        got, fcond = self._call(295.0, 0.0)
+        self.assertEqual(float(got), 0.0)
+        self.assertEqual(float(fcond), 0.0)
+        self.assertTrue(bool(jnp.isfinite(fcond)))
+
+    def test_condensation_and_evaporation_are_opposite_branches(self):
+        # A parcel cannot both condense and evaporate: at any state at most one
+        # of the two returns a non-zero amount.
+        for t, q in [(295.0, 0.001), (295.0, 0.030), (280.0, 0.010)]:
+            cond, _ = gt.condensation(
+                jnp.array(t / self.PLK), jnp.array(q), self.PLK, 1.0, self.PL)
+            evap, _ = gt.condensate_evaporation(
+                jnp.array(t / self.PLK), jnp.array(q), self.PLK, 1.0, self.PL,
+                0.05)
+            self.assertEqual(float(cond) * float(evap), 0.0, msg=f"{t},{q}")
+
+    def test_gradient_finite(self):
+        qsat = float(gt.saturation_specific_humidity(
+            jnp.array(295.0), jnp.array(self.PL)))
+
+        def f(q):
+            return gt.condensation(jnp.array(295.0 / self.PLK), q, self.PLK,
+                                   1.0, self.PL)[0]
+        grad = jax.grad(f)(jnp.array(qsat * 1.5))
+        self.assertTrue(bool(jnp.isfinite(grad)))
+        self.assertGreater(float(grad), 0.0)   # more vapour -> more condensate

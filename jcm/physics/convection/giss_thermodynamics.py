@@ -241,6 +241,36 @@ def condensate_evaporation(dry_static_energy: jnp.ndarray,
         ``(dqsum, fevp)`` -- the evaporated water (>= 0, capped by
         ``condensate``) and the fraction of the condensate it represents.
     """
+    dqsum = _saturation_adjustment(
+        dry_static_energy, water_mass, exner, mass, pressure, phase)
+    # Evaporation is the subsaturated direction, i.e. negative `dq`; the clip
+    # therefore also rules out condensing here.
+    dqsum = jnp.clip(-dqsum, 0.0, condensate)
+    fevp = _safe_ratio(dqsum, condensate)
+    return dqsum, fevp
+
+
+def _safe_ratio(numerator, denominator):
+    """``numerator/denominator`` where positive, else zero -- gradient-safe."""
+    usable = denominator > 0.0
+    return jnp.where(usable, numerator / jnp.where(usable, denominator, 1.0),
+                     0.0)
+
+
+def _saturation_adjustment(dry_static_energy, water_mass, exner, mass,
+                           pressure, phase):
+    """Signed water change from ModelE's three-step saturation relaxation.
+
+    ``get_dq_cond`` and ``get_dq_evap`` (``CLOUDS_COM.F90``) run the *same*
+    Newton loop and differ only in sign convention and in what they clip the
+    result against, so the loop lives here once. Positive means the parcel is
+    supersaturated and water condenses; negative means it is subsaturated and
+    condensate may evaporate.
+
+    The trip count of three is part of the scheme's definition, not a
+    convergence criterion -- ModelE stops there regardless of the residual --
+    so it is reproduced verbatim.
+    """
     latent_heat = LHE if phase == "water" else LHS
     slh = latent_heat / SHA
 
@@ -260,11 +290,39 @@ def condensate_evaporation(dry_static_energy: jnp.ndarray,
               / (1.0 + slh * qst * d_ln_qsat_dt(parcel_t, phase)))
         parcel_t = parcel_t + slh * dq / mass
         remaining_water = remaining_water - dq
-        dqsum = dqsum - dq
+        dqsum = dqsum + dq
+    return dqsum
 
-    # ModelE guards the whole body with `if (COND > 0)`, leaving both outputs
-    # zero otherwise; the clip already forces dqsum to 0 when condensate is 0,
-    # so only the fevp division needs protecting against 0/0.
-    dqsum = jnp.clip(dqsum, 0.0, condensate)
-    fevp = dqsum / jnp.maximum(condensate, _TEENY)
-    return dqsum, fevp
+
+def condensation(dry_static_energy: jnp.ndarray,
+                 water_mass: jnp.ndarray,
+                 exner: jnp.ndarray,
+                 mass: jnp.ndarray,
+                 pressure: jnp.ndarray,
+                 phase: str = "water"):
+    """Condense supersaturated vapour -- ModelE ``get_dq_cond``.
+
+    Port of ``modelE/model/CLOUDS_COM.F90:861``, the counterpart to
+    :func:`condensate_evaporation`. The plume calls this on arrival at each new
+    level: its conserved heat and water are carried up unchanged, so the colder
+    ambient pressure leaves it supersaturated, and this returns how much vapour
+    condenses out (releasing latent heat as it does).
+
+    Args:
+        dry_static_energy: ``SM``, extensive heat content.
+        water_mass: ``QM``, extensive water vapour -- **all** of the parcel's
+            water, since ModelE evaporates any existing condensate back in
+            before calling this.
+        exner: ``PLK``.
+        mass: Parcel air mass.
+        pressure: [**Pa**].
+        phase: ``"water"`` or ``"ice"``. Static.
+
+    Returns:
+        ``(dqsum, fcond)`` -- condensed water (>= 0, at most ``water_mass``) and
+        the fraction of the vapour it represents.
+    """
+    dqsum = _saturation_adjustment(
+        dry_static_energy, water_mass, exner, mass, pressure, phase)
+    dqsum = jnp.clip(dqsum, 0.0, water_mass)
+    return dqsum, _safe_ratio(dqsum, water_mass)
