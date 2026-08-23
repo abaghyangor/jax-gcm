@@ -196,7 +196,7 @@ column, not just on final tendencies. This is what makes the rewrite tractable.
 | 1 | **done** — `condensate_evaporation` in `giss_thermodynamics.py` + 8 tests | matches a literal transcription of the Fortran loop in the Newton interior and at both clips |
 | 2 | **done** — `entrainment_rate` in `giss_bsort.py` | `ent` **536/536**, `det` **536/536** vs dump, max rel 2.4e-6 |
 | 3 | **done** — `blend_air_masses` in `giss_bsort.py` | `envairm` 518/518 entraining, `updairm` **536/536**, `fupd`/`updfac`/`envfac` **1554/1554** |
-| 4 | Sorting + mass budget §3.4–3.5 | `addback`, `to_downdraft`, `detrained_local`, `mplume_out` — the budget must close to ~1e-7 as ModelE's does |
+| 4 | **done** — `sort_blends` in `giss_bsort.py` | `mplume_out`, `detrained`, `downdraft` all **536/536**, max rel 8.2e-7; mass conservation 3.6e-16 |
 | 5 | `w` §3.3 | `wcu(l)` |
 | 6 | Rewire `giss_tendencies.py` to the new detrainment sources (`dm`, `dmr`, `ddr`) | BOMEX heating/moistening profiles vs `dth_mc`/`dq_mc` |
 
@@ -234,6 +234,22 @@ Simplifications this establishes for BOMEX (assert, don't assume, for other case
   blends would otherwise be sent to the downdraft instead of detraining.
   `in_overshooting_regime = buoy(l) <= -0.25/tvl(l)` (`MSTCNV.F90:3470`).
   Without it the sort reproduces 1566/1572; with it, 1572/1572.
+- **`pres(l)` is in Pa but `pl(l)` is in mb**, and both appear in this routine.
+  `get_dq_evap` is called with `pres(l)`, so the blend saturation calculation is
+  Pa-based while the `pl(l) > 700` entrainment-floor test is mb-based. Treating
+  `pres` as mb put `qsat` off by a factor of 100 and reduced the `mixbuoy`
+  agreement to 2/1572; it is the only unit trap found in this routine.
+- **The evaporation is a test, not a state update.** ModelE evaporates each
+  blend's condensate solely to decide its buoyancy; the branches then add back
+  the untouched pre-evaporation extensive `smmix`/`qmmix`/`wmmix`. Applying the
+  evaporation to the returned properties would create vapour out of nothing —
+  `test_conserves_water_because_evaporation_is_only_a_test` guards this.
+- **Residual `mixbuoy` disagreement is dump precision, not physics.** Absolute
+  error is median 8.4e-8 / max 4.0e-7 against a decision scale of 1.7e-4, which
+  is what the dump's ~7-significant-figure `smix` predicts. Caveat: the closest
+  any blend comes to a threshold is 3.5e-7, marginally below that max error, so
+  fate agreement is not *structurally* guaranteed for blends sitting that close
+  — none flipped here, and the mass budget confirms it.
 - `mplume_lag == mplume_b` on 444/536 levels — the 1 km lookback usually reaches
   cloud base in shallow BOMEX. This does **not** remove the need for the §4
   ring buffer, but it does give a cheap regression check: a buffer bug will show
