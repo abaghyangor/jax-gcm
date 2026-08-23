@@ -197,8 +197,34 @@ column, not just on final tendencies. This is what makes the rewrite tractable.
 | 2 | **done** — `entrainment_rate` in `giss_bsort.py` | `ent` **536/536**, `det` **536/536** vs dump, max rel 2.4e-6 |
 | 3 | **done** — `blend_air_masses` in `giss_bsort.py` | `envairm` 518/518 entraining, `updairm` **536/536**, `fupd`/`updfac`/`envfac` **1554/1554** |
 | 4 | **done** — `sort_blends` in `giss_bsort.py` | `mplume_out`, `detrained`, `downdraft` all **536/536**, max rel 8.2e-7; mass conservation 3.6e-16 |
-| 5 | `w` §3.3 | `wcu(l)` |
+| 5 | **done** — `vertical_velocity` / `kinetic_energy` | `wcu(l)` **536/536**, max rel 6.7e-7 |
+| 5a | **done** — `plume_ascent` driver (scan, lookback, termination) | `mplume_lag` **536/536**; cloud-base level exact |
+| 5b | **blocked** — inter-level condensation + precipitation (see §5b) | — |
 | 6 | Rewire `giss_tendencies.py` to the new detrainment sources (`dm`, `dmr`, `ddr`) | BOMEX heating/moistening profiles vs `dth_mc`/`dq_mc` |
+
+## 5b. What blocks a full-column chain
+
+The driver reproduces the cloud-base level exactly and its lookback matches
+536/536, but chaining it up a whole column diverges from ModelE after the first
+level — **not because the sorting is wrong** (that is 536/536 when fed the
+oracle's per-level state) but because ModelE does more between plume levels
+than sorting. From `MSTCNV.F90` around the ascent loop, each level also runs:
+
+1. `get_dq_cond` — condensation of the lifted parcel, releasing latent heat;
+2. `CONVECTIVE_MICROPHYSICS` — which removes condensate as precipitation.
+
+Measured on the first BOMEX column, the plume entering level 11 carries
+**0.0049 less total water** than sorting alone predicts, and correspondingly
+more condensate and heat. That is the precipitation and the latent release.
+
+So the remaining work before the column closes is a **condensation +
+precipitation step**, not more sorting. `giss_plume.py`'s `_plume_core` already
+does parcel lift and saturation adjustment and is the natural starting point;
+the microphysics is a separate ModelE routine and is the larger unknown.
+
+Until then the honest statement is: *every per-level bsort formula is verified
+against ModelE, and the driver's own plumbing is verified, but the column is
+not yet closed end to end.*
 
 Phase 0 first: `enteff` in particular is **not** a constant *in general* — it is
 set at `MSTCNV.F90:1645–1665` from `closure2` (itself a per-step condition,
