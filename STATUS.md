@@ -557,3 +557,33 @@ the original setup:
 
 After `pip install -r requirements.txt` (into the project venv), the full
 project test suite is healthy.
+
+### Plume mass sink: an unresolved discrepancy (dumped plume-2 ent/det)
+
+Re-pointed the ModelE dump at plume 2 (the one that actually fires; the earlier
+dump captured plume 1, which never does) and compared entrainment/detrainment
+directly. The result contradicts the expectation that our shedding is too weak:
+
+| level | ModelE ent·dz | ModelE det·dz | ModelE M | JCM ent·dz |
+|---|---|---|---|---|
+| 6 | 0.371 | 0.000 | 35.36 | 0.267 |
+| 7 | 0.375 | 0.000 | 28.80 | 0.132 |
+| 8 | 0.367 | 0.000 | 21.91 | 0.034 |
+
+**ModelE entrains more than we do and detrains nothing, yet its plume mass
+falls.** Entraining 0.37 with zero detrainment should take 35.4 → ~47; it goes
+to 28.8. Closing the budget needs a diversion of ~0.39, i.e. `fpl ≈ 1.16`, which
+is impossible for a mixing fraction (≤ 1) — and the implicit entrainment limiter
+(`eplume/(1+eplume/ma)`) and `remrat` cap do not bind here.
+
+Interpretation caveat: `ENTALL = 1000*ENT` is registered as `%/km` but that is
+inconsistent by a factor 100 (`1000*ENT` with `ENT` in 1/m is *per km*). Reading
+it as `%/km` instead gives `ent·dz ≈ 0.004`, which *would* close the budget with
+`fpl ≈ 0.56` — but implies an entrainment e-folding scale of ~25 km, far too
+weak for shallow cumulus, whereas the per-km reading gives ~250 m, which is
+physically right. So the two readings each fail a different check.
+
+**Open question:** either there is an additional mass sink in `MSTCNV`'s plume
+budget that we have not found, or the diagnostic's scaling differs from the code
+comment. Resolving it needs `MPLUME`, `EPLUME` and `FLEFT` dumped *directly*
+inside the ascent loop rather than inferred from the registered diagnostics.
