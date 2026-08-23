@@ -327,8 +327,42 @@ oracle and neither resolved it* (recorded so they are not re-attempted):
   `MASS_FLUX2`; reproducing the blend faithfully needs those. The implementation
   was reverted rather than shipped.
 
-So the ~2× closure shortfall is **not yet explained**. It is the last identified
-blocker on matching BOMEX magnitude.
+**Resolved.** The bisection trace (per-iteration `DMSE1` from inside
+`MASS_FLUX2`) showed every state variable matching ours at identical `fplume`
+*except* `qdn` — our blended source parcel was ~0.31 g/kg too dry, worth ~0.76 K
+of `DMSE1` at `SLHE ≈ 2490 K per kg/kg`, enough to flip its sign and halve the
+converged `fplume`. Three fixes followed, all oracle-validated:
+
+1. **Multi-source (`nlpi>1`) closure** (`cloud_base_mass_flux_column`) — the
+   `fpi`-weighted BL blend, per-level removal, sub-cloud subsidence cascade, and
+   BL-top zeroing above `dcl`. This is what makes `DMSE1` insensitive to
+   `fplume` the way ModelE's is (its `QDN` moves only 0.0185→0.0184 across all 9
+   iterations).
+2. **`surface_flux_scales`** — the `tstar`/`qstar` source-parcel enhancement.
+   *Synergistic* with (1): worth ~16% with `nlpi=1` but ~63% with `nlpi>1`,
+   which is why testing them separately looked like two null results.
+3. **The closure runs at the *blended* parcel's LCL**, not the surface parcel's
+   (the blend is drier so it saturates a level higher; matches ModelE's `LMIN` on
+   6/7 sampled periods vs 2/7 for the surface LCL). The reported `cloud_base`
+   diagnostic stays the surface LCL — that is what is validated against `cldmc`.
+
+Two traps worth remembering: the subsidence cascade must run over **all** levels
+`1..lmin` including those whose `fpi` is zeroed (masking it to source levels
+collapses the closure), and **without the BL-top limit the multi-source blend is
+worse than single-source** — it mixes in the dry air below cloud base and goes
+stable, so `boundary_layer_height`/`surface` are effectively required inputs.
+
+Result: cloud-base mass flux **0.63-0.82× ModelE** (was ~0.45×), peak heating
+median **0.9×**, cloud base still 47/48 exact. 235 tests pass.
+
+**Remaining: per-period scatter, now localized.** Peak heating ranges 3.2×
+(period 12) to 0.52× (period 47) even though the closure ratio is steady. Direct
+comparison against the plume oracle shows the mass-flux *profile* matches well
+where the plume survives (period 47: 15.31/14.76, 10.05/10.84, 10.44/10.43 at
+successive levels), but on period 12 it tracks ModelE to level 10 and then
+**terminates early** (`w² ≤ 0` at level 11, vs ModelE continuing to ~15). A short
+plume concentrates the same mass flux over fewer layers and spikes the peak. So
+the open item is **cloud-top / buoyancy termination**, not the closure.
 
 **Heating-location work (BOMEX shape).** The harness showed the shape mismatch is
 mostly *where the heating goes*, not missing cooling terms: ModelE's biggest
