@@ -289,7 +289,8 @@ class GissConvection(PhysicsTerm):
         nlev = shape[0]
         nodal_shape = shape[1:]
 
-        cloud_base, fmp2 = self._diagnose(state, diagnostics, nlev, nodal_shape)
+        cloud_base, fmp2, closure_base = self._diagnose(
+            state, diagnostics, nlev, nodal_shape)
 
         if self.allow_mc:
             dtemp_dt, dq_dt, dth_mc, dq_mc = self._convective_tendencies(
@@ -413,8 +414,8 @@ class GissConvection(PhysicsTerm):
         """
         pressure_full = diagnostics.get("pressure_full")
         if pressure_full is None:
-            return (jnp.full(nodal_shape, nlev, dtype=int),
-                    jnp.zeros(nodal_shape))
+            sentinel = jnp.full(nodal_shape, nlev, dtype=int)
+            return sentinel, jnp.zeros(nodal_shape), sentinel
 
         # Surface-first profiles (JCM state is top-first); humidity g/kg -> kg/kg.
         p_sf = jnp.flip(pressure_full, axis=0)
@@ -426,28 +427,32 @@ class GissConvection(PhysicsTerm):
         thickness = diagnostics.get("layer_thickness")
         density = diagnostics.get("air_density")
         if thickness is None or density is None:
-            return cloud_base, jnp.zeros(nodal_shape)
+            return cloud_base, jnp.zeros(nodal_shape), cloud_base
 
         air_mass = jnp.flip(density, axis=0) * jnp.flip(thickness, axis=0)
         blt, dtheta, dq = self._source_parcel_inputs(
             diagnostics, q_sf, jnp.flip(density, axis=0)[0], nlev)
 
-        # The closure runs at the level where **ModelE's** parcel -- the
-        # boundary-layer *blend*, not the surface air -- reaches saturation. The
-        # blend is drier than the surface parcel, so it saturates a level higher,
-        # and the closure is very level-sensitive, so using the surface LCL here
-        # evaluates it one level too low and the closure bottoms out. Validated
-        # against the ModelE closure oracle: the blend's LCL reproduces `LMIN` on
-        # 6 of 7 sampled BOMEX periods (the surface LCL on 2).
+        # The plume is rooted one level **above the boundary-layer top**: it is
+        # launched from the top of the well-mixed layer. Validated directly
+        # against the ModelE closure oracle -- `LMIN == dcl + 1` on 46 of 48
+        # BOMEX periods (the other two one level lower).
+        #
+        # The closure is very level-sensitive, so this matters: on period 47 it
+        # returns 28 / 85 / 82 kg/m^2 at dcl / dcl+1 / dcl+2 against ModelE's 71.
+        # Deriving the level from where the source parcel saturates does *not*
+        # work: that rule only tracked `LMIN` because it was calibrated against a
+        # post-convection (too dry) state, and it moves the wrong way once the
+        # state is corrected, since a moister parcel saturates lower.
         #
         # The *reported* ``cloud_base`` stays the surface-parcel LCL, which is the
         # quantity validated against ModelE's ``cldmc`` (47/48 exact).
-        closure_base = self._blended_parcel_cloud_base(t_sf, q_sf, p_sf,
-                                                       air_mass, blt, nlev)
+        closure_base = (cloud_base if blt is None
+                        else jnp.clip(blt + 1, 0, nlev - 3))
         _, fmp2 = cloud_base_closure_mass_flux(
             t_sf, q_sf, p_sf, air_mass, closure_base,
             boundary_layer_top=blt, source_dtheta=dtheta, source_dq=dq)
-        return cloud_base, fmp2
+        return cloud_base, fmp2, closure_base
 
     def _plume_seed(self, diagnostics, theta_env, q_sf, air_mass, nlev):
         """Source parcel and updraft seed for the plume ascent.
@@ -479,25 +484,6 @@ class GissConvection(PhysicsTerm):
             surface.sensible_heat_flux, surface.evaporation, pbl_height,
             surface_density, theta_source, minimum=_CLOUD_BASE_W)
         return theta_source, q_source, w_base
-
-    def _blended_parcel_cloud_base(self, t_sf, q_sf, p_sf, air_mass,
-                                   boundary_layer_top, nlev):
-        """Level at which the mass-weighted boundary-layer blend saturates.
-
-        ``MSTCNV``'s source parcel is the ``fpi``-weighted blend of the
-        boundary-layer levels, so its saturation level -- not the surface
-        parcel's -- sets the closure level ``LMIN``.
-        """
-        level = jnp.arange(nlev).reshape((nlev,) + (1,) * (t_sf.ndim - 1))
-        top = nlev - 3 if boundary_layer_top is None else boundary_layer_top
-        weights = jnp.where(level <= top, air_mass, 0.0)
-        weights = weights / jnp.maximum(jnp.sum(weights, axis=0), 1.0e-20)
-        exner = (p_sf / _P_REF) ** KAPA
-        theta_blend = jnp.sum((t_sf / exner) * weights, axis=0)
-        q_blend = jnp.sum(q_sf * weights, axis=0)
-        base, _ = lifting_condensation_level(
-            theta_blend * exner[0], p_sf[0], q_blend, p_sf)
-        return jnp.clip(base, 0, nlev - 3)
 
     def _source_parcel_inputs(self, diagnostics, q_surface_first,
                               surface_density, nlev):
