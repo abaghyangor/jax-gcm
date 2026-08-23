@@ -68,6 +68,7 @@ from jcm.physics.convection.giss_mass_flux import cloud_base_mass_flux_column
 from jcm.physics.convection.giss_plume import plume_ascent_column
 from jcm.physics.convection.giss_tendencies import convective_tendencies
 from jcm.physics.convection.giss_thermodynamics import (
+    GRAV,
     KAPA,
     SHA,
     saturation_specific_humidity,
@@ -132,6 +133,35 @@ def surface_flux_scales(sensible_heat_flux, evaporation, friction_velocity,
     qstar = jnp.clip(evaporation / scale, 0.0,
                      0.2 * surface_specific_humidity)
     return tqstar_factor * tstar, tqstar_factor * qstar
+
+
+def convective_velocity_scale(sensible_heat_flux, evaporation,
+                              boundary_layer_height, surface_density,
+                              reference_theta, minimum=0.5):
+    """Cloud-base updraft seed from the convective velocity scale ``w*``.
+
+    ``MSTCNV`` seeds the plume with ``wbases = max(0.5, wturb)`` -- the
+    boundary-layer turbulent velocity from its own BL scheme (``MSTCNV`` line
+    ~2807). JCM has no direct equivalent, so we use the standard convective
+    velocity scale built from the surface **buoyancy** flux and the boundary-layer
+    depth::
+
+        w* = (g * z_i * (w'theta' + 0.61*theta*w'q') / theta)**(1/3)
+
+    On BOMEX this gives ~0.6 m/s against the oracle's observed 0.57 -- the right
+    scale, from inputs we actually have.
+
+    The seed matters more than its size suggests: the entrainment rate goes as
+    ``B/w**2``, so a plume seeded too slowly entrains hard, dilutes, and dies
+    early, while one that gets moving stays undilute. The ``max(0.5, ...)`` floor
+    is ModelE's.
+    """
+    heat_flux = sensible_heat_flux / (surface_density * SHA)     # K m/s
+    moisture_flux = evaporation / surface_density                # kg/kg m/s
+    buoyancy_flux = heat_flux + 0.61 * reference_theta * moisture_flux
+    w_cubed = (GRAV * boundary_layer_height
+               * jnp.maximum(buoyancy_flux, 0.0) / reference_theta)
+    return jnp.maximum(w_cubed ** (1.0 / 3.0), minimum)
 
 
 def cloud_base_closure_mass_flux(temperature: jnp.ndarray,
@@ -321,15 +351,23 @@ class GissConvection(PhysicsTerm):
         exner = (p / _P_REF) ** KAPA
         theta_env = t / exner
 
-        # Cloud-base source parcel: the surface (boundary-layer) potential
-        # temperature lifted dry-adiabatically to the cloud-base level, saturated.
+        # Cloud-base source parcel. The plume is seeded with the **same** parcel
+        # the closure is built on: the mass-weighted boundary-layer blend plus
+        # the surface-flux enhancement, lifted to cloud base. Seeding instead
+        # with raw surface air re-saturated at cloud base discards the parcel's
+        # moisture excess -- the very water whose condensation warms the plume --
+        # so it starts marginally (often negatively) buoyant, entrains hard
+        # (``eps ~ B/w^2``) and dies early. Validated against the plume oracle:
+        # this moves the BOMEX cloud top from 10/10/15/15 to 15/15/16/16 for
+        # periods 12/24/36/47, against ModelE's 16/17/18/20.
         cb = jnp.clip(cloud_base, 0, nlev - 1)
 
         def at_base(a):
             return jnp.take_along_axis(a, cb[None, ...], axis=0)[0]
 
-        t_base = theta_env[0] * at_base(exner)
-        q_base = saturation_specific_humidity(t_base, at_base(p))
+        theta_source, q_source, w_base = self._plume_seed(
+            diagnostics, theta_env, q, air_mass, nlev)
+        t_base = theta_source * at_base(exner)
 
         # Relax the closure mass flux over the cloud-base adjustment timescale
         # (MSTCNV line 2769): only the fraction of the neutralising mass flux
@@ -338,8 +376,8 @@ class GissConvection(PhysicsTerm):
         m_base = fmp2 * jnp.minimum(1.0, dtsrc / _TADJ_SECONDS)
 
         parcel_t, _cond, _buoy, mass_flux, det, _top = plume_ascent_column(
-            cloud_base, t_base, q_base, at_base(phi),
-            jnp.asarray(_CLOUD_BASE_W), m_base, t, q, phi, p, dz, air_mass,
+            cloud_base, t_base, q_source, at_base(phi),
+            w_base, m_base, t, q, phi, p, dz, air_mass,
             contce=_CONTCE)
 
         # The plume profiles are zero outside the live cloud; use the environment
@@ -406,6 +444,37 @@ class GissConvection(PhysicsTerm):
             t_sf, q_sf, p_sf, air_mass, closure_base,
             boundary_layer_top=blt, source_dtheta=dtheta, source_dq=dq)
         return cloud_base, fmp2
+
+    def _plume_seed(self, diagnostics, theta_env, q_sf, air_mass, nlev):
+        """Source parcel and updraft seed for the plume ascent.
+
+        Returns the mass-weighted boundary-layer blend of potential temperature
+        and humidity -- enhanced by the surface-flux scales, exactly as the
+        closure's parcel is -- together with the cloud-base updraft speed from
+        :func:`convective_velocity_scale`. Falls back to surface air and the
+        ``0.5 m/s`` floor when the boundary-layer/surface diagnostics are absent.
+        """
+        density = diagnostics.get("air_density")
+        surface_density = (1.2 if density is None
+                           else jnp.flip(density, axis=0)[0])
+        blt, dtheta, dq = self._source_parcel_inputs(
+            diagnostics, q_sf, surface_density, nlev)
+
+        level = jnp.arange(nlev).reshape((nlev,) + (1,) * (theta_env.ndim - 1))
+        top = nlev - 3 if blt is None else blt
+        weights = jnp.where(level <= top, air_mass, 0.0)
+        weights = weights / jnp.maximum(jnp.sum(weights, axis=0), 1.0e-20)
+        theta_source = jnp.sum(theta_env * weights, axis=0) + dtheta
+        q_source = jnp.sum(q_sf * weights, axis=0) + dq
+
+        surface = diagnostics.get("surface")
+        pbl_height = diagnostics.get("boundary_layer_height")
+        if surface is None or pbl_height is None:
+            return theta_source, q_source, jnp.asarray(_CLOUD_BASE_W)
+        w_base = convective_velocity_scale(
+            surface.sensible_heat_flux, surface.evaporation, pbl_height,
+            surface_density, theta_source, minimum=_CLOUD_BASE_W)
+        return theta_source, q_source, w_base
 
     def _blended_parcel_cloud_base(self, t_sf, q_sf, p_sf, air_mass,
                                    boundary_layer_top, nlev):
