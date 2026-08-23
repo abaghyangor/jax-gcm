@@ -374,9 +374,25 @@ def _plume_core(h_p, qt_p, w2_prev, w_prev, m, t_env, q_env, phi, p, dz,
     # (``if(L-LMIN.gt.1)``); ``downdraft_allowed`` carries that per-level gate.
     fpl = plume_mixing_fraction(t_env, q_env, 0.0, t_p, qv_p, qc_p, p, phase)
     fpl = jnp.where(downdraft_allowed, fpl, 0.0)
-    m_next = m_next * (1.0 - fpl * _ETADN)
+    diverted = fpl * _ETADN
+    m_next = m_next * (1.0 - diverted)
 
-    return (h_next, qt_next, w2, w, m_next), (t_p, qc_p, buoyancy, w2, m_next, det)
+    # The diverted mass must not simply vanish: in ``MSTCNV`` it becomes a
+    # downdraft that carries the plume/environment mixture and deposits it back
+    # into the column. Dropping it would make the scheme a mass and moisture
+    # sink -- and it shows up as the environment being dried by compensating
+    # subsidence with no detrainment moistening to offset it, where ModelE
+    # *moistens* the cloud layer.
+    #
+    # Reported as an addition to the detrainment rate, so the diverted mass is
+    # deposited at the level where the downdraft forms. This conserves mass and
+    # restores the moistening, but it is *not* the full downdraft: ModelE's
+    # descends, entrains and evaporates on the way down, which is what produces
+    # its low-level cooling. That descent is not ported.
+    det_effective = det + diverted / jnp.maximum(dz, _TEENY)
+
+    return (h_next, qt_next, w2, w, m_next), (t_p, qc_p, buoyancy, w2, m_next,
+                                              det_effective)
 
 
 def entraining_plume_ascent(t_base, q_base, geopotential_base, p_base, w_base,

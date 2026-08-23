@@ -355,7 +355,36 @@ stable, so `boundary_layer_height`/`surface` are effectively required inputs.
 Result: cloud-base mass flux **0.63-0.82× ModelE** (was ~0.45×), peak heating
 median **0.9×**, cloud base still 47/48 exact. 235 tests pass.
 
-**Remaining: per-period scatter, now localized.** Peak heating ranges 3.2×
+**Plume seed fixed (the shape breakthrough).** The plume was seeded with raw
+surface air re-saturated at cloud base, discarding the parcel's moisture excess
+— the very water whose condensation warms the plume. It therefore started
+marginally (often negatively) buoyant, and since entrainment goes as `B/w²` a
+slow plume entrains hard, dilutes and dies early (the oracle shows our buoyancy
+oscillating about zero while ModelE's `w` accelerates 0.57→1.9 m/s). Seeding it
+with the **same parcel the closure uses** (BL blend + `tstar`/`qstar`), and with
+the convective velocity scale `w* = (g·z_i·w'θv'/θ)^⅓` for the updraft seed
+(~0.6 m/s vs the oracle's 0.57), moved BOMEX cloud tops from 10/10/15/15 to
+**15/15/16/16** (ModelE 16/17/18/20) and gave:
+
+| metric (48 periods) | before | after |
+|---|---|---|
+| vertical shape correlation | −0.15 | **+0.85** |
+| peak heating median | 0.3× | **0.85×** (IQR 0.59–1.71) |
+| cloud base | 47/48 exact | 47/48 exact |
+
+**Open: the moisture tendency.** `dth_mc` now matches well, but `dq_mc` has the
+**wrong sign above cloud base** — ModelE *moistens* the cloud layer (+1.5 to
++1.9 g/kg/day mean) while we *dry* it (−2.7 to −8.3). Checked by hand at period
+47 level 6: our subsidence dries ~−7.1 g/kg/day and detrainment moistens only
+~+2.4, netting negative; ModelE has a *larger* mass flux there (35.4 vs 23.2),
+hence more subsidence drying, yet still nets positive. So its moisture
+deposition is far larger than ours. Returning the downdraft-diverted mass to the
+column (rather than letting it vanish, which was a genuine mass/moisture sink)
+is now done and is more faithful, but it moved the metrics by <0.01 — so the gap
+lies in machinery not yet ported: **precipitation, condensate detrainment, and
+the downdraft's descent/evaporation**. That is the next substantial piece.
+
+**Per-period scatter, localized.** Peak heating ranges 3.2×
 (period 12) to 0.52× (period 47) even though the closure ratio is steady. Direct
 comparison against the plume oracle shows the mass-flux *profile* matches well
 where the plume survives (period 47: 15.31/14.76, 10.05/10.84, 10.44/10.43 at
