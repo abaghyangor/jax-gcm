@@ -385,7 +385,11 @@ class GissConvection(PhysicsTerm):
         # / zero detrainment anyway, but NaN*0 = NaN in JAX, so guard the inputs).
         parcel_t_safe = jnp.where(parcel_t > 1.0, parcel_t, t)
         theta_plume = parcel_t_safe / exner
-        q_plume = saturation_specific_humidity(parcel_t_safe, p)   # in-cloud vapour
+        # Detrained moisture is the plume's **total** water: its in-cloud vapour
+        # plus the condensate it carries, which evaporates into the (subsaturated)
+        # environment. Depositing only the vapour leaves the condensate with
+        # nowhere to go, so the scheme loses water.
+        q_plume = saturation_specific_humidity(parcel_t_safe, p) + _cond
 
         dth_mc = convective_tendencies(mass_flux, theta_plume, det, dz,
                                        theta_env, air_mass)
