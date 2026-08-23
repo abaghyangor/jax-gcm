@@ -372,6 +372,22 @@ the convective velocity scale `w* = (g·z_i·w'θv'/θ)^⅓` for the updraft see
 | peak heating median | 0.3× | **0.85×** (IQR 0.59–1.71) |
 | cloud base | 47/48 exact | 47/48 exact |
 
+**Harness methodology fix — and what it revealed.** The SUBDD state is written at
+the *end* of the physics step, after convection has already dried and warmed the
+column, whereas ModelE's `dth_mc`/`dq_mc` were computed from the state *before*
+convection ran. The harness was therefore handing JCM a column already dried by
+the process it was meant to reproduce. Undoing one step of the convective
+tendency (they are per **day**) fixes it, and the cloud-base mass flux goes from
+**0.63–0.82× → 0.92–1.00×** ModelE (exact on period 12). **The closure is
+essentially correct**; its apparent shortfall was a comparison artifact.
+
+The uncomfortable consequence, recorded honestly: with the corrected input the
+peak-heating median goes **0.85× → 1.73×**. Two errors were partially
+cancelling — the closure read low because of the biased input, and the
+tendency conversion is ~1.7× high. Shape correlation is unchanged at **+0.85**.
+So the remaining error is now localized to the **plume/tendency stage**, not the
+closure, and the earlier "0.85× agreement" was fortuitous.
+
 **Open: the moisture tendency.** `dth_mc` now matches well, but `dq_mc` has the
 **wrong sign above cloud base** — ModelE *moistens* the cloud layer (+1.5 to
 +1.9 g/kg/day mean) while we *dry* it (−2.7 to −8.3). Checked by hand at period
