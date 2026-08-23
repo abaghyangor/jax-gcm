@@ -407,6 +407,26 @@ downdraft diversion **and** buoyancy detrainment — our `plume_mixing_fraction`
 and/or buoyancy detrainment is too weak, and our entrainment (which adds mass)
 may be partly offsetting it. That is the next target.
 
+Decomposing our plume's per-level mass budget pins it further:
+
+* **Our buoyancy detrainment is zero at every level.** `det = max(-rate, 0)` only
+  fires when the plume is negatively buoyant, and ours never is — so we shed
+  *only* through the downdraft diversion.
+* Our mixing fraction is **not** too small: `fpl ≈ 0.60–0.81` (diversion
+  0.20–0.27), if anything larger than the ~0.56 ModelE's first shedding implies.
+* But **entrainment simultaneously adds 0.10–0.27 per level**, so the net
+  retention is ~0.88 where ModelE's is ~0.70.
+* Our `w` tracks ModelE's near cloud base (0.66 vs 0.57, 0.77 vs 0.73) but falls
+  behind aloft (**1.38 vs 1.91** by level 14). Since `ε ∝ 1/w²` that inflates our
+  entrainment ~1.9× up there — and the extra entrainment drags the updraft,
+  keeping `w` low: a self-reinforcing loop.
+
+Arithmetic check on ModelE's budget: to retain 0.70 with ~20% entrainment would
+need a diversion of ~0.42, i.e. `fpl ≈ 1.25`, which is impossible. So ModelE is
+either entraining much less than us or shedding through an additional channel we
+have not identified. **That is the open question** — not the tendency conversion,
+which the level-by-level comparison shows is correct.
+
 **Open: the moisture tendency.** `dth_mc` now matches well, but `dq_mc` has the
 **wrong sign above cloud base** — ModelE *moistens* the cloud layer (+1.5 to
 +1.9 g/kg/day mean) while we *dry* it (−2.7 to −8.3). Checked by hand at period
