@@ -186,3 +186,79 @@ def virtual_temperature(temperature: jnp.ndarray,
         input).
     """
     return temperature * (1.0 + DELTX * specific_humidity - condensate)
+
+
+# `get_dq_evap` runs a fixed three-iteration Newton solve. The trip count is
+# part of the scheme's definition, not a convergence criterion -- ModelE stops
+# after three regardless of the residual -- so it is reproduced verbatim rather
+# than replaced by an iterate-to-tolerance loop, which would change answers.
+_EVAP_ITERATIONS = 3
+_TEENY = 1e-20
+
+
+def condensate_evaporation(dry_static_energy: jnp.ndarray,
+                           water_mass: jnp.ndarray,
+                           exner: jnp.ndarray,
+                           mass: jnp.ndarray,
+                           pressure: jnp.ndarray,
+                           condensate: jnp.ndarray,
+                           phase: str = "water"):
+    """Evaporate condensate toward saturation -- ModelE ``get_dq_evap``.
+
+    Port of ``modelE/model/CLOUDS_COM.F90:903``. Given an air parcel holding
+    ``condensate``, find how much of it evaporates as the parcel relaxes toward
+    saturation, cooling as it goes. The buoyancy-sorting plume calls this on
+    every updraft/environment blend before testing the blend's buoyancy
+    (``MSTCNV.F90``, ``plume_ent_det_w2_bsort``), which is what lets an
+    entraining mixture become negatively buoyant through evaporative cooling --
+    the mechanism that drives most of the plume's mass loss.
+
+    The Newton step solves ``q - mass*qsat(T) = 0`` with ``T`` responding to the
+    latent heating, linearised through ``d(ln qsat)/dT``:
+
+        dq = (q - mass*qsat(T)) / (1 + (L/cp)*qsat(T)*dlnqsatdt(T))
+
+    Evaporation is ``dq < 0`` (the parcel is subsaturated), which accumulates as
+    a positive ``dqsum``; the result is clipped to ``[0, condensate]`` so a
+    supersaturated blend neither condenses here nor evaporates more than it has.
+
+    Args:
+        dry_static_energy: ``SM``, potential-temperature-like heat content,
+            such that ``T = dry_static_energy*exner/mass`` [K * mass units].
+        water_mass: ``QM``, water-vapour content in the same mass units.
+        exner: ``PLK``, ModelE's ``p[mb]**KAPA``. Note this is *not* normalised
+            by a reference pressure -- see the module docstring.
+        mass: ``MASS``, air mass of the parcel. The plume calls this with
+            ``mass = 1`` and intensive ``sm``/``qm``.
+        pressure: Air pressure [**Pa**]. ModelE passes ``pres(l)`` in mb; the
+            caller must convert, since this module's ``qsat`` is Pa-based.
+        condensate: Available condensate, the cap on evaporation [same units as
+            ``water_mass``].
+        phase: ``"water"`` (``LHE``) or ``"ice"`` (``LHS``). Static. ModelE
+            selects this per level via ``vlat(l)``.
+
+    Returns:
+        ``(dqsum, fevp)`` -- the evaporated water (>= 0, capped by
+        ``condensate``) and the fraction of the condensate it represents.
+    """
+    latent_heat = LHE if phase == "water" else LHS
+    slh = latent_heat / SHA
+
+    parcel_t = dry_static_energy * exner / mass
+    remaining_water = water_mass
+    dqsum = jnp.zeros_like(parcel_t)
+
+    for _ in range(_EVAP_ITERATIONS):
+        qst = saturation_specific_humidity(parcel_t, pressure, phase)
+        dq = ((remaining_water - mass * qst)
+              / (1.0 + slh * qst * d_ln_qsat_dt(parcel_t, phase)))
+        parcel_t = parcel_t + slh * dq / mass
+        remaining_water = remaining_water - dq
+        dqsum = dqsum - dq
+
+    # ModelE guards the whole body with `if (COND > 0)`, leaving both outputs
+    # zero otherwise; the clip already forces dqsum to 0 when condensate is 0,
+    # so only the fevp division needs protecting against 0/0.
+    dqsum = jnp.clip(dqsum, 0.0, condensate)
+    fevp = dqsum / jnp.maximum(condensate, _TEENY)
+    return dqsum, fevp
