@@ -429,3 +429,37 @@ to
 That is a real improvement in kind, not just in magnitude, and it is the
 difference between a profile that is biased and one that is misshapen. But the
 precipitation caveat survives it either way.
+
+## 7b. Downdraft port — state
+
+`giss_downdraft.py` implements the descent core. Every parameter was extracted
+from a dump taken inside ModelE's own descent loop
+(`oracle_data/bomex_downdraft.txt`, 873 records over 52 columns), not guessed:
+
+| quantity | value | how established |
+|---|---|---|
+| descent budget | `dd_out = dd_in + ddr + edraft − detr` | closes to 1.1e-5 (dump precision) |
+| detrained fraction, buoyant | **0.75** | measured; implies `fddet = 0.25`, which has no assignment left in `MSTCNV.F90` |
+| detrained fraction, in BL | **0.50** | measured; matches `detfac = 0.5` (`MSTCNV.F90:4230`) |
+| `dd_detbyent` | 0 | active preset, line 288 |
+| downdraft entrainment | `etal = 2.0e-4 · gzl` | `etal/gzl` constant to 0.8% over 561 records |
+| precip share to downdraft | `fddrt = 0.5` | active preset |
+| evaporation efficiency scale | `dd_evpeff_qp_scale = 1e-3` | active preset |
+
+Mechanism counts over 854 active levels: detrainment fires on 565 (377 from
+positive buoyancy, **188 from the boundary-layer forced branch**), entrainment
+on 373, evaporation on 813 — so all three paths are live and none can be
+dropped.
+
+### Not yet verified
+
+The module passes a smoke test (mass balances, gradients finite, the downdraft
+accumulates then sheds in the boundary layer) but has **not** been validated
+level-by-level against the oracle. Doing so needs one more dump round: the
+descent trace carries `ddr` but not `smdnl`/`qmdnl` (the heat and water the
+plume routes into the downdraft), and the environment profile below cloud base,
+which the mass-budget dump does not cover because the plume never goes there.
+
+Until that check is run, the module should be treated as written-but-unverified
+— which, on the evidence of every earlier phase here, is not the same as
+correct.
