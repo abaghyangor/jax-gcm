@@ -611,7 +611,7 @@ def plume_ascent(cloud_base: jnp.ndarray,
 
     def step(carry, level_inputs):
         (mass, heat, water, condensate, kew, bdzsum, previous_w, alive,
-         history) = carry
+         dumped, history) = carry
         (level, senv, qenv, tvl, ma, gzl, delz, zl, exner_l,
          pressure_l) = level_inputs
 
@@ -653,6 +653,13 @@ def plume_ascent(cloud_base: jnp.ndarray,
             & (mass > _MIN_CLOUD_BASE_FRACTION * cloud_base_mass)
             & (buoyancy > -_MAX_OVERSHOOT_DT / tvl))
 
+        # When the plume fails its entry test, ModelE dumps everything it still
+        # carries into that level (MSTCNV.F90, just after the ascent loop:
+        # `DM(LMAX) += MPLUME`, `DSM(LMAX) += SMP`, ...). Without this the
+        # remaining mass simply vanishes and the environment's mass budget does
+        # not close.
+        terminating = alive & ~survives & ~dumped & (level >= cloud_base)
+
         # Record the mass entering this level; ModelE's `mplumearr(l) = mplume`
         # is likewise the incoming value, not the post-sorting one.
         history = jnp.where(level_axis == level, mass, history)
@@ -687,6 +694,9 @@ def plume_ascent(cloud_base: jnp.ndarray,
             return jnp.where(survives, value, 0.0)
 
         next_mass = jnp.where(survives, sorted_blends.plume_mass, mass)
+        def dump(value):
+            return jnp.where(terminating, value, 0.0)
+
         carry = (next_mass,
                  jnp.where(survives, sorted_blends.plume_heat, heat),
                  jnp.where(survives, sorted_blends.plume_water, water),
@@ -696,13 +706,14 @@ def plume_ascent(cloud_base: jnp.ndarray,
                  jnp.where(survives, bdzsum_here, bdzsum),
                  jnp.where(survives, w, previous_w),
                  survives,
+                 dumped | terminating,
                  history)
         outputs = (keep(mass), keep(lag), keep(w), keep(ent), keep(det),
                    keep(environment_air),
-                   keep(sorted_blends.detrained_mass),
-                   keep(sorted_blends.detrained_heat),
-                   keep(sorted_blends.detrained_water),
-                   keep(sorted_blends.detrained_condensate),
+                   keep(sorted_blends.detrained_mass) + dump(mass),
+                   keep(sorted_blends.detrained_heat) + dump(heat),
+                   keep(sorted_blends.detrained_water) + dump(water),
+                   keep(sorted_blends.detrained_condensate) + dump(condensate),
                    keep(sorted_blends.downdraft_mass),
                    keep(sorted_blends.downdraft_heat),
                    keep(sorted_blends.downdraft_water),
@@ -711,7 +722,8 @@ def plume_ascent(cloud_base: jnp.ndarray,
         return carry, outputs
 
     initial = (zeros, zeros, zeros, zeros, zeros, zeros, zeros,
-               jnp.zeros(horiz, dtype=bool), jnp.zeros((nlev,) + horiz))
+               jnp.zeros(horiz, dtype=bool), jnp.zeros(horiz, dtype=bool),
+               jnp.zeros((nlev,) + horiz))
     _, outputs = lax.scan(
         step, initial,
         (level_axis, environment_heat, environment_water,
