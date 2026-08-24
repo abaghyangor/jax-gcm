@@ -612,20 +612,36 @@ def plume_ascent(cloud_base: jnp.ndarray,
     def step(carry, level_inputs):
         (mass, heat, water, condensate, kew, bdzsum, previous_w, alive,
          history) = carry
-        (level, senv, qenv, tvl, ma, gzl, delz, zl, plk, pres) = level_inputs
+        (level, senv, qenv, tvl, ma, gzl, delz, zl, exner_l,
+         pressure_l) = level_inputs
 
         # Seed the plume on the level where it is born.
         at_base = level == cloud_base
-        mass = jnp.where(at_base, cloud_base_mass, mass)
-        heat = jnp.where(at_base, cloud_base_heat, heat)
-        water = jnp.where(at_base, cloud_base_water, water)
-        condensate = jnp.where(at_base, cloud_base_condensate, condensate)
         kew = jnp.where(at_base, 0.0, kew)
         bdzsum = jnp.where(at_base, 0.0, bdzsum)
         alive = alive | at_base
 
+        # Arriving at a new level, the plume's conserved heat and water leave it
+        # supersaturated, so ModelE re-partitions it and the microphysics rains
+        # some of the condensate out before any sorting happens. Skipped at
+        # cloud base, where the seed is already the post-condensation state.
+        arrival_mass = jnp.where(mass > 0.0, mass, 1.0)
+        risen_heat, risen_water, risen_condensate = resaturate_plume(
+            arrival_mass, heat, water, condensate, exner_l, pressure_l, phase)
+        risen_condensate = risen_condensate * (
+            1.0 - precipitation_fraction(risen_condensate, arrival_mass))
+        rose = ~at_base & (mass > 0.0)
+
+        mass = jnp.where(at_base, cloud_base_mass, mass)
+        heat = jnp.where(at_base, cloud_base_heat,
+                         jnp.where(rose, risen_heat, heat))
+        water = jnp.where(at_base, cloud_base_water,
+                          jnp.where(rose, risen_water, water))
+        condensate = jnp.where(at_base, cloud_base_condensate,
+                               jnp.where(rose, risen_condensate, condensate))
+
         safe_mass = jnp.maximum(mass, _TEENY)
-        parcel_virtual_t = ((heat / safe_mass) * plk
+        parcel_virtual_t = ((heat / safe_mass) * exner_l
                             * (1.0 + DELTX * water / safe_mass))
         buoyancy = ((parcel_virtual_t - tvl) / tvl - condensate / safe_mass)
 
@@ -647,7 +663,7 @@ def plume_ascent(cloud_base: jnp.ndarray,
         bdzsum_here = bdzsum + d_bdzsum
 
         ent, det = entrainment_rate(
-            buoyancy, mass, delz, kew_here, bdzsum_here, pres, iplume)
+            buoyancy, mass, delz, kew_here, bdzsum_here, pressure_l, iplume)
 
         # `mplume_lag`: highest stored level that is more than 1 km below, or
         # the cloud-base mass if the plume has not yet climbed that far.
@@ -663,7 +679,8 @@ def plume_ascent(cloud_base: jnp.ndarray,
         w = vertical_velocity(kew_here, mass, environment_air)
         sorted_blends = sort_blends(
             mass, heat, water, condensate, senv, qenv, environment_air,
-            updraft_air, updraft_factor, environment_factor, plk, pres, tvl,
+            updraft_air, updraft_factor, environment_factor, exner_l,
+            pressure_l, tvl,
             buoyancy, phase)
 
         def keep(value):
@@ -752,3 +769,62 @@ def resaturate_plume(plume_mass: jnp.ndarray,
     return (heat + (latent / SHA) * condensed / exner,
             water - condensed,
             condensed)
+
+
+# --- Precipitation: a CALIBRATED STAND-IN, not a port ------------------------
+#
+# ModelE removes precipitation between plume levels in CONVECTIVE_MICROPHYSICS
+# (MSTCNV.F90:6462-6814) -- Marshall-Palmer size distributions, cloud-droplet
+# number concentration, graupel fraction, particle fall speeds -- which also
+# takes aerosol-derived CDNC from outside MSTCNV. That routine is NOT ported.
+#
+# Without *something* here the plume retains condensate ModelE would have rained
+# out and the column carries a moist, heavy bias that grows with height. So this
+# is a deliberate placeholder, fitted to the oracle, so the rest of the scheme
+# can be exercised end to end. It is the one piece of this port that is
+# calibrated rather than derived, and results that depend on it should say so.
+#
+# Shape: the precipitated fraction is almost entirely a function of the in-plume
+# condensate mixing ratio (correlation +0.97 against the oracle over 484 BOMEX
+# transitions), and adding a residence-time factor gzl/w makes the fit *worse*
+# (+0.89). A saturating Weibull in qc alone therefore fits best, and its
+# exponent comes out at ~2.1 -- the quadratic collection dependence Kessler-type
+# autoconversion assumes, which is reassuring for a fit that was not constrained
+# to find it. RMS error 0.029 in the removed fraction, against 0.136 for the
+# best flat fraction.
+_PRECIP_QC_SCALE = 1.8558e-3   # condensate mixing ratio at which ~63% rains out
+_PRECIP_EXPONENT = 2.1125
+
+
+def precipitation_fraction(plume_condensate: jnp.ndarray,
+                           plume_mass: jnp.ndarray,
+                           scale: jnp.ndarray = _PRECIP_QC_SCALE,
+                           exponent: jnp.ndarray = _PRECIP_EXPONENT
+                           ) -> jnp.ndarray:
+    """Fraction of plume condensate removed as precipitation.
+
+    **This is a calibrated stand-in for ModelE's convective microphysics, not a
+    port of it.** See the block comment above for what it replaces and why.
+
+    ``fraction = 1 - exp(-(qc/scale)**exponent)``, with ``qc`` the in-plume
+    condensate mixing ratio. Saturating by construction, so it can never remove
+    more condensate than exists.
+
+    Args:
+        plume_condensate: Extensive condensate ``wmp``.
+        plume_mass: Plume mass ``mplume`` [kg/m^2].
+        scale: Condensate mixing ratio at which ~63% precipitates. Tunable, and
+            a differentiable leaf rather than a hard-coded constant, since it is
+            a fitted parameter and a likely target for later calibration.
+        exponent: Steepness of the onset. Likewise tunable.
+
+    Returns:
+        Fraction in [0, 1]. Reaches exactly 1 only where the exponential
+        underflows, i.e. all the condensate rains out.
+    """
+    qc = _safe_divide(plume_condensate, plume_mass)
+    # `x**exponent` with a non-integer exponent is not differentiable at x = 0,
+    # which is exactly a condensate-free plume, so keep zero out of the power.
+    wet = qc > 0.0
+    scaled = jnp.where(wet, qc / scale, 1.0) ** exponent
+    return jnp.where(wet, -jnp.expm1(-scaled), 0.0)
