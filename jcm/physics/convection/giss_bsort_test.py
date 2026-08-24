@@ -383,20 +383,23 @@ class TestSortBlends(unittest.TestCase):
 _COLUMN = dict(
     level=[10, 11, 12, 13, 14, 15, 16],
     cloud_base=10, enteff=0.67,
-    mplume=[51.78002, 40.9490, 49.80765, 41.1260, 32.3701, 23.8688, 16.8468],
-    wcu=[0.6661229, 0.8595595, 1.006440, 1.261636, 1.548336, 1.632314, 0.0],
+    mplume=[51.78002, 40.94896, 49.80765, 41.12595, 32.37008, 23.86885, 16.8468],
+    wcu=[0.6661229, 0.8595595, 1.00644, 1.261636, 1.548336, 1.632314, 0.0],
     ent=[0.004, 0.004, 0.002373484, 0.001860267, 0.001478261, 0.0005, 0.0],
+    det=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.001809418],
     lag=[51.78002] * 7,
     ma=[114.139, 124.5152, 145.2678, 176.3966, 207.5254, 238.6542, 269.783],
-    gzl=[104.5873, 114.9679, 138.7207, 168.0, 202.0, 237.6995, 276.6867],
-    delz=[104.5267, 114.9, 136.0888, 166.0, 200.0, 237.0469, 276.3319],
-    zl=[871.95, 981.82, 1107.44, 1259.26, 1443.48, 1662.34, 1918.88],
-    senv=[41.55117, 41.6, 41.67797, 41.8, 41.95, 42.17594, 42.56336],
-    qenv=[0.01419186, 0.0135, 0.01280588, 0.0115, 0.0100, 0.008228802,
-          0.005121686],
-    tvl=[295.343, 294.5, 293.6729, 292.5, 291.5, 290.8705, 290.4641],
-    plk=[7.047142, 7.02, 6.991814, 6.94, 6.90, 6.862273, 6.803096],
-    pres=[91782.26, 90500.0, 89289.23, 87000.0, 85000.0, 83641.74, 81148.71],
+    gzl=[104.5873, 117.7456, 138.7207, 168.017, 201.5415, 237.6995, 276.6867],
+    delz=[104.5267, 115.2422, 136.0888, 167.6942, 200.9352, 237.0469, 276.3319],
+    zl=[871.9527, 981.8191, 1107.444, 1259.26, 1443.478, 1662.343, 1918.877],
+    senv=[41.55117, 41.61034, 41.67797, 41.75965, 41.87822, 42.17594, 42.56336],
+    qenv=[0.01419186, 0.01354509, 0.01280588, 0.01191302, 0.01070161,
+          0.008228802, 0.005121686],
+    tvl=[295.343, 294.5645, 293.6729, 292.5937, 291.3948, 290.8705, 290.4641],
+    plk=[7.047142, 7.021307, 6.991814, 6.956239, 6.913175, 6.862273, 6.803096],
+    pres=[91782.26, 90612.06, 89289.23, 87712.0, 85829.51, 83641.74, 81148.71],
+    detrained=[32.49318, 10.42755, 25.08094, 21.61005, 12.09685, 0.0, 8.434217],
+    downdraft=[0.0, 0.0, 0.0, 0.0, 6.048424, 9.858854, 0.0],
     smp=2155.917, qmp=0.8344364, wmp=0.0306781,
     detrained0=32.49318, downdraft0=0.0,
 )
@@ -600,3 +603,112 @@ class TestResaturatePlume(unittest.TestCase):
                 jnp.array(self.PRESSURE))[2]
         grad = jax.grad(f)(jnp.array(self.OUT_WATER))
         self.assertTrue(bool(jnp.isfinite(grad)))
+
+
+class TestPrecipitationFraction(unittest.TestCase):
+    """The calibrated stand-in for ModelE's convective microphysics.
+
+    These pin the *shape* the closure must keep -- bounded, monotone,
+    saturating, differentiable -- rather than its fitted coefficients, which are
+    tunable by design. The one calibration check is deliberately loose: it
+    asserts the fit still lands in the right neighbourhood of the oracle, not
+    that it reproduces particular numbers.
+    """
+
+    def test_bounded_and_monotone_in_condensate(self):
+        mass = jnp.array(40.0)
+        qc = jnp.linspace(0.0, 5e-3, 40)
+        f = bs.precipitation_fraction(qc * mass, mass)
+        self.assertTrue(bool(jnp.all(f >= 0.0)))
+        self.assertTrue(bool(jnp.all(f <= 1.0)))
+        self.assertTrue(bool(jnp.all(jnp.diff(f) >= -1e-12)))
+
+    def test_no_condensate_no_precipitation(self):
+        f = bs.precipitation_fraction(jnp.array(0.0), jnp.array(40.0))
+        self.assertEqual(float(f), 0.0)
+
+    def test_zero_mass_is_safe(self):
+        f = bs.precipitation_fraction(jnp.array(0.0), jnp.array(0.0))
+        self.assertEqual(float(f), 0.0)
+        self.assertTrue(bool(jnp.isfinite(f)))
+
+    def test_saturates_rather_than_exceeding_available_condensate(self):
+        mass = jnp.array(40.0)
+        f = bs.precipitation_fraction(jnp.array(1.0) * mass, mass)  # absurd qc
+        # Saturates at exactly 1 once the exponential underflows: all the
+        # condensate rains out, which is the correct limit -- what matters is
+        # that it can never exceed what the plume holds.
+        self.assertLessEqual(float(f), 1.0)
+        self.assertGreater(float(f), 0.99)
+
+    def test_matches_the_oracle_calibration_in_the_observed_range(self):
+        # Over the condensate range BOMEX actually samples, the removed fraction
+        # runs from roughly a tenth to about a half.
+        mass = jnp.array(40.0)
+        low = float(bs.precipitation_fraction(jnp.array(5.6e-4) * mass, mass))
+        high = float(bs.precipitation_fraction(jnp.array(1.44e-3) * mass, mass))
+        self.assertGreater(low, 0.03)
+        self.assertLess(low, 0.20)
+        self.assertGreater(high, 0.35)
+        self.assertLess(high, 0.65)
+
+    def test_parameters_are_differentiable(self):
+        # The fitted coefficients are arguments, not constants, so they can be
+        # calibrated later by gradient descent.
+        mass = jnp.array(40.0)
+        cond = jnp.array(1e-3) * mass
+        g = jax.grad(lambda sc: bs.precipitation_fraction(cond, mass, scale=sc))(
+            jnp.array(bs._PRECIP_QC_SCALE))
+        self.assertTrue(bool(jnp.isfinite(g)))
+        self.assertLess(float(g), 0.0)   # a larger scale rains out less
+
+    def test_gradient_finite_at_zero_condensate(self):
+        # The non-integer power is not differentiable at zero, which is exactly
+        # a condensate-free plume.
+        g = jax.grad(lambda cnd: bs.precipitation_fraction(cnd, jnp.array(40.0)))(
+            jnp.array(0.0))
+        self.assertTrue(bool(jnp.isfinite(g)))
+
+
+class TestClosedColumn(unittest.TestCase):
+    """The whole chain against one real ModelE column.
+
+    With the re-saturation and the precipitation stand-in in place the ascent
+    tracks ModelE level by level. This is the end-to-end regression test: it
+    would catch any of the per-level pieces drifting, and it is the check that
+    was impossible before the inter-level step existed.
+    """
+
+    def _run(self):
+        return _run_column()
+
+    def test_plume_survives_the_whole_column(self):
+        r = self._run()
+        for lev in _COLUMN["level"][:-1]:
+            self.assertTrue(bool(r.active[lev]), msg=f"died at level {lev}")
+
+    def test_plume_mass_tracks_oracle(self):
+        r = self._run()
+        for i, lev in enumerate(_COLUMN["level"]):
+            if not bool(r.active[lev]):
+                continue
+            self.assertAlmostEqual(
+                float(r.plume_mass[lev]) / _COLUMN["mplume"][i], 1.0,
+                delta=0.05, msg=f"level {lev}")
+
+    def test_vertical_velocity_tracks_oracle(self):
+        r = self._run()
+        for i, lev in enumerate(_COLUMN["level"]):
+            if not bool(r.active[lev]) or _COLUMN["wcu"][i] <= 0.0:
+                continue
+            self.assertAlmostEqual(
+                float(r.vertical_velocity[lev]) / _COLUMN["wcu"][i], 1.0,
+                delta=0.05, msg=f"level {lev}")
+
+    def test_mass_flux_decays_with_height_as_in_the_oracle(self):
+        # The qualitative signature of buoyancy sorting, and the behaviour the
+        # previous Gregory-entrainment port could not produce: the plume sheds
+        # mass on the way up instead of growing until it terminates.
+        r = self._run()
+        base, top = _COLUMN["level"][0], _COLUMN["level"][-1]
+        self.assertLess(float(r.plume_mass[top]), float(r.plume_mass[base]))
