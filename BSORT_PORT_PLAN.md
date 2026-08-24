@@ -451,15 +451,52 @@ positive buoyancy, **188 from the boundary-layer forced branch**), entrainment
 on 373, evaporation on 813 — so all three paths are live and none can be
 dropped.
 
-### Not yet verified
+### Validation round: what it settled, and what it exposed
 
-The module passes a smoke test (mass balances, gradients finite, the downdraft
-accumulates then sheds in the boundary layer) but has **not** been validated
-level-by-level against the oracle. Doing so needs one more dump round: the
-descent trace carries `ddr` but not `smdnl`/`qmdnl` (the heat and water the
-plume routes into the downdraft), and the environment profile below cloud base,
-which the mass-budget dump does not cover because the plume never goes there.
+**Verified directly against the oracle:**
 
-Until that check is run, the module should be treated as written-but-unverified
-— which, on the evidence of every earlier phase here, is not the same as
-correct.
+* The **branch logic is exactly right.** ModelE's detrained fraction comes out
+  at precisely 0.75 on positively buoyant levels (n=377), 0.50 on
+  boundary-layer-forced levels (n=188) and 0.00 elsewhere (n=185) — the three
+  cases this port implements, with the constants it uses.
+* The descent budget `dd_out = dd_in + ddr + edraft − detr` closes to 1.1e-5.
+* With no evaporation supplied, downdraft mass and entrainment reproduce the
+  oracle exactly on the upper levels (median relative error 0.000%), before the
+  missing cooling makes the two solutions diverge.
+
+**Not verified, and now understood to be unverifiable in isolation:** the
+descent chain level by level. It depends on the precipitation falling through
+the downdraft, which comes from `CONVECTIVE_MICROPHYSICS` — not ported.
+
+### The finding that matters more than the port
+
+The downdraft is **acutely sensitive to the precipitation supply**, far more
+than expected:
+
+| precipitation supplied | downdraft mass, median error vs oracle |
+|---|---|
+| none | 0.000% on upper levels, diverging below |
+| over-supplied (0.05 kg/m² per level) | **322%** |
+
+The mechanism is a feedback: evaporation cools the downdraft, cooling keeps it
+negatively buoyant, staying negatively buoyant suppresses detrainment, and
+suppressed detrainment lets the mass run away. Get the precipitation wrong and
+the downdraft's whole structure is wrong, not merely its magnitude.
+
+**This inverts the reasoning behind porting it.** The expectation was that
+porting the downdraft would leave one approximation (precipitation magnitude)
+in place of two. Instead, the downdraft *amplifies* the precipitation
+approximation: it converts an error in how much rain forms into an error in
+where and whether the downdraft deposits its air at all.
+
+So the honest position is:
+
+* the downdraft port is **structurally correct and parameter-exact**, and it is
+  the right thing to have;
+* but it cannot be validated, and should not be trusted quantitatively, until
+  the precipitation it consumes is real rather than fitted;
+* and the precipitation stand-in is now a **more** load-bearing approximation
+  than it was before the downdraft existed, not less.
+
+Porting `CONVECTIVE_MICROPHYSICS` has therefore moved from "arguably out of
+scope" to the critical path for any quantitative convective-moisture result.
