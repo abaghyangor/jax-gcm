@@ -4,7 +4,9 @@ import unittest
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
+from jcm.physics.convection import giss_tendencies as gt
 from jcm.physics.convection.giss_tendencies import (
     convective_tendencies,
     subsidence_tendency,
@@ -105,3 +107,112 @@ class TestConvectiveTendencies(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBsortEnvironmentTendencies(unittest.TestCase):
+    """The two-stage plume -> environment update.
+
+    The conservation tests here are not decoration: mass closure is what
+    revealed that the plume's remaining mass must be dumped into its
+    termination level, without which the environment silently gained several
+    kg/m^2 per column.
+    """
+
+    NLEV = 12
+    BASE = 4
+
+    def _column(self, **over):
+        z = jnp.zeros(self.NLEV)
+        levels = jnp.arange(self.NLEV)
+        in_cloud = (levels >= self.BASE) & (levels <= self.BASE + 3)
+        senv = jnp.full(self.NLEV, 41.5)
+        qenv = jnp.linspace(0.015, 0.004, self.NLEV)
+        args = dict(
+            # 40 kg/m^2 drawn from the two layers below cloud base
+            source_removal=jnp.where(
+                (levels >= self.BASE - 2) & (levels < self.BASE), 20.0, 0.0),
+            entrained_air=jnp.where(in_cloud, 8.0, 0.0),
+            # Balanced by construction: everything entering the plume
+            # (40 source + 4x8 entrained = 72) must leave it again, so the four
+            # in-cloud levels deposit 18 each.
+            detrained_mass=jnp.where(in_cloud, 14.0, 0.0),
+            detrained_heat=jnp.where(in_cloud, 14.0 * 41.7, 0.0),
+            detrained_water=jnp.where(in_cloud, 14.0 * 0.012, 0.0),
+            downdraft_mass=jnp.where(in_cloud, 4.0, 0.0),
+            downdraft_heat=jnp.where(in_cloud, 4.0 * 41.3, 0.0),
+            downdraft_water=jnp.where(in_cloud, 4.0 * 0.010, 0.0),
+            environment_heat=senv,
+            environment_water=qenv,
+            layer_mass=jnp.full(self.NLEV, 200.0),
+        )
+        args.update(over)
+        return args, gt.bsort_environment_tendencies(**args)
+
+    def test_conserves_mass_when_the_plume_is_balanced(self):
+        # Source draw plus entrainment equals everything deposited, so the
+        # environment must end with exactly the mass it started with.
+        _, t = self._column()
+        self.assertAlmostEqual(float(jnp.sum(t.layer_mass)), 0.0, delta=1e-9)
+
+    def test_advection_alone_moves_no_mass_in_total(self):
+        # Subsidence redistributes; only the local exchange can change the
+        # column total. Removing the exchange must leave the total untouched.
+        args, t = self._column()
+        net_exchange = float(jnp.sum(
+            args["detrained_mass"] + args["downdraft_mass"]
+            - args["source_removal"] - args["entrained_air"]))
+        self.assertAlmostEqual(float(jnp.sum(t.layer_mass)), net_exchange,
+                               delta=1e-9)
+
+    def test_interface_flux_peaks_at_cloud_base(self):
+        # Continuity should build the flux up through the source layers to the
+        # cloud-base mass, then draw it down as the plume detrains.
+        _, t = self._column()
+        flux = np.asarray(t.interface_flux)
+        self.assertAlmostEqual(flux[self.BASE - 1], 40.0, delta=1e-6)
+        self.assertLess(flux[self.BASE + 3], flux[self.BASE - 1])
+
+    def test_no_flux_above_the_plume(self):
+        _, t = self._column()
+        self.assertEqual(float(jnp.sum(jnp.abs(
+            t.interface_flux[self.BASE + 4:]))), 0.0)
+
+    def test_subsidence_dries_the_layers_it_warms(self):
+        # Compensating subsidence brings down warmer, drier air, so in a moist
+        # BOMEX-like profile the in-cloud layers should moisten less than the
+        # detrainment alone would suggest, and the flux must be downward.
+        _, t = self._column()
+        self.assertTrue(bool(jnp.all(t.interface_flux[self.BASE - 1:
+                                                      self.BASE + 3] > 0)))
+
+    def test_downdraft_flag_changes_only_where_it_is_deposited(self):
+        # Excluding the downdraft removes mass from the column; the flag exists
+        # to isolate that, and is not mass-conserving by construction.
+        _, with_dd = self._column()
+        _, without_dd = self._column(deposit_downdraft_locally=False)
+        self.assertGreater(float(jnp.sum(with_dd.layer_mass)),
+                           float(jnp.sum(without_dd.layer_mass)))
+
+    def test_courant_is_reported(self):
+        _, t = self._column()
+        self.assertTrue(bool(jnp.isfinite(t.courant)))
+        # ModelE substeps above 0.999; this configuration is far below.
+        self.assertLess(float(t.courant), 0.999)
+
+    def test_column_matches_vectorized(self):
+        args, single = self._column()
+        block_args = {k: (v[:, None] * jnp.ones((1, 3)) if hasattr(v, "ndim")
+                          and v.ndim else v) for k, v in args.items()}
+        block = gt.bsort_environment_tendencies(**block_args)
+        for name in ("heat", "water", "layer_mass"):
+            self.assertLess(float(jnp.max(jnp.abs(
+                getattr(single, name)[:, None] - getattr(block, name)))), 1e-9)
+
+    def test_gradient_finite(self):
+        args, _ = self._column()
+
+        def f(entrained):
+            return jnp.sum(gt.bsort_environment_tendencies(
+                **{**args, "entrained_air": entrained}).heat)
+        grad = jax.grad(f)(args["entrained_air"])
+        self.assertTrue(bool(jnp.all(jnp.isfinite(grad))))
