@@ -363,3 +363,69 @@ Simplifications this establishes for BOMEX (assert, don't assume, for other case
   transport — out of scope for the current `PhysicsTerm` interface, which
   carries no tracer or momentum tendency from convection. Momentum should be
   revisited once the thermodynamic path matches.
+
+## 7a. Scoping `dd_evap_precip_loop` (the downdraft)
+
+Assessed rather than started, since it decides whether the tendency comparison
+rests on one approximation or two.
+
+### What the 808 lines actually are
+
+| | lines |
+|---|---|
+| total | 808 |
+| comments / blank | 189 |
+| tracer-guarded (`TRACERS_ON` is **off** in this build) | ~196 |
+| declarations | ~30 |
+| **live logic** | **~390** |
+| — of which: the descent loop, non-tracer | 252 |
+| — of which: pre-loop (precip phase, melting, `mcfrac`) | ~140 |
+
+BOMEX is all-liquid (`lhx = LHE` on every oracle level), so the melting,
+freezing and snow-phase machinery — most of the pre-loop's complexity — is
+**inert**. Tracers are out of scope for the `PhysicsTerm` regardless.
+
+### The core is smaller than the line count suggests
+
+Per level, descending from cloud top:
+
+1. accumulate the downdraft mass the sorting produced: `ddraft += ddr(l)`;
+2. evaporate precipitation into it — **`get_dq_evap`, already ported and tested**
+   as `condensate_evaporation`;
+3. cool and moisten it: `smdn -= slh*dqevp/plk`, `qmdn += dqevp`;
+4. test buoyancy against the environment (`svmix` vs `svm1`) and detrain when it
+   turns positively buoyant, with forced detrainment once inside the boundary
+   layer;
+5. deposit the detrained air into `dm`/`dsm`/`dqm`.
+
+That is a **downward scan mirroring `plume_ascent`'s upward one**, on machinery
+already built and proven. Estimate: ~120-160 lines of JAX plus tests, comparable
+to `sort_blends`, plus an oracle dump of `ddm`/`thdn`/`qldn`/`dqevp` to validate
+against — the step that has made every previous phase land correctly.
+
+Tunables come from the same preset block already confirmed active (the one
+carrying `bsort_enteff2 = 0.67`): `dd_evpeff_qp_scale = 0.001`,
+`mc_fddrt = 0.5`, `geometric_fevap = .true.`
+
+### The catch, stated plainly
+
+`dd_evap_precip_loop` consumes `condpr` — the precipitation produced by
+`CONVECTIVE_MICROPHYSICS`, which is **not** ported. Our stand-in supplies a
+precipitated mass per level, so it can drive the downdraft, but the evaporative
+cooling then inherits the stand-in's error.
+
+**So porting the downdraft does not reduce the approximation count to one.** It
+changes the situation from
+
+* *downdraft air deposited at the wrong level, with no evaporative cooling at
+  all* — a structural error in where and how the convection cools and moistens,
+  affecting 29.8% of everything leaving the plume;
+
+to
+
+* *downdraft descending and evaporating in the right place, by the right
+  mechanism, with an approximate precipitation supply.*
+
+That is a real improvement in kind, not just in magnitude, and it is the
+difference between a profile that is biased and one that is misshapen. But the
+precipitation caveat survives it either way.
