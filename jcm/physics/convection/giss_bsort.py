@@ -508,6 +508,8 @@ _LAG_DISTANCE = 1.0e3
 class PlumeAscent(NamedTuple):
     """Per-level results of one plume's ascent. All arrays are ``(nlev, *horiz)``."""
     plume_mass: jnp.ndarray          # mass entering each level
+    plume_condensate: jnp.ndarray    # condensate the plume holds at this level
+    precipitation: jnp.ndarray       # condpr: what rained out of it here
     mass_lag: jnp.ndarray            # mplume_lag: mass ~1 km below
     vertical_velocity: jnp.ndarray
     entrainment: jnp.ndarray
@@ -631,10 +633,13 @@ def plume_ascent(cloud_base: jnp.ndarray,
             droplet_number, droplet_radius).precipitated
         # Only the part of the partition realised over this layer's depth.
         rained = rained * microphysics.finite_ascent_fraction(ma)
-        risen_condensate = risen_condensate - safe_divide(
-            rained * arrival_mass, air_density)
-        risen_condensate = jnp.maximum(risen_condensate, 0.0)
+        rained_mass = jnp.minimum(
+            safe_divide(rained * arrival_mass, air_density), risen_condensate)
+        risen_condensate = jnp.maximum(risen_condensate - rained_mass, 0.0)
         rose = ~at_base & (mass > 0.0)
+        # Only levels the plume actually rose into produced precipitation; the
+        # seed level's condensate arrives already rained out.
+        rained_mass = jnp.where(rose, rained_mass, 0.0)
 
         mass = jnp.where(at_base, cloud_base_mass, mass)
         heat = jnp.where(at_base, cloud_base_heat,
@@ -712,7 +717,8 @@ def plume_ascent(cloud_base: jnp.ndarray,
                  survives,
                  dumped | terminating,
                  history)
-        outputs = (keep(mass), keep(lag), keep(w), keep(ent), keep(det),
+        outputs = (keep(mass), keep(condensate), keep(rained_mass), keep(lag),
+                   keep(w), keep(ent), keep(det),
                    keep(environment_air),
                    keep(sorted_blends.detrained_mass) + dump(mass),
                    keep(sorted_blends.detrained_heat) + dump(heat),
