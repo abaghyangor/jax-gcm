@@ -669,3 +669,51 @@ with `n1 = 9e9`, `n2 = 2e6`, `qr0 = 1e-4`.
 
 Then: implement, and validate `CONDP` against `oracle_data/bomex_microphys.txt`
 (630 records) exactly as every prior phase was validated.
+
+## 9. Heating-rate comparison — diagnosis
+
+Attempted, and **not yet presentable**. Recording why, because the remaining gap
+is now precisely identified.
+
+Against ModelE's `dth_mc` (SUBDD, 48 periods), our mean heating profile gives
+**correlation +0.29** and a peak ratio of 1.34, with the peak about three levels
+too high. ModelE cools the sub-cloud layers (−1.3 to −1.6 K/day at levels 0-3)
+where we produce nothing.
+
+### The sub-cloud source is now oracle-exact
+
+`oracle_data/bomex_source.txt` dumps the actual draw
+(`dmr(lll) = -mplume*fpi(...)`, `MSTCNV.F90:1573`). For the first plume it is
+levels 0-6 — the *whole* sub-cloud layer, mass-weighted, with the two levels
+above the BL top zeroed — summing exactly to the cloud-base mass. The earlier
+placeholder put it in the four layers just below cloud base, which is a
+different region entirely, and explains the missing sub-cloud cooling.
+
+### But supplying it changed nothing, and the reason matters
+
+Feeding the true source made no difference to the profile, because the
+**environmental profile at the sub-cloud levels was a constant fill**: the
+mass-budget dump only covers levels the plume reaches. A removal term is
+`-removed_air · senv`, and its heating effect comes entirely from the *contrast*
+between what is removed and what subsides in to replace it. With a uniform
+`senv` that contrast is zero, so the term is inert.
+
+This is worth stating as a general point about the tendency operator: in a
+uniform environment the correct answer is exactly zero everywhere — nothing can
+change if every layer is identical. A test that produces non-zero heating from a
+uniform column has a mass source, not physics.
+
+### What the heating plot actually needs
+
+1. **The full environmental profile**, all levels, from the SUBDD output
+   (`th`, `q`, `p_3d`) rather than from the plume dump — `single_column_harness`
+   already reads these.
+2. **Per-period plume matching.** There are 52 plume columns against 48 output
+   periods, so some periods fire more than one plume and their tendencies must
+   be summed before comparing.
+3. Then the two known approximations remain: the downdraft is deposited where it
+   forms rather than where it descends, and precipitation is the fitted
+   stand-in.
+
+Items 1 and 2 are wiring, not physics, and are what stand between here and a
+publishable heating comparison.
