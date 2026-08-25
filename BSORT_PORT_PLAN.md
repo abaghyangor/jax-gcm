@@ -970,3 +970,51 @@ remains unknown.
 
 Current standing with the pre-convection state and the downdraft wired:
 `dth` +0.931 / peak 1.53, `dq` +0.946 / peak 0.96.
+
+## 10. `PRECIPLIQ_GAMMA` ported and exact — but it does not fix the downdraft
+
+`giss_microphysics.py`. Validated against the 630-record oracle:
+
+| quantity | agreement |
+|---|---|
+| critical drop diameter `Dc` | **630/630**, max rel 5.8e-7 |
+| precipitated water | **570/570**, median rel 1.9e-6 |
+| precipitates-or-not | **630/630** |
+
+The scheme is a two-mode gamma distribution: a cloud mode of fixed capacity
+`CDNC·rho_w·(4/3)pi·rvl^3`, a rain mode holding the excess, and drops falling
+faster than the updraft are lost. `incompleteGamma2` is the **lower**
+regularized incomplete gamma, confirmed by the sign of the result.
+
+A third fractional-power NaN gradient turned up and was fixed (`x^(1/3)` and
+`x^(1/4)` at zero condensate) — the same class as the two in `giss_bsort` and
+`precipitation_fraction`. Worth treating as a standing hazard in this port:
+**any non-integer power whose base can legitimately be zero.**
+
+### The result that matters: precipitation was necessary but not sufficient
+
+Substituting the real microphysics for the stand-in raises the precipitation
+supply (0.0050 -> 0.0079) and the evaporation into the downdraft (0.0049 ->
+0.0075), a 50% increase — and leaves the downdraft mass profile **bit-identical**
+(8.72, 2.25, 3.39, 0.21 at levels 13/11/8/6, against ModelE's 9.86, 17.10,
+18.36, 19.06).
+
+The reason is that detrainment is a *step function* of the buoyancy sign, not of
+its magnitude: 0.75 when buoyant, 0.5 in the boundary layer, 0 otherwise. More
+cooling that does not flip the sign changes nothing at all. ModelE's downdraft
+evaporates roughly 3x more than ours even with the correct microphysics.
+
+So §9f's diagnosis was right about the mechanism (a runaway) but wrong about the
+cause being *only* the precipitation supply. Something in the downdraft port
+itself keeps it too warm. Candidates, untested:
+
+* `environment_condensate` is passed as zero in the harness, where ModelE uses
+  `qcl + qci`. That *raises* our environmental virtual temperature relative to
+  ModelE's, which should make our downdraft *less* likely to test buoyant — so
+  it cannot explain the discrepancy and may be masking it.
+* The evaporation efficiency factor saturates at 1 here, so it is not limiting.
+* The precipitation is being re-split `fddrt` each level in the port; ModelE's
+  `prcp_d` stays roughly constant down the column while ours decays. Worth
+  checking whether the split is being applied to the right quantity.
+
+The last of these is the most concrete and is where to look next.
