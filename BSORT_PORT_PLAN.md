@@ -916,3 +916,57 @@ layer that needed it.
 Next: set `boundary_layer_top = cloud_base - 1` (falling back to `dcl` where
 that is higher) and re-test. This is a one-line change with a sharp prediction —
 the levels 7-8 sign should flip.
+
+### 9f. The boundary-layer hypothesis is falsified; the runaway is the real mechanism
+
+Setting `boundary_layer_top = cloud_base - 1` changed **nothing** — the numbers
+are bit-identical to using the source top. The §9e hypothesis is wrong.
+
+The reason is visible in the downdraft mass profile for step 1's first plume:
+
+| level | ModelE `ddm` | ours |
+|---|---|---|
+| 13 | 9.86 | 8.72 |
+| 11 | 17.10 | 2.25 |
+| 8 | 18.36 | 3.39 |
+| 6 | 19.06 | 0.21 |
+| 2 | 1.37 | ~0 |
+
+**ModelE's downdraft grows as it descends**, roughly doubling from formation to
+the boundary layer, and only sheds its mass in the lowest few levels. Ours
+collapses within two levels and never arrives. Changing where forced detrainment
+begins is irrelevant when there is no downdraft left to detrain.
+
+### The runaway
+
+Our evaporation at level 13 is 0.0014 against ModelE's 0.0060. That is enough to
+start a feedback:
+
+> too little precipitation to evaporate → downdraft not cooled → tests
+> positively buoyant → sheds 75% of its mass → less mass to evaporate into →
+> less cooling still.
+
+Each step makes the next worse, which is why the collapse is so abrupt. ModelE
+avoids it because its downdraft stays negatively buoyant the whole way down.
+
+The efficiency factor is not the limiter — for these values
+`min(1, (ma·kg2mb/30)·(prcp_mixrat/1e-3)^0.6)` saturates at 1. The limiter is the
+**precipitation supply itself**, which is the fitted stand-in.
+
+### Consequence for the plan
+
+This is now the third independent line of evidence pointing at
+`CONVECTIVE_MICROPHYSICS`:
+
+* §8b — the stand-in's mechanism is demonstrably wrong (threshold, not Weibull);
+* §7b — the downdraft is acutely sensitive to the precipitation supply;
+* §9f — that sensitivity is a *runaway*, not a gradual degradation.
+
+It also means **the downdraft port cannot be validated at all** until
+precipitation is real: every test of it so far has been a test of the stand-in.
+The verdict in §9c that "the downdraft is not the fix" should be read narrowly —
+the downdraft as currently *fed* is not the fix. Whether the port is correct
+remains unknown.
+
+Current standing with the pre-convection state and the downdraft wired:
+`dth` +0.931 / peak 1.53, `dq` +0.946 / peak 0.96.
