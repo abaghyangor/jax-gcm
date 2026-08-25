@@ -1367,3 +1367,57 @@ to this input. Sub-cloud level 0 does improve, −0.427 to −0.644 against Mode
 * Heating 16% strong.
 
 `figures/tendencies.png` shows both fields for three periods.
+
+## 18. Continuity oracle: the remaining gap is the downdraft, and it is isolated
+
+`oracle_data/bomex_continuity.txt` dumps `cm`, `dm`, `dmr` and their heat/water
+counterparts from inside `apply_continuity_tendencies` — the one component never
+checked against its own oracle.
+
+### What it shows
+
+| level | `dm` ModelE | `dm` ours | `dmr` ModelE | `dmr` ours |
+|---|---|---|---|---|
+| 0-6 (sub-cloud) | 0.42 → 10.84 | **~0** | −11.64 → −12.04 | −11.64 |
+| 8 | 17.19 | 17.21 | −11.86 | −11.46 |
+| 9 | 48.82 | 48.89 | −32.11 | −31.69 |
+
+`dmr` matches, and the plume's own `dm` matches at levels 8-9. **The entire
+discrepancy is `dm` in the sub-cloud layers**, which is the downdraft's
+detrainment: ModelE's `dm` at level 6 is 10.84, and the downdraft dump shows
+`detr = 9.53` there. Our downdraft never arrives.
+
+### A harness bug found on the way
+
+The harness was passing SUBDD-derived `exner`/`pressure` where every other
+plume input used ModelE's own dumped values. In the harness configuration the
+plume's detrained mass diverged from level 10 onward (31.28 against 10.43),
+while the standalone configuration matched at 0.017%. Using ModelE's `plk`/
+`pres` at plume levels restores it to **0.067%**.
+
+That is worth noting as a pattern: the standalone validations and the harness
+were not running the same configuration, so a component could be "validated" and
+still be wrong where it was actually used. The plume is now verified *in the
+configuration the tendency comparison uses*.
+
+Standing after the fix: `dth` **+0.979 / 1.16**, `dq` **+0.981 / 0.95**.
+
+### The downdraft collapse is now isolated
+
+ModelE's downdraft detrains **nothing** between its formation level and the
+boundary layer, then sheds 9.53/4.94/2.56 at levels 6/5/4. Ours detrains 10.19
+at the formation level itself — the buoyant branch firing where ModelE's does
+not.
+
+Ruled out by direct test:
+
+* the descent port itself — driven with oracle `ddr`/`smdnl`/`qmdnl` it
+  reproduces ModelE's mass and detrainment essentially exactly;
+* the descent's auxiliary inputs — substituting real `qcl+qci`, real `mcfrac`
+  and the `lcl`-based boundary-layer top changes the result *not at all*;
+* the plume's downdraft source, now at 0.1% in the standalone configuration.
+
+What remains untested is the downdraft source **in the harness configuration**,
+where `ddr` is 8.70 against ModelE's 9.86 — 12% low. Given §7b established this
+system is a runaway, 12% at the formation level is not obviously too small to
+explain a collapse. That is the next thing to measure.
