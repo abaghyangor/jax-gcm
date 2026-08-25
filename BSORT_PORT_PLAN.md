@@ -833,3 +833,46 @@ reverses the priority set in §7b. The next diagnostic should be the *moisture*
 tendency `dq_mc`, not more heating work: it isolates the precipitation term far
 more directly than heating does, since the heating is dominated by subsidence
 while the moistening is dominated by what the plume actually sheds.
+
+### 9d. `dq_mc` — the two errors are one error
+
+| | correlation | peak ratio |
+|---|---|---|
+| `dq_mc`, downdraft folded | +0.836 | **0.70** |
+| `dq_mc`, downdraft descending | +0.849 | **0.70** |
+
+Again the descending downdraft barely moves it (+0.013), confirming §9c: the
+downdraft is not what is wrong.
+
+**The diagnostic signal is the sign error at levels 7-9.** ModelE *moistens*
+there (+0.0005 to +0.002); we *dry* (−0.0014 to −0.0059). Combined with the
+heating being 1.58x too strong in the same layer, both point at a single cause:
+
+> the compensating subsidence is too strong relative to the detrainment
+> deposition in the mid-cloud layer.
+
+Subsidence warms and dries; detrainment of plume air cools and moistens. Too
+much of the first relative to the second gives exactly this pair of symptoms —
+excess heating *and* drying where ModelE has moistening. That is one error
+showing in two diagnostics, not two independent problems.
+
+This matters because **the plume mass flux itself matches ModelE to 0.06%**
+(§7). So the error is not in the plume; it is in how the tendency operator turns
+that flux into environmental tendencies.
+
+Two candidates, in order:
+
+1. **The environment profile is the post-convection state.** The SUBDD `th`/`q`
+   are written after physics has already modified the column, so the contrast
+   driving both the subsidence and the deposition terms is taken against the
+   wrong profile. This exact bias was found and corrected once before in this
+   project, for the single-column harness; it appears to have re-entered here
+   through the SUBDD route. `single_column_harness.run_column` already has the
+   pre-convection correction (subtracting `dth_mc`/`dq_mc` times the step) and
+   should be reused rather than re-deriving the environment.
+2. The detrainment deposition may be under-weighted relative to the interface
+   flux in `bsort_environment_tendencies` — but this is less likely given the
+   mass budget closes.
+
+Next step is (1): drive the comparison from `single_column_harness`'s
+pre-convection state instead of raw SUBDD fields.
