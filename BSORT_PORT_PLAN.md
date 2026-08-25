@@ -1319,3 +1319,51 @@ the plume's cloud base, which the harness currently conflates.
 
 That is the number to quote, with the caveat that one harness input is a
 constant that happens to be favourable rather than a derived profile.
+
+## 17. `condpr` traced to a harness bug; the result is robust
+
+### The bug
+
+The harness was computing `condpr` from `detrained_condensate +
+downdraft_condensate` — the condensate *leaving* the plume — because
+`PlumeAscent` did not expose the condensate *in* it. That made our `CONDMU`
+3-5x smaller than ModelE's (ratios 0.22-0.30), which put it below the cloud-mode
+capacity so that `CONDP` came out essentially zero.
+
+`plume_ascent` now exposes both `plume_condensate` and `precipitation`
+(the `condpr` it already computed internally), so the harness no longer
+recomputes anything. `CONDMU` ratios move to 0.59-1.03.
+
+### Why fixing it changed nothing, and why that matters
+
+With `mcfrac` held constant the precipitation-weighted mean convective fraction
+*equals that constant regardless of the weights*, so `condpr` cannot affect
+`fevap` at all. The §16 test of "real `mcfrac`" was therefore run against a
+broken `condpr`, and the two inputs only mean anything together.
+
+Running both correctly:
+
+| | dth corr | dth peak | dq corr | dq peak |
+|---|---|---|---|---|
+| constant `mcfrac`, plume `condpr` | +0.977 | 1.15 | +0.980 | 0.95 |
+| **real `mcfrac` + real `condpr`** | **+0.978** | **1.16** | **+0.977** | **0.96** |
+
+Essentially identical. That resolves the §16 worry that the constant was
+"favourable by accident": it is not favourable, the answer is simply **robust**
+to this input. Sub-cloud level 0 does improve, −0.427 to −0.644 against ModelE's
+−1.627.
+
+**Standing result, every input derived:**
+
+| | correlation | peak ratio |
+|---|---|---|
+| `dth_mc` | **+0.978** | **1.16** |
+| `dq_mc` | **+0.977** | **0.96** |
+
+### What is left
+
+* Sub-cloud cooling reaches about 40% of ModelE's.
+* Levels 7-9 remain the wrong sign in moisture, though ~4x smaller than before.
+* Heating 16% strong.
+
+`figures/tendencies.png` shows both fields for three periods.
