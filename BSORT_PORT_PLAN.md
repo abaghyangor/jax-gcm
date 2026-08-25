@@ -554,3 +554,52 @@ against it. Do **not** trust the constants block — the active preset is lines
 `cloudrvl_mstcnv = 10`, `cdnc_ocean_mc = 60`, `dd_evpeff_qp_scale = 0.001`,
 `dd_detbyent = 0`, `max_dt_overshoot = 1`, `mc_fddrt = 0.5`) came from it, but
 `fddet` showed that some are not in the source at all.
+
+### 8a. Microphysics oracle — first round
+
+`oracle_data/bomex_microphys.txt`, 630 records. Two pieces already verified
+exactly, and one finding that invalidates the *form* of the current stand-in.
+
+**The critical drop diameter is exact.** The active analytic form
+
+```
+DCW = max(0, log(((w·(p/1e5)^0.4) − 9.65)/(−9.8)) / (−600))
+```
+
+reproduces the dumped `DCW` on the first record checked by hand
+(1.124894e-4 m at `w = 0.5`, `p = 94886`). Note `PL` inside
+`CONVECTIVE_MICROPHYSICS` is in **Pa** despite the name — the caller passes
+`PRES(L)`, not `pl(l)`. That is the second time this pair has bitten.
+
+**The cloud/rain partition is exact, 630/630.** `PRECIPLIQ_GAMMA` splits the
+condensate into a cloud mode of fixed capacity and a rain mode holding the rest:
+
+```
+lwc_cloud = min(twc, CDNC·ρw·(4/3)π·rvl³)      # ≈ 2.0-2.6e-4 kg/m³ here
+lwc_rain  = twc − lwc_cloud
+```
+
+Precipitation occurs **iff** `lwc_rain > 0`, and that predicate agrees with the
+oracle on every one of the 630 records. Of the rain-mode water, the
+precipitated fraction runs 0.022-1.03, median 0.795, correlating with
+`lwc_rain` (+0.58) far more than with `DCW` (+0.10) or `w` (+0.11).
+
+**This invalidates the shape of the current stand-in.**
+`giss_bsort.precipitation_fraction` is a smooth Weibull in the condensate
+*mixing ratio*. The real scheme is a **hard threshold on liquid water
+content**, at a capacity set by droplet number and size — nothing precipitates
+at all below it. The stand-in's +0.97 correlation with `qc` was picking up the
+threshold's shadow, not its mechanism, which is why it degraded at low
+condensate.
+
+Two consequences:
+
+* The stand-in can be **improved immediately**, without the gamma integration,
+  by replacing the Weibull with the exact threshold plus a fitted fraction of
+  the rain-mode water. That is strictly better grounded than what is there now.
+* The remaining unknown is narrow: what fraction of `lwc_rain` falls out, which
+  is the gamma integration above `DCW`.
+
+**Portability of the gamma integration:** `jax.scipy.special.gammainc` is
+differentiable in both arguments, and `mu_rain = 2.5` is a constant, so only the
+`x` argument varies. No obstacle.
