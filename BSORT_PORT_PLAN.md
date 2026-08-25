@@ -631,3 +631,41 @@ not to ship the intermediate step just because its derivation is nicer.
 **Decision: leave `precipitation_fraction` alone and port the gamma integration
 outright.** The threshold work is not wasted — it is the first half of that
 port, already verified.
+
+### 8c. The gamma integration, reduced to a spec
+
+`PRECIPLIQ_GAMMA` (active copy, `MSTCNV.F90:7880-8131`) turns out to be short
+once the diagnostic outputs are set aside. The whole precipitation calculation
+is:
+
+```
+lwc_cloud      = min(twc, CDNC·ρw·(4/3)π·rvl³)          # verified 630/630
+lwc_rain       = twc − lwc_cloud
+lam_cloud      = ((ρw·(π/6)·CDNC·(μc+1)(μc+2)(μc+3)) / lwc_cloud)^(1/3)
+lwc_detr_cloud = lwc_cloud · P(μc+4, lam_cloud·Dc)
+lwc_detr_rain  = lwc_rain  · P(μr+4, lam_rain·Dc)
+CONDP          = max(0, twc − lwc_detr_cloud − lwc_detr_rain)
+```
+
+with `μr = 2.5` constant and `Dc` the critical drop diameter from §8a.
+
+**`incompleteGamma2` is the *lower* regularized incomplete gamma**, i.e.
+`jax.scipy.special.gammainc`, not `gammaincc`. The naming invites the opposite
+reading, and the sign of the whole scheme depends on it. The proof is the last
+line: `lwc_detr_*` is subtracted from the total to give the precipitation, so it
+must be the water in *small* drops — the ones whose fall speed is below the
+updraft and which therefore stay with the plume. `detr` here means "detrained
+with the cloud", not "removed as rain".
+
+The recurrences in the Fortran (`gam_ingam_mup2 = mup1·gam_ingam_mup1 − expmx`,
+and so on) are just the upward recurrence for the incomplete gamma, used to get
+all four orders from one evaluation. A port can call `gammainc(μ+4, x)` directly
+and skip them.
+
+**Still to extract** (a few lines either side of what is transcribed above):
+`mu_cloud` and its `mu_cld_max = 15` cap, and `lam_rain`/`nc_rain` from
+`n0_rain = (n1−n2)/2·tanh((qr0·ρair − lwc_rain)/(4·qr0·ρair)) + (n1+n2)/2`
+with `n1 = 9e9`, `n2 = 2e6`, `qr0 = 1e-4`.
+
+Then: implement, and validate `CONDP` against `oracle_data/bomex_microphys.txt`
+(630 records) exactly as every prior phase was validated.
