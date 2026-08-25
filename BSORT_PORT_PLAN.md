@@ -1074,3 +1074,65 @@ plume's temperature, not its mass. The plume's own `w` and detrainment now match
 to 0.1%, so the next place to look is the heat content of what it deposits,
 and specifically whether the latent heat released on re-saturation is being
 double-counted against what ModelE already accounts for in `CDHEAT`.
+
+## 12. The sub-cloud gap is environmental precipitation evaporation
+
+The `CDHEAT` double-counting hypothesis was **wrong**: `CDHEAT` is a pure
+diagnostic (summed at `MSTCNV.F90:5645`, never fed back), and §5b had already
+shown plume heat matching 484/484.
+
+First, the plume is now confirmed correct in *every* output:
+
+| plume output | median error vs oracle |
+|---|---|
+| mass | 0.072% |
+| updraft `w` | 0.093% |
+| detrained mass | 0.017% |
+| **downdraft source** | **0.099%** |
+| **entrained air** | **0.110%** |
+
+The last two had never been checked. With all five matching to ~0.1%, the
+tendency discrepancy cannot be coming from the plume.
+
+### The missing term
+
+ModelE splits precipitation by `fddrt`: half falls through the downdraft, half
+through the **environment**, where it evaporates directly into the layer
+(`dsm_evp`, `dqm_evp`, applied at `MSTCNV.F90:4743`). This module's docstring
+listed it as deliberately out of scope. Dumping it shows it is not optional:
+
+| level | ModelE `dth_mc` | environmental-evaporation contribution |
+|---|---|---|
+| 0 | −1.627 | **−1.133** |
+| 1 | −1.296 | **−0.920** |
+| 2 | −1.313 | **−0.687** |
+| 3 | −0.566 | **−0.447** |
+| 4 | +6.132 | −0.188 |
+| ≥6 | — | 0.000 |
+
+It accounts for **70-90% of exactly the sub-cloud cooling we are missing**, and
+is identically zero above level 5.
+
+### What it does not explain
+
+The levels 7-9 sign error and the 42% heating excess aloft are untouched by it.
+Those remain open, and are now the only unexplained discrepancies. Since every
+plume output matches to 0.1% and the environmental evaporation is confined
+below level 5, the remaining error is in the **tendency operator's treatment of
+the mid-cloud layer** — most likely the balance between the interface flux and
+the detrainment deposition, which §9d already identified from the sign pattern.
+
+### To port it
+
+```
+if prcp_e > 0 and menv > 0:
+    smenv, qmenv = sm(l)/ma*menv, qm(l)/ma*menv
+    dqevp = get_dq_evap(smenv, qmenv, plk, menv, lhx, pres, evap_max=prcp_e)
+    dqm_evp(l) = dqevp
+    dsm_evp(l) = -(slh*dqevp + heat1(l))/plk
+```
+
+Everything is available except **`menv`** — the environmental air mass taking
+part — which, like `fddet` and `etal` before it, is used at `MSTCNV.F90:4603`
+but never assigned in the file. It needs one more dump round. `heat1` is the
+phase-change correction from `MSTCNV.F90:4226`, zero for all-liquid BOMEX.
