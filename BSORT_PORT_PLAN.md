@@ -1136,3 +1136,63 @@ Everything is available except **`menv`** — the environmental air mass taking
 part — which, like `fddet` and `etal` before it, is used at `MSTCNV.F90:4603`
 but never assigned in the file. It needs one more dump round. `heat1` is the
 phase-change correction from `MSTCNV.F90:4226`, zero for all-liquid BOMEX.
+
+## 13. Correction: `fddet` and `menv` are both properly defined
+
+**Retracting a claim made twice in this document and once in a commit message.**
+§7b and §9f state that `fddet` "has no assignment left in `MSTCNV.F90`" and that
+its value had to be recovered by measurement. That is wrong.
+
+`grep` is case-sensitive; **Fortran is not.** Searching for the lowercase spelling
+used at the call sites missed the uppercase declarations:
+
+* `FDDET = 0.25d0` is a **`real*8, parameter` at `MSTCNV.F90:42`**, with a
+  docstring comment. The measured 0.25 was correct, but it was never a mystery —
+  only a badly-searched constant.
+* `MENV = FEVAP(L)*MA(L)` at `MSTCNV.F90:4587`, likewise properly assigned, with
+  `!@var MENV air mass available for re-evaporation of precip into the
+  environment` two lines above its declaration.
+
+Before finding this I had checked that `menv` was deterministic across two runs
+(it is, bit-identical) and was preparing to report an uninitialized-variable bug
+in ModelE. That would have been wrong, and embarrassing to have raised.
+
+**Standing rule for this port: search Fortran case-insensitively (`grep -i`).**
+The codebase declares in upper case and calls in lower case, so a case-sensitive
+search reliably finds the uses and hides the definitions — the exact pattern
+that produces false "this is never defined" conclusions.
+
+### The environmental evaporation chain, fully specified
+
+With `geometric_fevap = .true.` (the default):
+
+```
+prwtsum = 1e-30;  prwtmcsum = 0;  fevap_extra = 0
+for l = lmax down to 1:
+    if l >= lcl:
+        mcfc        = 0.5*(mcfrac(l-1) + mcfrac(l))
+        fevap_extra = mcfc*(1 - mcfc)*geometric_fevapfac
+        prwtsum    += condpr(l)
+        prwtmcsum  += condpr(l)*mcfc
+    else:
+        mcfc = 0
+    fevap(l) = min(1, max(0, prwtmcsum/prwtsum - mcfc) + fevap_extra)
+
+menv(l) = fevap(l)*ma(l)
+```
+
+then, where `prcp_e > 0` and `menv > 0`:
+
+```
+dqm_evp(l) = get_dq_evap(sm(l)/ma*menv, qm(l)/ma*menv, plk, menv, pres,
+                         evap_max = prcp_e)
+dsm_evp(l) = -(slh*dqm_evp(l) + heat1(l))/plk
+```
+
+`geometric_fevapfac = 0` in the active preset (`MSTCNV.F90:290`), so
+`fevap_extra` vanishes and `fevap` reduces to the precipitation-weighted
+convective-fraction excess. `heat1` is zero for all-liquid BOMEX (verified in
+the dump). `condpr` and `mcfrac` are both available: the first from
+`giss_microphysics`, the second dumped.
+
+Nothing here is unknown any more — this is ready to port.
