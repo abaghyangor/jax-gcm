@@ -500,3 +500,57 @@ So the honest position is:
 
 Porting `CONVECTIVE_MICROPHYSICS` has therefore moved from "arguably out of
 scope" to the critical path for any quantitative convective-moisture result.
+
+## 8. Next: `CONVECTIVE_MICROPHYSICS` — scoping
+
+Now on the critical path (see §7b). Scoped, not started. **This corrects the
+earlier estimate in two directions.**
+
+### Easier than assumed
+
+`CDNC` is **not** an aerosol computation. It is
+`cdnc_ocean_mc*(1-pearth) + cdnc_land_mc*pearth` (`MSTCNV.F90:1269`) — a
+land/ocean blend, so a constant `60` over BOMEX's ocean. The worry that this
+routine reaches outside `MSTCNV` for aerosol input was wrong.
+
+### But two more live/dead branch traps, of exactly the kind that cost this port before
+
+Both flags default to `.true.`, so the obvious-looking code is **dead**:
+
+| flag | default | consequence |
+|---|---|---|
+| `use_s08_fallspeed_mstcnv` | `.true.` | the 15-iteration Newton solve for `DCW` is **not** used; an analytic log form is |
+| `use_gammadsd_mstcnv` | `.true.` | `PRECIP_MP` (Marshall-Palmer) is **not** called; `PRECIPLIQ_GAMMA` is |
+
+And `PRECIPLIQ_GAMMA` is defined twice, resolved by `#define FAST_MICROPHYSICS`
+at the top of the file: the copy at 6963 compiles as `PRECIPLIQ_GAMMA_orig` and
+is dead; the **active** one is at **7863-8114**, ~250 lines.
+
+So the routine to port is `PRECIPLIQ_GAMMA` (7863-8114) plus:
+
+* `DCW` — the drop diameter whose terminal fall speed matches the updraft, from
+  the analytic form
+  `DCW = max(0, log(((w*(p/1e5)^0.4) - 9.65)/(-9.8))/(-600))`, saturating when
+  `w*(p/1e5)^0.4 >= 9.65`;
+* `CDNC` (constant here) and `cloudrvl_mstcnv = 10` µm;
+* the mixed-phase and pure-ice branches, **inert for BOMEX** but needed for
+  other cases.
+
+### Physical picture
+
+An assumed gamma drop-size distribution with number `CDNC` and mean volume
+radius `cloudrvl_mstcnv`; drops larger than `DCW` fall out of the updraft and
+become `CONDP`. So precipitation is set by the competition between updraft speed
+and drop fall speed — which is why the calibrated stand-in's dependence on
+condensate loading alone was only ever an approximation, and why it is
+`w`-dependent in reality.
+
+### Method
+
+Same as every prior phase: dump `CONDP` with its inputs (`CONDMU`, `WCU`, `TP`,
+`PL`, `CDNC`, `DCW`) from inside `CONVECTIVE_MICROPHYSICS`, rerun, then port
+against it. Do **not** trust the constants block — the active preset is lines
+~265-295, and every value used so far (`bsort_enteff2 = 0.67`,
+`cloudrvl_mstcnv = 10`, `cdnc_ocean_mc = 60`, `dd_evpeff_qp_scale = 0.001`,
+`dd_detbyent = 0`, `max_dt_overshoot = 1`, `mc_fddrt = 0.5`) came from it, but
+`fddet` showed that some are not in the source at all.
