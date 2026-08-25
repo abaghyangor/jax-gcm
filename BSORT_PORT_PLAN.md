@@ -1284,3 +1284,38 @@ entirely from precipitation-weighted `mcfrac`.
 Both are now small enough that `mcfrac` — currently a hand-set constant in the
 harness — is the most likely single remaining cause. It is dumped, so this is a
 harness fix rather than a physics one.
+
+## 16. The `mcfrac` hypothesis is wrong
+
+§15 predicted that replacing the harness's constant `mcfrac = 0.02` with the
+dumped profile would deepen the sub-cloud cooling toward ModelE's. It does the
+opposite:
+
+| | dth corr | dth peak | dq corr |
+|---|---|---|---|
+| `mcfrac = 0.02` | **+0.977** | **1.15** | **+0.980** |
+| `mcfrac` from the oracle | +0.972 | 1.18 | +0.978 |
+
+Sub-cloud cooling at levels 0-2 goes from −0.43/−0.57/−0.44 to
+−0.31/−0.21/−0.03 — weaker, not stronger.
+
+The mechanism is clear in hindsight. Below cloud base `mcfc = 0`, so `fevap`
+reduces to the precipitation-weighted mean convective fraction. A constant 0.02
+makes that mean exactly 0.02; the real profile averages closer to 0.01, so it
+evaporates *less*. ModelE's own `fevap` is 0.016, between the two.
+
+So the constant is not the cause, and it is closer to right than the real
+profile by accident. The remaining gap must be in how the weighted mean is
+accumulated — most likely that our `condpr` weighting differs from ModelE's, or
+that the `l >= lcl` gate should use the lifting condensation level rather than
+the plume's cloud base, which the harness currently conflates.
+
+**Best standing configuration** (constant `mcfrac`, everything else real):
+
+| | correlation | peak ratio |
+|---|---|---|
+| `dth_mc` | **+0.977** | **1.15** |
+| `dq_mc` | **+0.980** | **0.95** |
+
+That is the number to quote, with the caveat that one harness input is a
+constant that happens to be favourable rather than a derived profile.
