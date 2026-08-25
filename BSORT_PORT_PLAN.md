@@ -1239,3 +1239,48 @@ plumbing; the physics is in place and the constants are all resolved
 (`geometric_fevapfac = 0`, `heat1 = 0` for all-liquid).
 
 Suite: 307 passed, 3 skipped.
+
+## 15. Wired — heating correlation 0.977, peak ratio 1.15
+
+Feeding `condpr` from `giss_microphysics` and adding the returned environment
+tendencies:
+
+| | dth corr | dth peak | dq corr | dq peak |
+|---|---|---|---|---|
+| §11 standing | +0.946 | 1.42 | +0.945 | 0.96 |
+| correct `wmdnl` stream only | +0.968 | 1.19 | **+0.980** | 0.96 |
+| **+ environmental evaporation** | **+0.977** | **1.15** | **+0.980** | **0.95** |
+
+Two separate gains. Most of it came from feeding the descent the *right*
+precipitation stream — `downdraft_condensate` (`wmdnl`) rather than the total
+precipitation — which alone took heating from 1.42 to 1.19 and moisture
+correlation from 0.945 to 0.980. The environmental evaporation added the rest.
+
+### The sub-cloud prediction was right in sign, short in magnitude
+
+Predicted: levels 0-3 move from ~0 to roughly ModelE's −1.3 to −1.6 K/day.
+
+| level | ModelE | before | after |
+|---|---|---|---|
+| 0 | −1.627 | −0.061 | **−0.427** |
+| 1 | −1.296 | −0.001 | **−0.572** |
+| 2 | −1.313 | +0.118 | **−0.437** |
+| 3 | −0.566 | +0.815 | +0.363 |
+
+The sign is now right where it was wrong or absent, but the magnitude is about a
+third of ModelE's. So environmental evaporation is *a* cause of the sub-cloud
+cooling, not the whole of it — the earlier estimate that it accounted for 70-90%
+was based on ModelE's own dumped term, and our reproduction of that term is
+evidently weaker than ModelE's. The likely reason is `mcfrac`: the harness
+passes a constant 0.02 where ModelE computes a profile, and `fevap` is built
+entirely from precipitation-weighted `mcfrac`.
+
+### Still open
+
+* Levels 7-9 remain the wrong sign in moisture (ours −0.0005 to −0.0012 against
+  ModelE +0.0005 to +0.0021), though roughly four times smaller than before.
+* Heating remains 15% strong.
+
+Both are now small enough that `mcfrac` — currently a hand-set constant in the
+harness — is the most likely single remaining cause. It is dumped, so this is a
+harness fix rather than a physics one.
