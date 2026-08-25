@@ -1421,3 +1421,63 @@ What remains untested is the downdraft source **in the harness configuration**,
 where `ddr` is 8.70 against ModelE's 9.86 — 12% low. Given §7b established this
 system is a runaway, 12% at the formation level is not obviously too small to
 explain a collapse. That is the next thing to measure.
+
+## 19. Root cause: five branch flips, amplified by the runaway
+
+Measured in the harness configuration, every plume output now matches:
+
+| | median | 90th |
+|---|---|---|
+| plume mass | 0.077% | 0.41% |
+| plume detrained | 0.067% | 0.38% |
+| downdraft source mass / heat / water | 0.109% | 1.63% |
+
+The 12% figure in §18 was from before the `plk`/`pres` fix and no longer holds.
+
+### The actual failure
+
+Over 268 levels where either model routes blends to the downdraft:
+
+| | count |
+|---|---|
+| both fire | **263** |
+| ModelE only (we miss) | **5** |
+| ours only | 3 |
+| total downdraft mass, ours / ModelE | **0.994** |
+
+In aggregate the downdraft source is right to 0.6%. But the misses are not
+distributed harmlessly. For step 1's first plume, level 13 is one of the five:
+ModelE routes 6.05 kg/m² to the downdraft there and we route none. That is 38%
+of that column's downdraft, and it is at a *formation* level.
+
+Because the downdraft is a runaway (§7b, §9f), starting with 9.86 instead of
+15.9 is not a 38% error in the result — the smaller draught cools less, tests
+buoyant, sheds 75% of itself, and is gone within two levels. ModelE's grows to
+19.1. **A 2% error in the branch decision produces a total loss of the
+sub-cloud detrainment.**
+
+### This is the §6 caveat coming true
+
+The port's differentiability note recorded that the three-way sort is a hard
+threshold and that "agreement is not *structurally* guaranteed for blends
+sitting within ~4e-7 of a threshold" — noted then as a theoretical limitation.
+It is now the leading-order error in the tendency comparison.
+
+The standalone check found 1572/1572 fates correct *when fed the oracle's blend
+properties*. In the harness the plume self-propagates, so small differences
+accumulate until a marginal blend lands on the other side of the threshold.
+
+### What this does and does not mean
+
+* It is **not** a porting error. Every formula matches; the sort reproduces
+  ModelE exactly given identical inputs.
+* It is a genuine **conditioning** property of the scheme: buoyancy sorting with
+  three discrete outcomes and a runaway downstream amplifies small state
+  differences into large tendency differences.
+* It bounds what level-by-level agreement can be expected from *any* independent
+  implementation, including a Fortran one compiled differently.
+
+The remaining sub-cloud gap should therefore be quoted as a sensitivity of the
+scheme, not as an outstanding bug — while noting that a smoother sort (§6's
+sigmoid option, currently off) would remove the amplification at the cost of
+departing from ModelE.
