@@ -876,3 +876,43 @@ Two candidates, in order:
 
 Next step is (1): drive the comparison from `single_column_harness`'s
 pre-convection state instead of raw SUBDD fields.
+
+### 9e. Pre-convection state applied — large gain, and the sign error localises
+
+The SUBDD `th`/`q` are the post-convection state. Recovering the pre-convection
+profile (subtract one step of `dth_mc`/`dq_mc`, as
+`single_column_harness.run_column` already does) gives:
+
+| | dth corr | dth peak | dq corr | dq peak |
+|---|---|---|---|---|
+| post-convection | +0.893 | 1.62 | +0.836 | 0.70 |
+| **pre-convection** | **+0.925** | 1.58 | **+0.938** | **0.96** |
+
+Moisture is now essentially right in magnitude (0.96) and well correlated. This
+confirms §9d's diagnosis: the contrast driving both terms was being taken
+against the wrong profile.
+
+**Lesson worth keeping:** this correction already existed in the harness and was
+bypassed by building a fresh path from raw SUBDD fields. The bug was not new — it
+was re-imported.
+
+### The remaining sign error, and a concrete suspect
+
+Levels 7-9 still have ModelE moistening (+0.0005 to +0.002) where we dry
+(−0.0015 to −0.005). For plume 1, cloud base is level 9 (0-based), and the
+source draw covers levels 0-6. So levels 7-8 sit in a gap: no source removal, no
+detrainment, only subsidence — hence drying.
+
+**Suspect: the boundary-layer top fed to the downdraft is wrong.** The harness
+sets it to the last non-zero source level (6), but ModelE uses
+`max(lcl-1, dcl)` — with `lcl` the cloud base, `lcl-1` is level 8 (0-based).
+The downdraft's forced detrainment should therefore reach levels 7-8, which is
+exactly the gap where the sign is wrong.
+
+That would also explain why wiring the descending downdraft looked ineffective
+in §9c and §9d: it was being told to dump its air two levels too low, below the
+layer that needed it.
+
+Next: set `boundary_layer_top = cloud_base - 1` (falling back to `dcl` where
+that is higher) and re-test. This is a one-line change with a sharp prediction —
+the levels 7-8 sign should flip.
