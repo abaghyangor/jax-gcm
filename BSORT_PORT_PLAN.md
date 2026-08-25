@@ -603,3 +603,31 @@ Two consequences:
 **Portability of the gamma integration:** `jax.scipy.special.gammainc` is
 differentiable in both arguments, and `mu_rain = 2.5` is a constant, so only the
 `x` argument varies. No obstacle.
+
+### 8b. The intermediate stand-in does not pay off — skip to the gamma integration
+
+Tested, and **rejected**. Replacing the Weibull with the exact cloud/rain
+threshold plus a fitted rain-mode fraction makes the answer *worse*, not better:
+
+| model | RMS error in precipitated fraction |
+|---|---|
+| current Weibull in `qc` (wrong mechanism) | **0.0277** |
+| exact threshold + constant rain fraction (0.815) | 0.0417 |
+| exact threshold + content-dependent rain fraction | 0.0358 |
+
+The threshold itself is exact — it predicts precipitation-or-not on 630/630
+records. What cannot be faked is the *rain-mode fraction*, which varies from
+0.02 to 1.03 across the dataset. A constant throws that variation away, and a
+one-parameter saturating fit in `lwc_rain` recovers only part of it, because the
+true fraction is a gamma integral above a drop diameter that depends on the
+updraft speed.
+
+So the empirical Weibull, despite having demonstrably the wrong mechanism,
+happens to fit this data better than a physically-motivated but incomplete
+replacement. That is a useful reminder that "more physical" and "more accurate"
+are not the same thing when the physics is only half-installed — and a reason
+not to ship the intermediate step just because its derivation is nicer.
+
+**Decision: leave `precipitation_fraction` alone and port the gamma integration
+outright.** The threshold work is not wasted — it is the first half of that
+port, already verified.
