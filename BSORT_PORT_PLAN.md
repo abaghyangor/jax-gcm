@@ -797,3 +797,39 @@ structural check — layer masses against layer masses — exposed it.
 
 Next: redo §9a with the shift applied, then re-test the descending downdraft
 against the sub-cloud sign error.
+
+### 9c. Heating comparison, corrected for the off-by-one
+
+Redone with `l → l-1` applied to every SUBDD-indexed quantity. Plumes now
+genuinely ascend — mean 10.2 active levels, against 1 before.
+
+| | correlation | peak ratio |
+|---|---|---|
+| §9a (invalid, plumes not ascending) | +0.82 | 1.08 |
+| corrected, downdraft folded in place | **+0.893** | **1.62** |
+| corrected, downdraft descending | **+0.896** | **1.58** |
+
+Correlation is genuinely better than the invalid number. The peak ratio is
+worse, and that is the honest direction: with the plume actually rising it
+deposits far more heat, and we now overshoot ModelE by ~60%.
+
+**The descending downdraft is not the fix for the sub-cloud layer.** It moves
+the correlation by 0.003 and the peak by 0.04. Levels 0-3 still show roughly
+zero or the wrong sign where ModelE cools by 1.3-1.6 K/day. The hypothesis in
+§9a — that misplaced downdraft air explained the sub-cloud error — is therefore
+**not supported** once the plume is actually ascending.
+
+Two candidates remain for the sub-cloud discrepancy, in order of suspicion:
+
+1. **The downdraft is not cold enough.** Its cooling comes from evaporating
+   precipitation, and the precipitation supply is the fitted stand-in, which
+   §8b showed has the wrong mechanism. A downdraft that arrives too warm
+   deposits without cooling — consistent with what is seen.
+2. **The 60% overshoot aloft** may itself be the sub-cloud story: too much mass
+   detraining high means too little returning low.
+
+Both point back at the microphysics rather than at the downdraft, which
+reverses the priority set in §7b. The next diagnostic should be the *moisture*
+tendency `dq_mc`, not more heating work: it isolates the precipitation term far
+more directly than heating does, since the heating is dominated by subsidence
+while the moistening is dominated by what the plume actually sheds.
