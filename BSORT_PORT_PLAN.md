@@ -759,3 +759,41 @@ descent exists to fix.
 
 `figures/heating_preliminary.png` is committed and labelled preliminary. It
 should **not** be shown externally in this state.
+
+### 9b. Off-by-one between ModelE level indices and SUBDD arrays — invalidates §9a
+
+**The +0.82 correlation in §9a is not trustworthy and must be recomputed.**
+
+ModelE's level index `l` is **1-based**; the SUBDD arrays are 0-based. The
+harness used the dumped `l` directly to index `th`, `q`, `p_3d` and the derived
+layer mass, so every environmental quantity was shifted one level relative to
+the plume. It shows up cleanly in the layer mass: the derived `MA[L]` equals the
+true `ma[L+1]`.
+
+Consequence, on step 1's first plume:
+
+| | active levels | downdraft | detrained |
+|---|---|---|---|
+| no shift (as in §9a) | **1** | 0.000 | 51.78 |
+| `l → l-1` | **7** | 9.84 | 124.79 |
+| ModelE (step 1, *two* plumes) | 14 records | 18.19 | 171.87 |
+
+Unshifted, the plume dies immediately and dumps its entire mass at cloud base.
+That still produces heating in roughly the right *place*, which is why the
+correlation looked reasonable — the §9a number was obtained from plumes that
+were not actually ascending.
+
+With the shift the numbers line up: ModelE's 14 records for that step are two
+plumes of seven levels each, and our single plume gives seven active levels with
+about half the total downdraft mass. That consistency is the real check.
+
+This also explains why wiring the descending downdraft changed nothing: the
+plume was producing **no downdraft mass at all** to descend.
+
+**Standing lesson for this port, now the second instance** (after the `dcl`
+off-by-one): a diagnostic that looks plausible is not evidence. The correlation
+improved for a reason unrelated to the physics being right, and only a
+structural check — layer masses against layer masses — exposed it.
+
+Next: redo §9a with the shift applied, then re-test the descending downdraft
+against the sub-cloud sign error.
