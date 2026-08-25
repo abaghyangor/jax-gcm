@@ -1018,3 +1018,59 @@ itself keeps it too warm. Candidates, untested:
   checking whether the split is being applied to the right quantity.
 
 The last of these is the most concrete and is where to look next.
+
+## 11. The port now has no fitted parameters
+
+Wiring `giss_microphysics` into the plume's own condensate budget removed the
+last calibrated term. `precipitation_fraction` is deleted; every value in the
+scheme is now derived from ModelE rather than fitted to it.
+
+### One missing piece cost 3 orders of magnitude, and the oracle caught it
+
+The first wiring attempt regressed the plume from 0.06% to **53.6%** median mass
+error, because ModelE scales `CONDP` down by `min(1, ma/cond_repart_dmscale)` —
+only part of the partition is realised over the distance the plume ascends in
+one layer. Confirming it took one arithmetic check: a dumped factor of 0.2035
+times the reference mass 509.86 gives 103.76, exactly the dumped layer mass.
+
+With the rescale, the real microphysics **beats** the stand-in it replaced:
+
+| | fitted stand-in | real microphysics |
+|---|---|---|
+| active levels | 534/536 | **535/536** |
+| plume mass | 0.06% | 0.072% |
+| updraft `w` | 0.14% | **0.093%** |
+| detrained mass | 0.12% | **0.017%** |
+
+### The downdraft port is validated after all
+
+Driven with the oracle's own inputs rather than our plume's, the descent
+reproduces ModelE essentially exactly — mass 9.859/16.546/17.101/17.574/17.986/
+18.361/18.714/19.062 against the oracle's identical values, and detrainment
+9.531/4.941/2.561 exact. **The port was never wrong**; it was being fed a
+downdraft source that our plume generated differently under a reconstructed
+environment. §7b's "cannot be validated" and §9c's "not the fix" were both
+consequences of the harness, not the physics.
+
+### Tendency standing
+
+| | correlation | peak ratio |
+|---|---|---|
+| `dth_mc` | **+0.946** | 1.42 |
+| `dq_mc` | **+0.945** | **0.96** |
+
+### What is still wrong
+
+Unchanged by the microphysics, which is itself informative — these are not
+precipitation problems:
+
+* **Levels 0-3**: ModelE cools 1.3-1.6 K/day, we produce ~0.
+* **Levels 7-9**: ModelE moistens, we dry.
+* **Heating 42% too strong** while moisture is right to 4%.
+
+Heating too strong with moisture correct points away from the mass flux (which
+would move both) and toward the *heat* carried by detrained air — i.e. the
+plume's temperature, not its mass. The plume's own `w` and detrainment now match
+to 0.1%, so the next place to look is the heat content of what it deposits,
+and specifically whether the latent heat released on re-saturation is being
+double-counted against what ModelE already accounts for in `CDHEAT`.

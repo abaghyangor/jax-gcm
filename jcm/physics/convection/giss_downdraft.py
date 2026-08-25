@@ -33,8 +33,9 @@ Deliberately outside this module:
   evaporation is a separate term.
 * **Tracers**, which the ``PhysicsTerm`` interface does not carry.
 
-The precipitation supply itself comes from ModelE's convective microphysics,
-which is not ported; see ``giss_bsort.precipitation_fraction``.
+The precipitation supply comes from
+:mod:`jcm.physics.convection.giss_microphysics`, a direct port of ModelE's
+``PRECIPLIQ_GAMMA``.
 
 Broadcasting-native: vertical on axis 0, and the scan runs downward.
 """
@@ -44,9 +45,8 @@ from typing import NamedTuple
 import jax.numpy as jnp
 from jax import lax
 
-from jcm.physics.convection.giss_bsort import _safe_divide
 from jcm.physics.convection.giss_thermodynamics import (
-    DELTX, LHE, LHS, SHA, condensate_evaporation)
+    DELTX, LHE, LHS, SHA, condensate_evaporation, safe_divide)
 
 # Share of the precipitation flux that falls through the downdraft rather than
 # the surrounding environment (`mc_fddrt`).
@@ -162,7 +162,7 @@ def downdraft_descent(source_mass: jnp.ndarray,
         depth_from_top = depth_from_top + ma * _KG_TO_MB
         precip_area = jnp.maximum(area_min, mcfrac)
         precip_mixing_ratio = jnp.minimum(
-            _safe_divide(total_precip,
+            safe_divide(total_precip,
                          precip_area * jnp.minimum(depth_from_top,
                                                    _PRECIP_DEPTH_MAX)),
             _PRECIP_MIXING_RATIO_MAX)
@@ -191,8 +191,8 @@ def downdraft_descent(source_mass: jnp.ndarray,
         water = water + evaporated
         precip_down = precip_down - evaporated
 
-        theta = _safe_divide(heat, mass)
-        humidity = _safe_divide(water, mass)
+        theta = safe_divide(heat, mass)
+        humidity = safe_divide(water, mass)
 
         # Buoyancy against the environment, both loaded by their condensate.
         downdraft_virtual = theta * plk * (1.0 + DELTX * humidity
@@ -216,12 +216,12 @@ def downdraft_descent(source_mass: jnp.ndarray,
         entrained = jnp.where(can_exchange, mass * entrainment, 0.0)
         # ModelE's "implicit" form, then a ceiling on how much of the layer may
         # be drawn in.
-        entrained = _safe_divide(entrained, 1.0 + _safe_divide(entrained, ma))
+        entrained = safe_divide(entrained, 1.0 + safe_divide(entrained, ma))
         entrained = jnp.minimum(entrained, _REMRAT * ma)
         detrained = jnp.where(can_exchange,
                               mass * jnp.minimum(1.0, detrained_fraction), 0.0)
 
-        detrained_fraction_actual = _safe_divide(detrained, mass)
+        detrained_fraction_actual = safe_divide(detrained, mass)
         detrained_heat = heat * detrained_fraction_actual
         detrained_water = water * detrained_fraction_actual
 

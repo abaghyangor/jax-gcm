@@ -326,3 +326,20 @@ def condensation(dry_static_energy: jnp.ndarray,
         dry_static_energy, water_mass, exner, mass, pressure, phase)
     dqsum = jnp.clip(dqsum, 0.0, water_mass)
     return dqsum, _safe_ratio(dqsum, water_mass)
+
+
+def safe_divide(numerator, denominator, fallback=0.0):
+    """Divide only where the denominator is strictly positive.
+
+    The usual ``x / maximum(d, tiny)`` guard is finite in *value* but carries a
+    derivative of order ``1/tiny``, which overflows to NaN under ``grad`` and
+    then survives every downstream mask. Selecting the branch on both sides
+    keeps the degenerate case out of the gradient entirely.
+
+    Degenerate denominators are routine in the convection scheme rather than
+    exceptional: a terminated plume, an inactive column, an empty blend and a
+    condensate-free parcel all reach these expressions with zero.
+    """
+    usable = denominator > 0.0
+    return jnp.where(usable, numerator / jnp.where(usable, denominator, 1.0),
+                     fallback)
