@@ -1196,3 +1196,46 @@ the dump). `condpr` and `mcfrac` are both available: the first from
 `giss_microphysics`, the second dumped.
 
 Nothing here is unknown any more — this is ready to port.
+
+## 14. Environmental evaporation implemented — and a stream I had conflated
+
+`downdraft_descent` now computes `dsm_evp`/`dqm_evp` inside the descent scan,
+where ModelE computes them (`MSTCNV.F90:4587-4643`), returning them as
+`environment_heat` / `environment_water`.
+
+### Two precipitation streams, not one
+
+The first attempt produced identically zero, which exposed a distinction I had
+collapsed. ModelE carries **two separate precipitation quantities**:
+
+* **`wmdnl`** — condensate the sorted blends carry *into the downdraft*. This,
+  and only this, feeds the descending flux: `prcp_d` starts at zero
+  (`MSTCNV.F90:4277`) and the loop adds nothing else to it.
+* **`condpr`** — precipitation *produced by the plume*, from the microphysics.
+  It never enters the downdraft flux at all. Its only roles are weighting how
+  much rain evaporates into the clear air, and the phase-change term `heat1`.
+
+Passing the flux where the produced precipitation belonged made the weighting
+degenerate: with a single stream, the precipitation-weighted mean convective
+fraction equals the local one, their difference is zero, and no air participates.
+They are now separate arguments.
+
+### Why the term is a sub-cloud effect
+
+`fevap(l) = max(0, prwtmcsum/prwtsum - mcfc)`. Above cloud base `mcfc` is the
+local convective fraction and largely cancels the weighted mean, so little
+evaporates. **Below cloud base `mcfc` is zero**, so `fevap` becomes the full
+precipitation-weighted mean convective fraction and the term switches on.
+
+Checked against the oracle: the weighted mean is 0.016, and
+`menv = 0.016 x 103.76 = 1.66` — exactly the dumped `menv`. That is why the
+missing cooling was confined to levels 0-3.
+
+### Remaining to close the loop
+
+Feed `condpr` from `giss_microphysics` into `produced_precipitation`, and add
+the returned `environment_heat`/`environment_water` to the tendency. Both are
+plumbing; the physics is in place and the constants are all resolved
+(`geometric_fevapfac = 0`, `heat1 = 0` for all-liquid).
+
+Suite: 307 passed, 3 skipped.
