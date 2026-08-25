@@ -717,3 +717,45 @@ uniform column has a mass source, not physics.
 
 Items 1 and 2 are wiring, not physics, and are what stand between here and a
 publishable heating comparison.
+
+### 9a. Items 1 and 2 done — heating comparison now tracks, but is not finished
+
+Both wiring items are in place:
+
+* **Step markers.** A saved counter incremented at `MSTCNV` entry is written
+  into the mass-budget and source dumps. It resolves to **48 distinct steps**,
+  exactly the number of SUBDD periods, with 9-18 level-records each — so several
+  steps do fire more than one plume, and their tendencies are now summed before
+  comparison.
+* **Full environmental profile** read from the SUBDD output (`th`, `q`, `p_3d`)
+  at every level, instead of the plume dump which only covers levels the plume
+  reaches. `p_3d` is in **mb**; `senv = th/1000^kappa`.
+
+Effect on the comparison against `dth_mc`:
+
+| | before | after |
+|---|---|---|
+| mean-profile correlation | +0.29 | **+0.82** |
+| peak ratio | 1.34 | **1.08** |
+
+Per-period correlation is median +0.76, 10th percentile +0.47.
+
+### What is still wrong, and where to look
+
+The main heating layer (levels 4-8) now matches closely — within ~10% at the
+peak. Two regions do not:
+
+* **Levels 0-3 (sub-cloud).** ModelE cools by 1.3-1.6 K/day; we give roughly
+  zero, and at level 3 we produce +2.9 where ModelE has −0.6. Wrong sign, so
+  this is structural rather than a magnitude error. The prime suspect is the
+  downdraft, which ModelE lands in exactly this layer after it descends, and
+  which we currently deposit where it formed.
+* **Levels 9-15.** ModelE keeps heating 1.2-3.9 K/day where ours decays to zero,
+  so our detrainment is not reaching high enough.
+
+Both are consistent with the two known placeholders, and the sub-cloud sign
+error in particular is what the (already written, still unvalidated) downdraft
+descent exists to fix.
+
+`figures/heating_preliminary.png` is committed and labelled preliminary. It
+should **not** be shown externally in this state.
