@@ -43,7 +43,7 @@ from typing import NamedTuple
 import jax.numpy as jnp
 from jax.scipy.special import gammainc
 
-from jcm.physics.convection.giss_bsort import _safe_divide
+from jcm.physics.convection.giss_thermodynamics import safe_divide
 
 # Water density and the volume factor of a sphere, as ModelE uses them.
 _RHO_WATER = 1000.0
@@ -67,6 +67,28 @@ _RAIN_THRESHOLD = 1.0e-4
 _LAM_RAIN_FACTOR = ((_MU_RAIN + 1.0) * (_MU_RAIN + 2.0)
                     * (_MU_RAIN + 3.0)) ** (1.0 / 3.0)
 _RGAS = 287.05
+
+# Only part of a layer's precipitation forms within the distance the plume
+# actually ascends in one step, so ModelE scales `CONDP` down by the layer's
+# mass against a reference depth (`cond_repart_dpscale = 50 mb`). Verified
+# against the oracle: a dumped factor of 0.2035 corresponds exactly to the
+# dumped layer mass of 103.76 kg/m^2.
+_ASCENT_REFERENCE_MASS = 50.0 * 100.0 / 9.80665      # `cond_repart_dmscale`
+
+
+def finite_ascent_fraction(layer_mass: jnp.ndarray) -> jnp.ndarray:
+    """Fraction of the partitioned precipitation realised in one layer.
+
+    ``min(1, ma / cond_repart_dmscale)``. Thin layers give the drops less
+    distance to fall out in, so less of the partition is realised.
+
+    Args:
+        layer_mass: ``ma`` [kg/m^2].
+
+    Returns:
+        Fraction in (0, 1].
+    """
+    return jnp.minimum(1.0, layer_mass / _ASCENT_REFERENCE_MASS)
 
 
 class Precipitation(NamedTuple):
@@ -139,7 +161,7 @@ def precipitate(condensate: jnp.ndarray,
     has_cloud = cloud_water > 0.0
     # The cube root has an infinite derivative at zero, and zero is a normal
     # argument here (a condensate-free parcel), so keep it out of the power.
-    lam_cloud_cubed = _safe_divide(
+    lam_cloud_cubed = safe_divide(
         _RHO_WATER * _PI_6 * droplet_number
         * (mu_cloud + 1.0) * (mu_cloud + 2.0) * (mu_cloud + 3.0),
         cloud_water)
@@ -160,16 +182,16 @@ def precipitate(condensate: jnp.ndarray,
     has_rain = rain_water > 0.0
     threshold = _RAIN_THRESHOLD * air_density
     n0_rain = (0.5 * (_N0_HIGH - _N0_LOW)
-               * jnp.tanh(_safe_divide(threshold - rain_water, 4.0 * threshold))
+               * jnp.tanh(safe_divide(threshold - rain_water, 4.0 * threshold))
                + 0.5 * (_N0_HIGH + _N0_LOW))
     # Likewise the fourth root.
-    number_rain_fourth = _safe_divide(n0_rain ** 3 * rain_water,
+    number_rain_fourth = safe_divide(n0_rain ** 3 * rain_water,
                                       _RHO_WATER * _PI_6)
     number_rain = jnp.where(
         has_rain,
         jnp.where(has_rain, number_rain_fourth, 1.0) ** 0.25, 0.0)
     lam_rain = jnp.where(
-        has_rain, _safe_divide(n0_rain, number_rain) * _LAM_RAIN_FACTOR, 0.0)
+        has_rain, safe_divide(n0_rain, number_rain) * _LAM_RAIN_FACTOR, 0.0)
     retained_rain = jnp.where(
         has_rain,
         rain_water * gammainc(_MU_RAIN + 4.0, lam_rain * diameter),

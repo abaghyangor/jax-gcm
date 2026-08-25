@@ -42,8 +42,10 @@ import jax.numpy as jnp
 from jax import lax
 
 import jcm.constants as c
+from jcm.physics.convection import giss_microphysics as microphysics
 from jcm.physics.convection.giss_thermodynamics import (
-    DELTX, LHE, LHS, SHA, condensate_evaporation, condensation)
+    DELTX, LHE, LHS, RGAS as RGAS_AIR, SHA, condensate_evaporation,
+    condensation, safe_divide)
 
 # Fraction of the buoyancy force that goes into vertical kinetic energy. ModelE
 # applies only a sixth while the parcel is buoyant, but the full force once it
@@ -81,24 +83,6 @@ NMIX = 3
 _UPDRAFT_FRACTION_MAX = 0.99999
 
 _TEENY = 1e-20
-
-
-def _safe_divide(numerator, denominator, fallback=0.0):
-    """Divide only where the denominator is strictly positive.
-
-    The usual ``x / maximum(d, tiny)`` guard is finite in *value* but carries a
-    derivative of order ``1/tiny``, which overflows to NaN under ``grad`` and
-    then survives every downstream mask. Selecting the branch on both the
-    numerator and the denominator keeps the degenerate case out of the gradient
-    entirely.
-
-    Degenerate denominators are routine here rather than exceptional: a
-    terminated plume, an inactive column and an empty blend all reach these
-    expressions with zero mass.
-    """
-    usable = denominator > 0.0
-    return jnp.where(usable, numerator / jnp.where(usable, denominator, 1.0),
-                     fallback)
 
 
 def buoyancy_work_increments(buoyancy: jnp.ndarray,
@@ -257,15 +241,15 @@ def blend_air_masses(plume_mass: jnp.ndarray,
 
     # Blending ratios, drifting toward complete mixing as the plume thins.
     reference_weight = jnp.minimum(
-        1.0, _safe_divide(plume_mass, plume_mass_lag))
-    fupd_full_mixing = _safe_divide(plume_mass,
+        1.0, safe_divide(plume_mass, plume_mass_lag))
+    fupd_full_mixing = safe_divide(plume_mass,
                                     plume_mass + environment_air)
     fupd = (reference_weight * fupd_reference
             + (1.0 - reference_weight) * fupd_full_mixing)
 
     # Updraft air implied by those ratios and the entrained environmental air.
     environment_share = jnp.sum(frac * (1.0 - fupd), axis=0)
-    updraft_air = environment_air * _safe_divide(
+    updraft_air = environment_air * safe_divide(
         1.0 - environment_share, environment_share)
 
     # Never set aside more updraft air than the plume holds; ModelE scales the
@@ -274,13 +258,13 @@ def blend_air_masses(plume_mass: jnp.ndarray,
     updraft_air_max = _UPDRAFT_FRACTION_MAX * plume_mass
     excessive = updraft_air > updraft_air_max
     rescale = jnp.where(excessive,
-                        _safe_divide(updraft_air_max, updraft_air, 1.0), 1.0)
+                        safe_divide(updraft_air_max, updraft_air, 1.0), 1.0)
     environment_air = environment_air * rescale
     updraft_air = jnp.where(excessive, updraft_air_max, updraft_air)
 
     fupd_average = jnp.sum(frac * fupd, axis=0)
-    updraft_factor = _safe_divide(frac * fupd, fupd_average)
-    environment_factor = _safe_divide(frac * (1.0 - fupd), 1.0 - fupd_average)
+    updraft_factor = safe_divide(frac * fupd, fupd_average)
+    environment_factor = safe_divide(frac * (1.0 - fupd), 1.0 - fupd_average)
 
     # Overshooting: one blend of pure updraft air, no environmental air.
     overshoot_updraft_air = plume_mass * jnp.minimum(
@@ -388,7 +372,7 @@ def sort_blends(plume_mass: jnp.ndarray,
 
     # Remove the set-aside air from the plume. What survives is the part that
     # never participates in mixing at this level.
-    removed_fraction = _safe_divide(updraft_air, plume_mass)
+    removed_fraction = safe_divide(updraft_air, plume_mass)
     retained = 1.0 - removed_fraction
     set_aside_heat = plume_heat * removed_fraction
     set_aside_water = plume_water * removed_fraction
@@ -490,7 +474,7 @@ def vertical_velocity(kew: jnp.ndarray,
     energy = 2.0 * jnp.maximum(kew, 0.0) * plume_mass
     moving = energy > 0.0
     momentum = jnp.where(moving, jnp.sqrt(jnp.where(moving, energy, 1.0)), 0.0)
-    return _safe_divide(momentum, plume_mass + environment_air)
+    return safe_divide(momentum, plume_mass + environment_air)
 
 
 def kinetic_energy(vertical_velocity_: jnp.ndarray,
@@ -555,6 +539,8 @@ def plume_ascent(cloud_base: jnp.ndarray,
                  exner: jnp.ndarray,
                  pressure: jnp.ndarray,
                  entrainment_efficiency: jnp.ndarray,
+                 droplet_number: jnp.ndarray = 60.0e6,
+                 droplet_radius: jnp.ndarray = 10.0e-6,
                  iplume: int = 2,
                  phase: str = "water") -> PlumeAscent:
     """Run one buoyancy-sorting plume from cloud base to termination.
@@ -598,6 +584,9 @@ def plume_ascent(cloud_base: jnp.ndarray,
         exner: ``plk``.
         pressure: [**Pa**].
         entrainment_efficiency: ``enteff``.
+        droplet_number: ``CDNC`` [m^-3] for the precipitation partition. ModelE
+            forms this as a land/ocean blend; 60e6 is its ocean value.
+        droplet_radius: Assumed cloud droplet volume radius [m].
         iplume: Plume index (static).
         phase: ``"water"`` or ``"ice"`` (static).
 
@@ -628,8 +617,23 @@ def plume_ascent(cloud_base: jnp.ndarray,
         arrival_mass = jnp.where(mass > 0.0, mass, 1.0)
         risen_heat, risen_water, risen_condensate = resaturate_plume(
             arrival_mass, heat, water, condensate, exner_l, pressure_l, phase)
-        risen_condensate = risen_condensate * (
-            1.0 - precipitation_fraction(risen_condensate, arrival_mass))
+        # Rain out what the microphysics says falls faster than the updraft.
+        # ModelE passes an extrapolation of the *previous* levels' `wcu` here
+        # (`wcupass`), not this level's, because `wcu` is not known until after
+        # the sorting -- so the carried `previous_w` is the right argument.
+        risen_temperature = safe_divide(risen_heat, arrival_mass) * exner_l
+        air_density = pressure_l / (RGAS_AIR * jnp.maximum(risen_temperature,
+                                                           1.0))
+        water_content = safe_divide(risen_condensate,
+                                    arrival_mass) * air_density
+        rained = microphysics.precipitate(
+            water_content, previous_w, pressure_l, risen_temperature,
+            droplet_number, droplet_radius).precipitated
+        # Only the part of the partition realised over this layer's depth.
+        rained = rained * microphysics.finite_ascent_fraction(ma)
+        risen_condensate = risen_condensate - safe_divide(
+            rained * arrival_mass, air_density)
+        risen_condensate = jnp.maximum(risen_condensate, 0.0)
         rose = ~at_base & (mass > 0.0)
 
         mass = jnp.where(at_base, cloud_base_mass, mass)
@@ -781,62 +785,3 @@ def resaturate_plume(plume_mass: jnp.ndarray,
     return (heat + (latent / SHA) * condensed / exner,
             water - condensed,
             condensed)
-
-
-# --- Precipitation: a CALIBRATED STAND-IN, not a port ------------------------
-#
-# ModelE removes precipitation between plume levels in CONVECTIVE_MICROPHYSICS
-# (MSTCNV.F90:6462-6814) -- Marshall-Palmer size distributions, cloud-droplet
-# number concentration, graupel fraction, particle fall speeds -- which also
-# takes aerosol-derived CDNC from outside MSTCNV. That routine is NOT ported.
-#
-# Without *something* here the plume retains condensate ModelE would have rained
-# out and the column carries a moist, heavy bias that grows with height. So this
-# is a deliberate placeholder, fitted to the oracle, so the rest of the scheme
-# can be exercised end to end. It is the one piece of this port that is
-# calibrated rather than derived, and results that depend on it should say so.
-#
-# Shape: the precipitated fraction is almost entirely a function of the in-plume
-# condensate mixing ratio (correlation +0.97 against the oracle over 484 BOMEX
-# transitions), and adding a residence-time factor gzl/w makes the fit *worse*
-# (+0.89). A saturating Weibull in qc alone therefore fits best, and its
-# exponent comes out at ~2.1 -- the quadratic collection dependence Kessler-type
-# autoconversion assumes, which is reassuring for a fit that was not constrained
-# to find it. RMS error 0.029 in the removed fraction, against 0.136 for the
-# best flat fraction.
-_PRECIP_QC_SCALE = 1.8558e-3   # condensate mixing ratio at which ~63% rains out
-_PRECIP_EXPONENT = 2.1125
-
-
-def precipitation_fraction(plume_condensate: jnp.ndarray,
-                           plume_mass: jnp.ndarray,
-                           scale: jnp.ndarray = _PRECIP_QC_SCALE,
-                           exponent: jnp.ndarray = _PRECIP_EXPONENT
-                           ) -> jnp.ndarray:
-    """Fraction of plume condensate removed as precipitation.
-
-    **This is a calibrated stand-in for ModelE's convective microphysics, not a
-    port of it.** See the block comment above for what it replaces and why.
-
-    ``fraction = 1 - exp(-(qc/scale)**exponent)``, with ``qc`` the in-plume
-    condensate mixing ratio. Saturating by construction, so it can never remove
-    more condensate than exists.
-
-    Args:
-        plume_condensate: Extensive condensate ``wmp``.
-        plume_mass: Plume mass ``mplume`` [kg/m^2].
-        scale: Condensate mixing ratio at which ~63% precipitates. Tunable, and
-            a differentiable leaf rather than a hard-coded constant, since it is
-            a fitted parameter and a likely target for later calibration.
-        exponent: Steepness of the onset. Likewise tunable.
-
-    Returns:
-        Fraction in [0, 1]. Reaches exactly 1 only where the exponential
-        underflows, i.e. all the condensate rains out.
-    """
-    qc = _safe_divide(plume_condensate, plume_mass)
-    # `x**exponent` with a non-integer exponent is not differentiable at x = 0,
-    # which is exactly a condensate-free plume, so keep zero out of the power.
-    wet = qc > 0.0
-    scaled = jnp.where(wet, qc / scale, 1.0) ** exponent
-    return jnp.where(wet, -jnp.expm1(-scaled), 0.0)

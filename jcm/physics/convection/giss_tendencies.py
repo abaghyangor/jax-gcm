@@ -29,16 +29,9 @@ from typing import NamedTuple
 
 import jax.numpy as jnp
 
+from jcm.physics.convection.giss_thermodynamics import safe_divide as _safe_ratio
 
-def _safe_ratio(numerator, denominator):
-    """``numerator/denominator`` where positive, else zero -- gradient-safe.
 
-    ``x / maximum(d, tiny)`` is finite in value but has a ~1/tiny derivative,
-    which becomes NaN under ``grad`` on layers the plume never reached.
-    """
-    usable = denominator > 0.0
-    return jnp.where(usable, numerator / jnp.where(usable, denominator, 1.0),
-                     0.0)
 
 
 def subsidence_tendency(interface_flux: jnp.ndarray,
