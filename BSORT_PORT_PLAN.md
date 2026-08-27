@@ -1533,3 +1533,65 @@ needs either
 
 The first is a measurement change and is worth doing before concluding anything
 about the second.
+
+## 21. Precision check: the port is bit-exact; one coupling term is not
+
+Re-ran every dump at full double precision (`es24.16` instead of `es14.6`).
+
+### The branch flips are real
+
+Bit-identical results: the same 263 shared downdraft levels, the same **5**
+ModelE-only and **3** ours-only, the same 0.994 mass ratio, the same 0.0779% /
+0.0689% plume errors to four significant figures. **The flips are genuine
+divergence, not measurement artefact.** The sigmoid question in §20 is therefore
+a real question rather than a workaround for bad instrumentation — though see
+below for why it is still not the next step.
+
+### The formulas are exact, which the old dumps were hiding
+
+Every per-level component, given ModelE's own state at full precision:
+
+| component | old (7 sig figs) | **double precision** |
+|---|---|---|
+| entrainment closure `ent` | 2.39e-06 | **0.0** |
+| detrainment `det` | 4.15e-07 | **0.0** |
+| updraft set-aside | 8.31e-07 | **3.7e-16** |
+| sort: plume out | 8.23e-07 | **2.4e-15** |
+| sort: detrained | 6.19e-07 | **3.8e-16** |
+| sort: downdraft | 7.43e-07 | **4.4e-16** |
+| vertical velocity `wcu` | 6.73e-07 | **0.0** |
+| inter-level re-saturation, heat | ~1e-06 | **3.6e-16** |
+| inter-level re-saturation, vapour | ~1e-06 | **4.0e-15** |
+
+**The port reproduces ModelE to machine precision.** Every "1e-6 agreement"
+reported earlier in this document was the dump's precision, not the port's
+error. That is a materially stronger claim than anything previously recorded
+here, and it should replace the older numbers when this work is described.
+
+### The one term that is not exact
+
+Applying `precipitate` *in situ* — from our own re-saturated condensate rather
+than from ModelE's dumped `CONDMU` — leaves a **2.5% median** error in the
+removed condensate, against 1.9e-06 when fed ModelE's `CONDMU` directly. So the
+routine is right and the **coupling into it** is not.
+
+Two candidate causes tested and rejected:
+
+* `wcupass`, which ModelE extrapolates as `1.5*w(l-1) - 0.5*w(l-2)`
+  (`MSTCNV.F90:1874`) where we pass `w(l-1)`. Using the extrapolation makes it
+  *worse*: 3.19% against 2.46%.
+* the density in `CONDMU = (wmp/mplume)*rho0(l)` (`MSTCNV.F90:1772`), which is
+  the environmental `rho0 = ma/delz` rather than a plume density. Using it:
+  2.68% against 2.46%.
+
+So the conversion into volumetric units is not the discrepancy either. This is
+where to resume.
+
+### Why this matters more than the 2.5% suggests
+
+A 2.5% error in the condensate removed per level feeds the next level's
+buoyancy, and the sort is a hard threshold. Five blends out of 268 land on the
+wrong side, the downdraft collapses, and the deposition moves from levels 4-6 to
+levels 9-13 — the single defect of §20. **Closing the 2.5% would very likely
+close the whole remaining gap**, and it requires no change to the physics, which
+makes it strictly preferable to the sigmoid.
