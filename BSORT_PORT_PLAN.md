@@ -1481,3 +1481,55 @@ The remaining sub-cloud gap should therefore be quoted as a sensitivity of the
 scheme, not as an outstanding bug — while noting that a smoother sort (§6's
 sigmoid option, currently off) would remove the amplification at the cost of
 departing from ModelE.
+
+## 20. Correction: there is one error, not two
+
+§19 closed by saying the mid-level heating excess was "not downdraft-related",
+reasoning that ModelE's downdraft does not detrain at levels 7-11. That was the
+wrong test — the question is not whether *ModelE's* downdraft detrains there,
+but whether *ours* does. It does.
+
+Splitting the detrainment by source, summed over all 48 steps:
+
+| level | plume, ModelE / ours | downdraft, ModelE / ours |
+|---|---|---|
+| 4 | 0.0 / 0.0 | **172.0 / 27.6** |
+| 5 | 0.0 / 0.0 | **234.6 / 33.3** |
+| 6 | 703.8 / 703.8 | 70.3 / 47.6 |
+| 9 | 593.1 / 593.3 | 155.6 / 250.8 |
+| 10 | 245.5 / 253.4 | **19.2 / 143.0** |
+| 11 | 183.8 / 203.3 | 39.9 / 104.8 |
+
+**The plume's detrainment matches at every level.** The downdraft's is displaced
+upward: roughly seven times too little at levels 4-5, seven times too much at
+level 10.
+
+The heat it carries is also right — `dsm/dm`, the specific heat of the detrained
+air, agrees with ModelE to four or five significant figures at every level
+(41.4840 vs 41.4891 at level 6, 41.6256 vs 41.6286 at level 9). So the air is at
+the correct temperature; it is simply deposited in the wrong place.
+
+### One mechanism explains both symptoms
+
+* Missing sub-cloud cooling — the downdraft never arrives.
+* Excess mid-level heating — because it unloaded there instead.
+
+Both follow from the collapse traced in §19: five branch flips at formation
+levels, amplified by the runaway. This is a single defect with two faces, not
+two independent problems, and it means the remaining discrepancy is smaller and
+better understood than the two open items in §19 suggested.
+
+### What would actually close it
+
+Nothing in the port is wrong. Closing the gap requires the sorted blends to
+land on ModelE's side of the buoyancy threshold on those five levels, which
+needs either
+
+* **higher input precision** — the dumps carry ~7 significant figures and the
+  marginal blends sit within ~4e-7 of the threshold, so some of the five flips
+  may be measurement artefact rather than genuine divergence; or
+* **a smoother sort** — the sigmoid option, which removes the amplification but
+  departs from ModelE and should stay off by default.
+
+The first is a measurement change and is worth doing before concluding anything
+about the second.
