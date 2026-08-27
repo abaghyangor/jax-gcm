@@ -1595,3 +1595,51 @@ wrong side, the downdraft collapses, and the deposition moves from levels 4-6 to
 levels 9-13 — the single defect of §20. **Closing the 2.5% would very likely
 close the whole remaining gap**, and it requires no change to the physics, which
 makes it strictly preferable to the sigmoid.
+
+## 22. Chasing the 2.5%: one real fix found, the rest still open
+
+### Found and fixed: the volumetric conversion density
+
+`CONDMU = (wmp/mplume)*rho0(l)` (`MSTCNV.F90:1772`) uses the **layer reference
+density**, not one derived from the plume's own temperature. With
+`rho0 = ma/delz`, our volumetric condensate reproduces the dumped `CONDMU`
+**exactly** — ratio 1.00000 at both the 10th and 90th percentile over 484
+levels. The plume-temperature density is 0.08% off.
+
+`plume_ascent` now uses `ma/delz`. Effect:
+
+| | before | after |
+|---|---|---|
+| plume mass | 0.0779% | **0.0733%** |
+| plume detrained | 0.0689% | **0.0616%** |
+| downdraft branch (both / ModelE-only / ours-only) | 263 / 5 / 3 | **264 / 4 / 2** |
+| downdraft mass ratio | 0.99411 | **1.00189** |
+
+**One of the five branch flips is fixed.** The tendencies barely move
+(`dth` +0.9793/1.163, `dq` +0.9813/0.947) because the corrected column was not
+one of the dominant ones — but the defect count is genuinely down.
+
+### Rejected by direct test
+
+* **`wcupass`.** ModelE extrapolates `1.5*w(l-1) - 0.5*w(l-2)`
+  (`MSTCNV.F90:1874`) where we pass `w(l-1)`. Using the extrapolation is
+  *worse*: 3.19% against 2.46%.
+* **The back-conversion density.** `TLOC` is the caller's `tl(l)`, the
+  environmental temperature, so ModelE converts forward with `rho0` and back
+  with `PL/(R*tl)`. Reproducing that asymmetry changes nothing — the two
+  densities agree closely enough (2.678% either way).
+* **`CDNC`.** It varies 45.7-61.8 cm^-3 against our constant 60. Substituting
+  the dumped values makes the residual *worse* (4.37%), but that test is
+  unreliable: two plumes per step call the microphysics at identical pressures,
+  so matching records by pressure picks arbitrarily between them. **Retest this
+  once the microphysics dump carries a plume index** — it is the most plausible
+  remaining candidate.
+
+### The open thread
+
+`wmp` is **not** assigned after the `CONVECTIVE_MICROPHYSICS` call. The routine
+computes `CONDV = CONDMU - CONDP` and converts both to plume-mass units, but the
+plume's condensate is not visibly updated from `CONDV` in the ascent loop. Our
+port removes the precipitation directly. Whether ModelE removes it elsewhere, or
+carries it and removes it inside the sorting, is the next thing to establish —
+it decides whether our removal belongs where we put it at all.

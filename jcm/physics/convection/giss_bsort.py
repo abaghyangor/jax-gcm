@@ -624,8 +624,12 @@ def plume_ascent(cloud_base: jnp.ndarray,
         # (`wcupass`), not this level's, because `wcu` is not known until after
         # the sorting -- so the carried `previous_w` is the right argument.
         risen_temperature = safe_divide(risen_heat, arrival_mass) * exner_l
-        air_density = pressure_l / (RGAS_AIR * jnp.maximum(risen_temperature,
-                                                           1.0))
+        # ModelE forms the volumetric condensate as `CONDMU = (wmp/mplume)*rho0`
+        # (MSTCNV.F90:1772) -- `rho0` being the layer's reference air density,
+        # not one derived from the plume's own temperature. Using `ma/delz`
+        # reproduces the dumped `CONDMU` exactly (ratio 1.00000 over 484
+        # levels); a plume-temperature density is 0.08% off.
+        air_density = safe_divide(ma, delz)
         water_content = safe_divide(risen_condensate,
                                     arrival_mass) * air_density
         rained = microphysics.precipitate(
