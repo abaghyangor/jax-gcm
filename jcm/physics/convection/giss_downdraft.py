@@ -226,12 +226,26 @@ def downdraft_descent(source_mass: jnp.ndarray,
         # saturation deficit first, then scales it by how much rain is actually
         # falling through the layer, and finally caps it at what is there.
         safe_mass = jnp.where(alive, mass, 1.0)
+        # Where the shaft does not exist `heat` and `water` are zero, so the
+        # implied temperature is 0 K. The saturation fits are undefined there
+        # and go non-finite under `grad` even though the result is masked away
+        # below, so those levels are given the environment's own state.
+        safe_heat = jnp.where(alive, heat, senv * safe_mass)
+        safe_water = jnp.where(alive, water, qenv * safe_mass)
         evaporated, _ = condensate_evaporation(
-            heat, water, plk, safe_mass, pres,
+            safe_heat, safe_water, plk, safe_mass, pres,
             jnp.full_like(mass, 1e30), phase)
+        # The fractional power is zero at zero but its derivative is not --
+        # `x**0.6` differentiates to `0.6*x**-0.4`, which is infinite there and
+        # NaNs the gradient for every rain-free level, which is most of them.
+        # The double `where` keeps the singular point out of both passes.
+        rain_ratio = precip_mixing_ratio / _EVAP_PRECIP_SCALE
+        raining = rain_ratio > 0.0
         efficiency = jnp.minimum(
             1.0, (ma * _KG_TO_MB / _EVAP_MASS_REFERENCE)
-            * (precip_mixing_ratio / _EVAP_PRECIP_SCALE) ** _EVAP_EXPONENT)
+            * jnp.where(raining,
+                        jnp.where(raining, rain_ratio, 1.0) ** _EVAP_EXPONENT,
+                        0.0))
         evaporated = jnp.minimum(evaporated * efficiency, precip_down)
         evaporated = jnp.where(alive, evaporated, 0.0)
 

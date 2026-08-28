@@ -660,6 +660,15 @@ def plume_ascent(cloud_base: jnp.ndarray,
             0.01, 1.5 * previous_w - 0.5 * previous_w2)
         environment_temperature = safe_divide(
             tvl, 1.0 + DELTX * qenv)
+        # Below cloud base and above the plume top there is no parcel, so
+        # `risen_temperature` comes out at 0 K. The microphysics is not defined
+        # there -- its saturation fits and drop-size powers go non-finite under
+        # `grad` even though `rose` discards the value afterwards -- so those
+        # levels are handed the environment's own temperature and no water.
+        present = mass > 0.0
+        risen_temperature = jnp.where(present, risen_temperature,
+                                      environment_temperature)
+        water_content = jnp.where(present, water_content, 0.0)
         rained = microphysics.precipitate(
             water_content, extrapolated_w, pressure_l, risen_temperature,
             microphysics.scaled_droplet_number(droplet_number, pressure_l,
@@ -683,10 +692,21 @@ def plume_ascent(cloud_base: jnp.ndarray,
         condensate = jnp.where(at_base, cloud_base_condensate,
                                jnp.where(rose, risen_condensate, condensate))
 
-        safe_mass = jnp.maximum(mass, _TEENY)
-        parcel_virtual_t = ((heat / safe_mass) * exner_l
-                            * (1.0 + DELTX * water / safe_mass))
-        buoyancy = ((parcel_virtual_t - tvl) / tvl - condensate / safe_mass)
+        # Levels the plume has not reached carry zero mass. Guarding with
+        # `maximum(mass, tiny)` would keep the value finite but hand the
+        # gradient a factor of 1/tiny, which overflows to NaN and then survives
+        # every downstream mask -- see `safe_divide`. Selecting on both sides
+        # keeps those levels out of the gradient; they are neutrally buoyant and
+        # inert, which is what `alive` already assumes of them.
+        occupied = mass > 0.0
+        safe_mass = jnp.where(occupied, mass, 1.0)
+        parcel_virtual_t = jnp.where(
+            occupied,
+            (heat / safe_mass) * exner_l * (1.0 + DELTX * water / safe_mass),
+            tvl)
+        buoyancy = jnp.where(
+            occupied,
+            (parcel_virtual_t - tvl) / tvl - condensate / safe_mass, 0.0)
 
         # Entry conditions, on the state arriving at this level.
         survives = (
