@@ -2055,3 +2055,66 @@ exact when teacher-forced -- the sort to 2.4e-15, re-saturation to 3.6e-16,
 integration to 6.3e-7. The error is in the *accumulation*, and the sorting
 thresholds are what make a sub-1% accumulation error visible as a discrete
 branch flip.
+
+## 29. R1 closed: `wbases` measured, and two oracle files corrected
+
+### The answer
+
+A new dump (unit 771, `MSTCNV.F90` end of `cloud_base_closure`) records
+`wbases`, `mplumes` and the `wturb` maximum they come from. Rebuilt and reran
+BOMEX:
+
+* **`wbases(2) = 0.5 in all 52 plumes.`** `max(wturb)` over the source block
+  runs 0.346 to 0.372 and never reaches the 0.5 floor, so the floor binds
+  throughout. The `cloud_base_velocity = 0.5` default chosen in §28 is exact
+  for this case, not a guess.
+* `mplumes(1) = 0` in every plume, confirming directly what §25 inferred from
+  the ascent dumps: `lessent_scheme = 2` collapses the spectrum to one plume.
+
+**Scope risk R1 is closed for BOMEX.** It returns for any case where the
+boundary layer is turbulent enough to lift `wturb` above 0.5, which this one
+never is; wiring a real `wturb` remains necessary before trusting the closure
+outside these conditions.
+
+### Two oracle files were contaminated
+
+`closure_diag.txt` and `bisect_diag.txt`, added in §26, had been copied from
+files that accumulated across 16 runs -- the dumps open with
+`position='append'` and the run directory had never been cleared. Their row
+counts were inflated: 832 -> **52**, 7984 -> **499**.
+
+Every distribution reported from them in §26 holds unchanged, because the
+surplus was the same run repeated: `nlpi` is 6-9 and never 1, `lmin0` is always
+1, `fplume` spans 0.0625-0.999, `|dmse|` has median 1.83 and max 2.69, and all
+52 launched plumes match a closure row's `fmp2` exactly. Only the counts were
+wrong, and §26's conclusions about W1 stand.
+
+The other six oracle files were compared byte-for-byte against the fresh run
+and are **identical**, so nothing derived from the plume, blend, downdraft,
+source or continuity dumps is affected -- and the rebuild reproduces the run
+bit-for-bit, which is itself a useful check that adding the dump perturbed
+nothing.
+
+*Standing rule: clear the run directory before a diagnostic rerun, or the
+dumps silently concatenate.*
+
+### Where the tendency chain now stands
+
+Free-running plume and descent, against `continuity_diag.txt`:
+
+| level | `dm` ours / ModelE | `dmr` ours / ModelE | `cm` ours / ModelE |
+|---|---|---|---|
+| 0 | 0.368 / 0.369 | -7.397 / -7.397 | 7.029 / 7.028 |
+| 1 | 0.348 / 0.356 | -7.418 / -7.410 | 14.099 / 14.082 |
+| 2 | 0.656 / 0.687 | -7.436 / -7.422 | 20.880 / 20.817 |
+| 9 | 32.493 / 32.493 | -21.983 / -22.037 | 25.586 / 22.964 |
+
+The **boundary layer now matches to under 1% on `cm`** -- the layers whose
+missing cooling started this whole investigation back in §19. The downdraft
+reaches the surface with the right mass (ratio 0.9994), detrains nothing above
+`dcl` as ModelE does, and entrains within ~15% at every level.
+
+The whole of the remaining disagreement is the single l=11 blend from §28,
+which swaps `dm` between levels 10 and 11 (31.283/10.428 against 10.428/25.081)
+and propagates up the `cm` cumsum. That one blend clears its threshold by 2%,
+and closing it needs `mixbuoy` accurate to better than that.
