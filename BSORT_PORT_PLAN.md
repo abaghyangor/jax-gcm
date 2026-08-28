@@ -1981,3 +1981,77 @@ open item: it is the only thing standing between this chain and a clean match.
 
 `ruff` is not installed in the jax-gcm venv, so the changed files were not
 linted. Tests: 308 pass, 3 skipped.
+
+## 28. Chasing l=14: two real bugs, and the accuracy wall behind them
+
+### It was never knife-edge in the way §24 assumed
+
+§24 called the l=14 flip a knife-edge that a 0.03% mass drift could move. The
+blend dump says otherwise: `mixbuoy` there is -7.216e-4 against a `negbuoy/tvl`
+of -6.864e-4, a margin of -3.53e-5, or **5% of the threshold**. A 0.03% drift
+cannot do that. Something systematic was wrong, and two things were.
+
+### Bug 1: the wrong gravitational constant
+
+`buoyancy_work_increments` used `jcm.constants.grav` (9.81) while every other
+constant in the port comes from `giss_thermodynamics.GRAV`, ModelE's 9.80665 as
+declared in `Constants_mod.F90`. `giss_downdraft` was separately hardcoding
+9.80665, so the port disagreed with itself.
+
+The evidence was exact: our `kew` over ModelE's was **1.0003416**, and
+9.81/9.80665 = **1.0003416**. Fixing it took the error in `w` at the first
+level above cloud base from +1.71e-4 to -3.3e-6, a factor of 50.
+
+`jcm/constants.py` still defaults to 9.81 model-wide. Changing that is a
+separate decision with a much wider blast radius.
+
+### Bug 2: `wcupass` extrapolated against nothing
+
+The port special-cased the first level above cloud base, reasoning that no
+`wcu(l-2)` existed yet. Wrong twice: ModelE's special case is the *literal*
+second model level (`if(l.eq.2)`, `MSTCNV.F90:1868`), which a plume based at
+level 10 never reaches; and `wcu` below cloud base is not unset --
+`MSTCNV.F90:1636-1640` fills `lcl-2 .. lmin` with `wbases(iplume)`. The
+extrapolation always applies, against that seed.
+
+`plume_ascent` now takes `cloud_base_velocity`, defaulting to ModelE's
+`max(0.5, wturb)` floor of 0.5. Free-running BOMEX, this moves `condpr` at the
+first precipitating level from **+4.1% to -0.4%** and the downdraft's surface
+mass ratio from **0.7255 to 0.9994**.
+
+### The wall
+
+Fixing these did not produce a clean match, and the reason is worth stating
+plainly. Two blends in this column sit on their sorting thresholds:
+
+| blend | `mixbuoy` | threshold | margin |
+|---|---|---|---|
+| l=11, n=2 | +1.734929e-4 | `posbuoy/tvl` +1.697421e-4 | +3.75e-6 (**2%**) |
+| l=14, n=1 | -7.216168e-4 | `negbuoy/tvl` -6.863541e-4 | -3.53e-5 (**5%**) |
+
+Getting both right at once requires `mixbuoy` accurate to ~2%. With the
+corrected `wcupass` the l=14 blend now sorts to the downdraft correctly, and
+the l=11 blend flips out of the updraft. A scan over `cloud_base_velocity`
+locates the cliff between 0.55 and 0.58 and shows the result is otherwise
+**insensitive** across [0.6, 2.0] -- so `wbase` is not a tuning lever, it is a
+switch between which of the two blends is wrong.
+
+The aggregate free-run plume-mass error is therefore 4.2e-1 at the faithful
+`wbase = 0.5` and 3.3e-4 at 0.7. The larger number is the honest one: at 0.7 a
+wrong `wcupass` was compensating, and the agreement was partly luck. This was
+put to the user, who chose the faithful value.
+
+### What this changes about the remaining work
+
+`wturb` (scope risk R1) is no longer a side issue -- it is the one unmeasured
+input standing between us and knowing whether `wbase` is 0.5 or something
+larger. It needs either a dump added to the instrumented ModelE plus a BOMEX
+rerun, or a derivation from the PBL scheme.
+
+Beyond that, the binding constraint is the accuracy of the plume's accumulated
+thermodynamic state, not any single formula. Every component checked so far is
+exact when teacher-forced -- the sort to 2.4e-15, re-saturation to 3.6e-16,
+`blend_air_masses` to machine precision at every blend, the continuity
+integration to 6.3e-7. The error is in the *accumulation*, and the sorting
+thresholds are what make a sub-1% accumulation error visible as a discrete
+branch flip.
