@@ -1643,3 +1643,57 @@ plume's condensate is not visibly updated from `CONDV` in the ascent loop. Our
 port removes the precipitation directly. Whether ModelE removes it elsewhere, or
 carries it and removes it inside the sorting, is the next thing to establish —
 it decides whether our removal belongs where we put it at all.
+
+## 23. Where ModelE removes the precipitation
+
+`wmp` is never assigned after the microphysics call because it is passed **into**
+it. The caller supplies `wmp` at the `condv` argument slot
+(`MSTCNV.F90:1876-1888`), so the plume's condensate is **replaced** by
+
+```
+CONDV   = CONDMU - CONDP                 ! CONDMU formed with rho0
+wmp_new = CONDV * mplume * TLOC*R/PL     ! converted back with rho_env
+```
+
+not decremented by `CONDP`. The forward and backward conversions use different
+densities — `rho0 = ma/delz` going in, `rho_env = PL/(R*tl(l))` coming out — so
+in principle ModelE also rescales the surviving condensate by `rho0/rho_env`.
+
+**Numerically the distinction does not matter here**: replacement and
+subtraction give bit-identical residuals (0.5316% either way), because the two
+densities agree closely in this case. Worth recording anyway, since a case with
+a larger plume/environment temperature contrast would separate them.
+
+### Confirming the removal is real
+
+Between bsort at level `l` and bsort at level `l+1`, ModelE loses a median
+1.60e-3 of total water. Our re-saturation reproduces the vapour **exactly**
+(median difference 0.0e0) and the condensate high by **exactly that amount** —
+`loss / condensate excess = 1.00000`. So the missing water is precipitation, and
+nothing else about the inter-level step is wrong.
+
+The sorting itself is also exact in condensate, not just in mass: feeding
+`sort_blends` the oracle's state reproduces `plume_heat`, `plume_water` **and**
+`plume_condensate` to 2.4e-15, and water conserves through it to 4.2e-16. That
+check had never been run — only the masses had been.
+
+### Residual: 0.53%, cause unknown
+
+Our condensate after precipitation is 0.53% high (median). Candidates tested
+against the oracle and **rejected**:
+
+| candidate | result |
+|---|---|
+| `wcupass = 1.5*w(l-1) - 0.5*w(l-2)` | worse (3.19% vs 2.46% on the removal) |
+| back-conversion through `rho_env` | identical, 0.5316% |
+| `CDNC` from the oracle (45.7-60.3) | **worse: 0.96% vs 0.53%** |
+
+The `CDNC` test is now trustworthy — the microphysics dump carries `mplume`, so
+records match on pressure *and* plume mass, 484/484 unambiguously. Substituting
+ModelE's own `CDNC` degrading the fit is genuinely odd and suggests something
+else compensates for the constant-60 assumption.
+
+At 0.53% in the condensate this is a small residual, but it is what compounds
+into the four remaining branch flips, so it is still the thing worth chasing.
+Untested candidates: the parcel temperature `TP` handed to the microphysics, and
+`rvl`/`cloudrvl_mstcnv`, which we hold at 10 µm.
