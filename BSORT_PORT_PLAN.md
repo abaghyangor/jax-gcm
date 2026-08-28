@@ -1851,3 +1851,64 @@ run with cloud-base mass fluxes taken from the oracle. That holds the closure
 fixed while the ported physics is measured, so a residual tendency gap can be
 attributed to one side or the other instead of to both at once. It also means
 R1 and R2 do not block the first useful measurement.
+
+## 26. The closure oracle already existed; what it says about W1
+
+### There was nothing to fix
+
+`closure_diag.txt` (unit 772) and `bisect_diag.txt` (unit 773) were written by
+the same instrumented BOMEX run as every other dump in `oracle_data/`, with the
+same timestamp. `SCMopt%PlumeDiag` is on, and the run exits cleanly
+(`run_status` 13, "terminated normally"). The blocker recorded earlier was
+about the SUBDD *solo-variable* registration path (`mc_w_p1` and friends),
+which these plain Fortran writes do not go through. **R2's premise was wrong:
+the closure oracle has been on disk all along.**
+
+Both files are now in the bridge's `oracle_data/`, with
+`oracle.read_closure_diag`, `read_bisect_diag` and `read_source_weights`.
+832 closure calls, 832 bisection traces, one-to-one. Every one of the 52
+launched plumes matches a closure row's `fmp2` exactly, which confirms the
+column mapping end to end.
+
+### R2 is replaced by a sharper problem
+
+`nlpi` -- the number of blended boundary-layer source levels -- is **6, 7, 8 or
+9 in all 832 calls, and never 1**; `lmin0` is always 1. `giss_mass_flux.py`
+ports the `nlpi=1` case explicitly ("the multi-source generalization is
+deferred"), so the ported closure covers a case this configuration never
+reaches. That is a structural gap, not a tuning gap.
+
+It is bounded, though. `MASS_FLUX2` blends the source as
+`SDN = SUM(SMO1*FPIBYAML)` (`MSTCNV.F90:8960`) and spreads the removal as
+`SMN1(:) = SMO1(:)*(1 - fmp2*fpibyaml)` (`MSTCNV.F90:8925`), so
+
+    SDN = SUM(SMO1*fpibyaml) - fmp2*SUM(SMO1*fpibyaml^2)
+
+The generalization is a **second moment** of the same weights, not a new loop:
+our three-level stencil keeps its shape, with `theta[0]` becoming the weighted
+blend and one extra term carrying `fmp2`'s effect on it. Estimate ~50 LOC in
+`giss_mass_flux.py`, now validatable term by term against `bisect_diag.txt`,
+which dumps `SDN, SUP, QDN, QUP, SVDN, SVUP, DMSE1` at every iteration.
+
+`fpi` itself is recoverable from the existing source dump (`read_source_weights`).
+In BOMEX it is uniform: 1/7 over seven levels, zero above.
+
+### The bisection usually does not converge
+
+Iterations per call run 4-9. In call 0, `fplume` climbs 0.5 -> 0.998 while
+`dmse1` stays negative throughout (-1.687 -> -0.843): the sign never flips, so
+the bisection saturates against the `fplume` ceiling rather than reaching the
+`|DMSE1| <= 1e-3` band. Across all 832 calls the final `|dmse|` has median 1.83
+and max 2.69, and `fplume` lands on bisection lattice points (0.0625, ..., 0.999).
+
+`giss_mass_flux.py`'s unit tests assert that the bisection *drives* `DMSE1`
+toward zero. That is true directionally but the endpoint is a saturated bound,
+not neutrality, so a test asserting convergence to the tolerance band would be
+asserting something ModelE does not do. Match the trace, not the ideal.
+
+### Revised W1
+
+Still last in the order, but no longer blocked and no longer unmeasurable:
+generalize the source blend to `nlpi > 1` (~50 LOC), then validate iteration by
+iteration against the bisection trace before wiring the closure in. R1
+(`wturb` for `wbases`) is unchanged and still the one input with no oracle.
