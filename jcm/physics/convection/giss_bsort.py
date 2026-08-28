@@ -545,6 +545,7 @@ def plume_ascent(cloud_base: jnp.ndarray,
                  exner: jnp.ndarray,
                  pressure: jnp.ndarray,
                  entrainment_efficiency: jnp.ndarray,
+                 cloud_base_velocity: jnp.ndarray = 0.5,
                  droplet_number: jnp.ndarray = 60.0e6,
                  droplet_radius: jnp.ndarray = 10.0e-6,
                  iplume: int = 2,
@@ -590,6 +591,11 @@ def plume_ascent(cloud_base: jnp.ndarray,
         exner: ``plk``.
         pressure: [**Pa**].
         entrainment_efficiency: ``enteff``.
+        cloud_base_velocity: ``wbases(iplume)``, the updraft speed at cloud base
+            [m/s]. ModelE stores it in `wcu` for every level from `lcl-2` up to
+            `lmin`, so it is what the first two levels of the ascent extrapolate
+            `wcupass` against. It is `max(0.5, wturb)` for the entraining plume;
+            0.5 is the floor and the value BOMEX sits at.
         droplet_number: ``CDNC`` [m^-3] for the precipitation partition. ModelE
             forms this as a land/ocean blend; 60e6 is its ocean value.
         droplet_radius: Assumed cloud droplet volume radius [m].
@@ -644,13 +650,14 @@ def plume_ascent(cloud_base: jnp.ndarray,
         # levels below rather than the level below alone (MSTCNV.F90:1874) --
         # `wcu(l)` is not known until after this level's sorting. Recovering
         # ModelE's critical drop diameter confirms the extrapolation exactly.
-        # ModelE special-cases the level where no `w(l-2)` exists yet
-        # (`if(l.eq.2) wcupass = wcu(l-1)`); ours is the first level above cloud
-        # base, where extrapolating from an unset value would overshoot by half.
-        extrapolated_w = jnp.where(
-            previous_w2 > 0.0,
-            jnp.maximum(0.01, 1.5 * previous_w - 0.5 * previous_w2),
-            previous_w)
+        # ModelE's only special case is the literal second model level
+        # (`if(l.eq.2) wcupass = wcu(l-1)`), which a plume based this high never
+        # reaches, so the extrapolation always applies. Below cloud base `wcu`
+        # is not zero: MSTCNV.F90:1636-1640 fills every level from `lcl-2` up to
+        # `lmin` with `wbases(iplume)`, so the first two levels of the ascent
+        # extrapolate against that seed rather than against nothing.
+        extrapolated_w = jnp.maximum(
+            0.01, 1.5 * previous_w - 0.5 * previous_w2)
         environment_temperature = safe_divide(
             tvl, 1.0 + DELTX * qenv)
         rained = microphysics.precipitate(
@@ -759,7 +766,12 @@ def plume_ascent(cloud_base: jnp.ndarray,
                    survives)
         return carry, outputs
 
-    initial = (zeros, zeros, zeros, zeros, zeros, zeros, zeros, zeros,
+    # `previous_w`/`previous_w2` start at the cloud-base updraft speed, which is
+    # what ModelE has stored in `wcu` below cloud base, so the `wcupass`
+    # extrapolation is right from the first level of the ascent.
+    seed_w = jnp.broadcast_to(jnp.asarray(cloud_base_velocity, zeros.dtype),
+                              zeros.shape)
+    initial = (zeros, zeros, zeros, zeros, zeros, zeros, seed_w, seed_w,
                jnp.zeros(horiz, dtype=bool), jnp.zeros(horiz, dtype=bool),
                jnp.zeros((nlev,) + horiz))
     _, outputs = lax.scan(
