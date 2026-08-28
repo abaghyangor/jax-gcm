@@ -41,7 +41,7 @@ import jax.numpy as jnp
 from jax import lax
 
 from jcm.physics.convection.giss_thermodynamics import (
-    DELTX, LHE, LHS, SHA, condensate_evaporation, safe_divide)
+    DELTX, GRAV, LHE, LHS, SHA, condensate_evaporation, safe_divide)
 
 # Share of the precipitation flux that falls through the downdraft rather than
 # the surrounding environment (`mc_fddrt`).
@@ -76,7 +76,7 @@ _PRECIP_DEPTH_MAX = 400.0       # mb, `min(dp_from_cldtop, 400)`
 # precipitation-weighted convective-fraction excess.
 _GEOMETRIC_FEVAP_FACTOR = 0.0
 
-_KG_TO_MB = 9.80665 / 100.0     # ModelE `kg2mb`
+_KG_TO_MB = GRAV / 100.0        # ModelE `kg2mb`
 _TEENY = 1e-20
 
 
