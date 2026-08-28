@@ -165,8 +165,23 @@ def downdraft_descent(source_mass: jnp.ndarray,
     below = jnp.concatenate(
         [jnp.zeros((1,) + horiz), convective_fraction[:-1]], axis=0)
     edge_fraction = 0.5 * (below + convective_fraction)
+    # ModelE gates both the rain-bearing area and the injection of new
+    # condensate on `l >= lcl`; with no cloud base supplied every level counts.
+    lcl = 0 if cloud_base is None else cloud_base
     if cloud_base is not None:
         edge_fraction = jnp.where(level_axis >= cloud_base, edge_fraction, 0.0)
+
+    # `dp_from_cldtop` measures the air column the rain has already fallen
+    # through, and ModelE starts accumulating it at the *plume* top `lmax`
+    # (MSTCNV.F90:4290-4294), which sits above the highest level the downdraft
+    # itself reaches. Our scan covers the whole column, so the levels above the
+    # plume have to be excluded explicitly: counting them makes the rain shaft
+    # look hundreds of mb deep, collapses `prcp_mixrat`, and leaves the
+    # downdraft unloaded and spuriously buoyant.
+    plume_top = jnp.max(
+        jnp.where((produced_precipitation > 0.0) | (source_mass > 0.0),
+                  level_axis, 0),
+        axis=0)
 
     def step(carry, level_inputs):
         (mass, heat, water, precip_down, precip_env, depth_from_top,
@@ -182,10 +197,17 @@ def downdraft_descent(source_mass: jnp.ndarray,
         precip_down = total_precip * _DOWNDRAFT_PRECIP_SHARE + precip
         precip_env = total_precip * (1.0 - _DOWNDRAFT_PRECIP_SHARE)
 
-        depth_from_top = depth_from_top + ma * _KG_TO_MB
+        depth_from_top = depth_from_top + jnp.where(level <= plume_top,
+                                                    ma * _KG_TO_MB, 0.0)
         precip_area = jnp.maximum(area_min, mcfrac)
+        # `prcp_mixrat = prcp/(prcp_area*min(dp_from_cldtop,400)*mb2kg)`
+        # (MSTCNV.F90:4357). `dp_from_cldtop` is in mb, so the `mb2kg` converts
+        # the column of air the rain falls through into kg/m^2 and makes the
+        # ratio a genuine mixing ratio. `total_precip` is deliberately the flux
+        # arriving from the level above: ModelE fixes `prcp` at MSTCNV.F90:4296,
+        # before this level's `wmdnl` and `condpr` are folded in.
         precip_mixing_ratio = jnp.minimum(
-            safe_divide(total_precip,
+            safe_divide(total_precip * _KG_TO_MB,
                          precip_area * jnp.minimum(depth_from_top,
                                                    _PRECIP_DEPTH_MAX)),
             _PRECIP_MIXING_RATIO_MAX)
@@ -274,6 +296,16 @@ def downdraft_descent(source_mass: jnp.ndarray,
             safe_environment_air, pres, precip_env, phase)
         environment_evaporated = jnp.where(wets, environment_evaporated, 0.0)
         precip_env = precip_env - environment_evaporated
+
+        # The rain the plume produced in this layer joins the falling flux only
+        # once the level's own evaporation is done, so it first becomes
+        # available to the level below (`MSTCNV.F90:4733-4736`). Splitting it by
+        # the same `fddrt` share is what keeps the shaft loaded: without it the
+        # downdraft carries almost no water, reads as buoyant against the
+        # environment, and sheds itself within a couple of levels.
+        falls = jnp.where(level >= lcl, produced, 0.0)
+        precip_down = precip_down + falls * _DOWNDRAFT_PRECIP_SHARE
+        precip_env = precip_env + falls * (1.0 - _DOWNDRAFT_PRECIP_SHARE)
 
         carry = (mass, heat, water, precip_down, precip_env, depth_from_top,
                  precip_total, precip_weighted)
