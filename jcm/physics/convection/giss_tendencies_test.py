@@ -138,9 +138,20 @@ class TestBsortEnvironmentTendencies(unittest.TestCase):
             detrained_mass=jnp.where(in_cloud, 14.0, 0.0),
             detrained_heat=jnp.where(in_cloud, 14.0 * 41.7, 0.0),
             detrained_water=jnp.where(in_cloud, 14.0 * 0.012, 0.0),
-            downdraft_mass=jnp.where(in_cloud, 4.0, 0.0),
-            downdraft_heat=jnp.where(in_cloud, 4.0 * 41.3, 0.0),
-            downdraft_water=jnp.where(in_cloud, 4.0 * 0.010, 0.0),
+            # The downdraft forms in cloud but lands below it: the descent
+            # carries the 16 kg/m^2 the sort routed to it down to the two
+            # sub-cloud layers, entraining 2 per level on the way. Balance:
+            # 40 source + 32 plume-entrained + 8 downdraft-entrained in,
+            # 56 plume-detrained + 24 downdraft-detrained out.
+            downdraft_detrained_mass=jnp.where(
+                (levels >= self.BASE - 4) & (levels < self.BASE - 2), 12.0, 0.0),
+            downdraft_detrained_heat=jnp.where(
+                (levels >= self.BASE - 4) & (levels < self.BASE - 2),
+                12.0 * 41.3, 0.0),
+            downdraft_detrained_water=jnp.where(
+                (levels >= self.BASE - 4) & (levels < self.BASE - 2),
+                12.0 * 0.010, 0.0),
+            downdraft_entrained_air=jnp.where(in_cloud, 2.0, 0.0),
             environment_heat=senv,
             environment_water=qenv,
             layer_mass=jnp.full(self.NLEV, 200.0),
@@ -159,18 +170,33 @@ class TestBsortEnvironmentTendencies(unittest.TestCase):
         # column total. Removing the exchange must leave the total untouched.
         args, t = self._column()
         net_exchange = float(jnp.sum(
-            args["detrained_mass"] + args["downdraft_mass"]
-            - args["source_removal"] - args["entrained_air"]))
+            args["detrained_mass"] + args["downdraft_detrained_mass"]
+            - args["source_removal"] - args["entrained_air"]
+            - args["downdraft_entrained_air"]))
         self.assertAlmostEqual(float(jnp.sum(t.layer_mass)), net_exchange,
                                delta=1e-9)
 
     def test_interface_flux_peaks_at_cloud_base(self):
-        # Continuity should build the flux up through the source layers to the
-        # cloud-base mass, then draw it down as the plume detrains.
-        _, t = self._column()
+        # With no downdraft, continuity builds the flux up through the source
+        # layers to the full cloud-base mass, then draws it down as the plume
+        # detrains.
+        z = jnp.zeros(self.NLEV)
+        _, t = self._column(downdraft_detrained_mass=z,
+                            downdraft_detrained_heat=z,
+                            downdraft_detrained_water=z,
+                            downdraft_entrained_air=z)
         flux = np.asarray(t.interface_flux)
         self.assertAlmostEqual(flux[self.BASE - 1], 40.0, delta=1e-6)
         self.assertLess(flux[self.BASE + 3], flux[self.BASE - 1])
+
+    def test_downdraft_detrainment_offsets_the_flux_below_cloud_base(self):
+        # The downdraft puts 24 kg/m^2 back into the layers underneath the
+        # source, so by cloud base the net upward flux is the plume's 40 less
+        # that 24. Depositing it at the level it formed instead would leave the
+        # sub-cloud flux untouched, which is exactly the error being avoided.
+        _, t = self._column()
+        self.assertAlmostEqual(float(t.interface_flux[self.BASE - 1]), 16.0,
+                               delta=1e-6)
 
     def test_no_flux_above_the_plume(self):
         _, t = self._column()
@@ -185,13 +211,20 @@ class TestBsortEnvironmentTendencies(unittest.TestCase):
         self.assertTrue(bool(jnp.all(t.interface_flux[self.BASE - 1:
                                                       self.BASE + 3] > 0)))
 
-    def test_downdraft_flag_changes_only_where_it_is_deposited(self):
-        # Excluding the downdraft removes mass from the column; the flag exists
-        # to isolate that, and is not mass-conserving by construction.
-        _, with_dd = self._column()
-        _, without_dd = self._column(deposit_downdraft_locally=False)
-        self.assertGreater(float(jnp.sum(with_dd.layer_mass)),
-                           float(jnp.sum(without_dd.layer_mass)))
+    def test_evaporation_cools_and_moistens_where_it_is_applied(self):
+        # `dsm_evp`/`dqm_evp` go straight into the state, so they show up in the
+        # tendency at their own level with their own sign.
+        levels = jnp.arange(self.NLEV)
+        below = levels < self.BASE
+        cool = jnp.where(below, -3.0, 0.0)
+        wet = jnp.where(below, 0.002, 0.0)
+        _, dry = self._column()
+        _, wetted = self._column(evaporation_heat=cool, evaporation_water=wet)
+        self.assertTrue(bool(jnp.all(wetted.heat[below] < dry.heat[below])))
+        self.assertTrue(bool(jnp.all(wetted.water[below] > dry.water[below])))
+        # It adds vapour, not air, so the mass tendency is untouched.
+        np.testing.assert_allclose(np.asarray(wetted.layer_mass),
+                                   np.asarray(dry.layer_mass), atol=1e-12)
 
     def test_courant_is_reported(self):
         _, t = self._column()

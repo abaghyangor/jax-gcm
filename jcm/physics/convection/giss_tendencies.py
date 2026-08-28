@@ -141,6 +141,8 @@ def convective_tendencies(mass_flux, plume_property, detrainment_rate,
 #   1. **Direct exchange.** The air the plume entrained is *removed* from its
 #      layer (`dmr`, `dsmr`, `dqmr`, all negative) and the air it detrained is
 #      *deposited* (`dm`, `dsm`, `dqm`). This is a local swap, not advection.
+#      The descending downdraft writes into the same six arrays, so its
+#      entrainment is another removal and its detrainment another deposition.
 #   2. **Compensating subsidence.** The interface mass flux follows from
 #      continuity over that exchange -- `cm(l) = cm(l-1) - dm(l) - dmr(l)` --
 #      *not* from the plume's own mass. The environment is then upwind-advected
@@ -164,14 +166,23 @@ def bsort_environment_tendencies(
         detrained_mass: jnp.ndarray,
         detrained_heat: jnp.ndarray,
         detrained_water: jnp.ndarray,
-        downdraft_mass: jnp.ndarray,
-        downdraft_heat: jnp.ndarray,
-        downdraft_water: jnp.ndarray,
+        downdraft_detrained_mass: jnp.ndarray,
+        downdraft_detrained_heat: jnp.ndarray,
+        downdraft_detrained_water: jnp.ndarray,
+        downdraft_entrained_air: jnp.ndarray,
         environment_heat: jnp.ndarray,
         environment_water: jnp.ndarray,
         layer_mass: jnp.ndarray,
-        deposit_downdraft_locally: bool = True) -> EnvironmentTendency:
-    """Environmental tendency from one buoyancy-sorting plume.
+        evaporation_heat: jnp.ndarray = 0.0,
+        evaporation_water: jnp.ndarray = 0.0) -> EnvironmentTendency:
+    """Environmental tendency from one buoyancy-sorting plume and its downdraft.
+
+    The plume and the downdraft both act on the same four ``MSTCNV`` arrays.
+    What is deposited into a layer accumulates in ``dm``/``dsm``/``dqm``, and
+    what is drawn out of it in ``dmr``/``dsmr``/``dqmr``; the plume writes them
+    during its ascent and ``dd_evap_precip_loop`` adds to the same arrays as the
+    downdraft descends (``MSTCNV.F90:4553-4575``). Continuity then integrates
+    the pair into the interface flux that drives compensating subsidence.
 
     Args:
         source_removal: Air drawn from the sub-cloud source layers to launch the
@@ -180,46 +191,50 @@ def bsort_environment_tendencies(
             continuity integration balance -- without it the interface flux
             starts from zero at cloud base instead of carrying the plume's mass,
             and the environment gains mass from nowhere.
-        entrained_air: ``envairm`` drawn out of each layer [kg/m^2].
+        entrained_air: ``envairm`` drawn out of each layer by the plume [kg/m^2].
         detrained_mass: Locally detrained blend mass [kg/m^2].
         detrained_heat: Its extensive heat.
         detrained_water: Its extensive water vapour.
-        downdraft_mass: Blend mass routed to the downdraft [kg/m^2].
-        downdraft_heat: Its extensive heat.
-        downdraft_water: Its extensive water vapour.
+        downdraft_detrained_mass: Mass the *descending* downdraft hands back to
+            the environment, ``detr`` (``MSTCNV.F90:4553``). This is where
+            downdraft air actually lands, which is well below the level the
+            plume's sort routed it to: the descent carries it down, entraining
+            and evaporating rain into it on the way.
+        downdraft_detrained_heat: Its extensive heat, ``fdetr*smdn``.
+        downdraft_detrained_water: Its extensive water vapour, ``fdetr*qmdn``.
+        downdraft_entrained_air: ``edraft``, environmental air the downdraft
+            draws in as it descends (``MSTCNV.F90:4557``), a removal like the
+            plume's own entrainment.
         environment_heat: Intensive environmental heat (``senv``).
         environment_water: Intensive environmental humidity (``qenv``).
         layer_mass: ``ma`` [kg/m^2].
-        deposit_downdraft_locally: See the note below. Static.
+        evaporation_heat: ``dsm_evp``, the extensive cooling from rain
+            evaporating into the *clear* air outside the downdraft. ModelE
+            applies this straight to ``sm`` before continuity runs
+            (``MSTCNV.F90:4743``), so it is folded into the state the subsidence
+            then advects rather than treated as a deposition.
+        evaporation_water: ``dqm_evp``, the vapour that evaporation adds.
 
     Returns:
         An :class:`EnvironmentTendency`.
 
     Note:
-        **The downdraft is an approximation here.** ModelE hands downdraft air to
-        ``dd_evap_precip_loop`` (``MSTCNV.F90:3985-4792``, ~800 lines), which
-        lets it descend, evaporate precipitation into it, and detrain lower
-        down. That routine is not ported. Downdraft air is 29.8% of everything
-        leaving the plume in BOMEX -- far too much to discard -- so by default it
-        is deposited **at the level where it formed**, which conserves mass but
-        places the associated cooling and moistening roughly 350 m too high and
-        omits the evaporative cooling entirely. Set the flag to ``False`` to
-        exclude it instead, which is *not* mass-conserving and is provided only
-        for isolating its effect.
+        The plume's sort routes some blend mass to the downdraft, but that mass
+        is **not** deposited where it forms -- ModelE books it to ``dmddform``,
+        which `apply_continuity_tendencies` does not read. It re-enters the
+        environment only through ``downdraft_detrained_*``. Passing the
+        formation-level amounts here instead would place the cooling and
+        moistening several hundred metres too high and omit the evaporative
+        cooling entirely.
     """
-    if deposit_downdraft_locally:
-        deposited_mass = detrained_mass + downdraft_mass
-        deposited_heat = detrained_heat + downdraft_heat
-        deposited_water = detrained_water + downdraft_water
-    else:
-        deposited_mass = detrained_mass
-        deposited_heat = detrained_heat
-        deposited_water = detrained_water
+    deposited_mass = detrained_mass + downdraft_detrained_mass
+    deposited_heat = detrained_heat + downdraft_detrained_heat
+    deposited_water = detrained_water + downdraft_detrained_water
 
     # Stage 1: the local swap. Removal is negative, deposition positive. The
     # source draw and the entrainment are both removals at the environment's own
     # properties, so they combine.
-    removed_air = source_removal + entrained_air
+    removed_air = source_removal + entrained_air + downdraft_entrained_air
     removed_heat = removed_air * environment_heat
     removed_water = removed_air * environment_water
     exchange_mass = deposited_mass - removed_air
@@ -236,9 +251,12 @@ def bsort_environment_tendencies(
                            axis=0)[::-1] == 0
     interface_flux = jnp.where(above_top, 0.0, interface_flux)
 
+    # The evaporation is already in `sm`/`qm` by the time continuity runs, so it
+    # is part of the state the subsidence advects. It adds water vapour without
+    # adding air, so it does not enter `updated_mass`.
     updated_mass = layer_mass + exchange_mass
-    heat = environment_heat * layer_mass + exchange_heat
-    water = environment_water * layer_mass + exchange_water
+    heat = environment_heat * layer_mass + exchange_heat + evaporation_heat
+    water = environment_water * layer_mass + exchange_water + evaporation_water
 
     # Upwind advection by `cmneg = -cm`: a negative (downward) flux carries the
     # layer above, a positive one the layer below.
@@ -269,8 +287,8 @@ def bsort_environment_tendencies(
 
     advected_mass = convergence(down_flux)
     return EnvironmentTendency(
-        heat=exchange_heat + convergence(heat_flux),
-        water=exchange_water + convergence(water_flux),
+        heat=exchange_heat + evaporation_heat + convergence(heat_flux),
+        water=exchange_water + evaporation_water + convergence(water_flux),
         layer_mass=exchange_mass + advected_mass,
         interface_flux=interface_flux,
         courant=jnp.max(jnp.abs(_safe_ratio(interface_flux, updated_mass)),
