@@ -601,8 +601,8 @@ def plume_ascent(cloud_base: jnp.ndarray,
     zeros = jnp.zeros(horiz)
 
     def step(carry, level_inputs):
-        (mass, heat, water, condensate, kew, bdzsum, previous_w, alive,
-         dumped, history) = carry
+        (mass, heat, water, condensate, kew, bdzsum, previous_w, previous_w2,
+         alive, dumped, history) = carry
         (level, senv, qenv, tvl, ma, gzl, delz, zl, exner_l,
          pressure_l) = level_inputs
 
@@ -623,7 +623,11 @@ def plume_ascent(cloud_base: jnp.ndarray,
         # ModelE passes an extrapolation of the *previous* levels' `wcu` here
         # (`wcupass`), not this level's, because `wcu` is not known until after
         # the sorting -- so the carried `previous_w` is the right argument.
-        risen_temperature = safe_divide(risen_heat, arrival_mass) * exner_l
+        # ModelE passes `TPSAV(l) = smp*plk/mplume` (MSTCNV.F90:1690), formed
+        # *before* this level's condensation, so the latent heat just released
+        # is not in it. Using the post-condensation temperature makes the parcel
+        # 0.22% too warm.
+        risen_temperature = safe_divide(heat, arrival_mass) * exner_l
         # ModelE forms the volumetric condensate as `CONDMU = (wmp/mplume)*rho0`
         # (MSTCNV.F90:1772) -- `rho0` being the layer's reference air density,
         # not one derived from the plume's own temperature. Using `ma/delz`
@@ -632,9 +636,24 @@ def plume_ascent(cloud_base: jnp.ndarray,
         air_density = safe_divide(ma, delz)
         water_content = safe_divide(risen_condensate,
                                     arrival_mass) * air_density
+        # ModelE hands the microphysics `wcupass`, an extrapolation of the two
+        # levels below rather than the level below alone (MSTCNV.F90:1874) --
+        # `wcu(l)` is not known until after this level's sorting. Recovering
+        # ModelE's critical drop diameter confirms the extrapolation exactly.
+        # ModelE special-cases the level where no `w(l-2)` exists yet
+        # (`if(l.eq.2) wcupass = wcu(l-1)`); ours is the first level above cloud
+        # base, where extrapolating from an unset value would overshoot by half.
+        extrapolated_w = jnp.where(
+            previous_w2 > 0.0,
+            jnp.maximum(0.01, 1.5 * previous_w - 0.5 * previous_w2),
+            previous_w)
+        environment_temperature = safe_divide(
+            tvl, 1.0 + DELTX * qenv)
         rained = microphysics.precipitate(
-            water_content, previous_w, pressure_l, risen_temperature,
-            droplet_number, droplet_radius).precipitated
+            water_content, extrapolated_w, pressure_l, risen_temperature,
+            microphysics.scaled_droplet_number(droplet_number, pressure_l,
+                                               environment_temperature),
+            droplet_radius).precipitated
         # Only the part of the partition realised over this layer's depth.
         rained = rained * microphysics.finite_ascent_fraction(ma)
         rained_mass = jnp.minimum(
@@ -718,6 +737,7 @@ def plume_ascent(cloud_base: jnp.ndarray,
                  jnp.where(survives, kinetic_energy(w, next_mass), kew),
                  jnp.where(survives, bdzsum_here, bdzsum),
                  jnp.where(survives, w, previous_w),
+                 jnp.where(survives, previous_w, previous_w2),
                  survives,
                  dumped | terminating,
                  history)
@@ -735,7 +755,7 @@ def plume_ascent(cloud_base: jnp.ndarray,
                    survives)
         return carry, outputs
 
-    initial = (zeros, zeros, zeros, zeros, zeros, zeros, zeros,
+    initial = (zeros, zeros, zeros, zeros, zeros, zeros, zeros, zeros,
                jnp.zeros(horiz, dtype=bool), jnp.zeros(horiz, dtype=bool),
                jnp.zeros((nlev,) + horiz))
     _, outputs = lax.scan(

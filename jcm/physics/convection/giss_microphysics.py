@@ -75,6 +75,35 @@ _RGAS = 287.05
 # dumped layer mass of 103.76 kg/m^2.
 _ASCENT_REFERENCE_MASS = 50.0 * 100.0 / 9.80665      # `cond_repart_dmscale`
 
+# ModelE specifies the droplet concentration at a reference state and scales it
+# by the local air density (`do_scale_nc`, MSTCNV.F90:1864). The reference is
+# `nc_pref = 900 hPa` and `nc_tref = tf + 10 K` (CLOUDS_COM.F90:31-32).
+_NC_REFERENCE_PRESSURE = 900.0e2
+_NC_REFERENCE_TEMPERATURE = 273.15 + 10.0
+
+
+def scaled_droplet_number(droplet_number: jnp.ndarray,
+                          pressure: jnp.ndarray,
+                          environment_temperature: jnp.ndarray) -> jnp.ndarray:
+    """Droplet concentration scaled from its reference state to the local air.
+
+    ``CDNC * (p/T) * (nc_tref/nc_pref)``. The concentration is *specified* per
+    unit volume at a reference density, so it must be scaled by the local one;
+    using the unscaled value leaves the cloud-mode capacity wrong by several
+    percent, which matters because precipitation is a threshold process in it.
+
+    Args:
+        droplet_number: Reference concentration [m^-3] (60e6 over ocean).
+        pressure: [**Pa**].
+        environment_temperature: Layer temperature ``tl(l)`` [K] -- the
+            *environment's*, not the plume's.
+
+    Returns:
+        Scaled concentration [m^-3].
+    """
+    return (droplet_number * safe_divide(pressure, environment_temperature)
+            * (_NC_REFERENCE_TEMPERATURE / _NC_REFERENCE_PRESSURE))
+
 
 def finite_ascent_fraction(layer_mass: jnp.ndarray) -> jnp.ndarray:
     """Fraction of the partitioned precipitation realised in one layer.
