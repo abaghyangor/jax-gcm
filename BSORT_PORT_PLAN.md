@@ -2118,3 +2118,89 @@ The whole of the remaining disagreement is the single l=11 blend from §28,
 which swaps `dm` between levels 10 and 11 (31.283/10.428 against 10.428/25.081)
 and propagates up the `cm` cumsum. That one blend clears its threshold by 2%,
 and closing it needs `mixbuoy` accurate to better than that.
+
+## 30. W2 done: the plume runs on state, not on dumps
+
+`giss_plume_driver` composes the chain and derives what it needs from the
+column. Until now every profile the ported pieces consumed came from an oracle
+dump, so none of the port had been run on inputs a model could supply.
+
+### What it derives, and how it checks out
+
+| quantity | source | agreement |
+|---|---|---|
+| `delz = ma/rho0` | hydrostatic | exact, every level |
+| `tvl = tl*(1+deltx*qv)` | state | exact, every level |
+| `gzl` | centred geopotential difference (`CLOUDS_DRV.F90:582`) | exact at every level with valid neighbours |
+| `fpi` -> `source_removal` | `MSTCNV.F90:2672-2675` | **exact**: 7.397145 from each of seven layers, zero above `dcl`, summing to `mplume` |
+| `mcfrac` | ascent mass flux and `wcu` (`MSTCNV.F90:5136`) | right shape, ~2x the oracle at cloud base |
+| source parcel | `MSTCNV.F90:1583-1601` | see below |
+
+`fpi` matching exactly is the useful one: it exercises the mass weighting, the
+rule that drops source layers above the mixed-layer top, and the
+renormalisation, all at once.
+
+### Where the driver stands against the oracle
+
+Driving the whole chain from the reconstructed BOMEX column, cloud-base mass is
+exact and the first ascent step is within 1.7e-4. But at the cloud-base level
+our sort routes 32.5144 to the **downdraft** where ModelE **detrains** 32.493 --
+the same mass, the opposite branch.
+
+The seed explains it:
+
+| | ours | ModelE | rel |
+|---|---|---|---|
+| heat | 2154.913 | 2155.917 | -4.7e-4 |
+| water | 0.827414 | 0.834436 | -8.4e-3 |
+| condensate | 0.036227 | 0.030678 | +1.8e-1 |
+
+Re-saturation conserves total water, so ModelE's raw parcel held 0.865114 and
+ours 0.863641 -- 0.17% less. Since `source_removal` is *exact*, that difference
+is entirely the sub-cloud humidity the harness reconstructs by subtracting
+`dq_mc*dt` from the post-convection state: 0.028 g/kg, which is well inside what
+that reconstruction can be trusted to. It is a harness limitation, not a driver
+one, and there is no dump of the sub-cloud `sm`/`qm` to settle it against.
+
+The consequence is §28's wall once more, now reached at the cloud-base level
+rather than at l=11 or l=14: a 0.17% input error decides a branch.
+
+### Three NaN-gradient bugs, all pre-existing
+
+The driver's gradient test is the first thing to differentiate the composed
+chain, and every gradient through the scheme was NaN. The scheme's whole purpose
+is to be differentiable, so this was the most valuable thing W2 turned up:
+
+1. `giss_bsort` still had one `maximum(mass, tiny)` -- the last instance of the
+   very pattern `safe_divide` was introduced to replace, and which its own
+   docstring warns about.
+2. The microphysics ran at levels the plume never reached, where the parcel
+   temperature is 0 K and the Murphy & Koop fits are outside their validity
+   range.
+3. `giss_downdraft` called `condensate_evaporation` at 0 K the same way, and
+   raised the rain ratio to the power 0.6 at zero -- finite in value, infinite
+   in derivative, and most levels have no rain.
+
+All three are value-neutral: the free-running comparison against
+`continuity_diag.txt` is unchanged to every digit.
+
+*Standing rule: a NaN gradient hides until something differentiates the whole
+composed chain. Unit-level gradient tests on each piece did not find any of
+these, because each piece is only degenerate in the context the others put it
+in.*
+
+### Note on units
+
+`giss_plume_driver` takes ModelE's convention: `exner = (p in mb)**kappa` paired
+with `potential_temperature = theta/1000**kappa`, so that their product is the
+temperature. Passing a conventional potential temperature against this Exner
+function overstates every temperature about sevenfold, which lands outside the
+saturation fits rather than merely being inaccurate. This cost an hour when the
+first test column was built the conventional way; the module docstring now says
+so explicitly.
+
+### Next
+
+W4 (subsidence substepping) and W5 (the `lmin` scan with sequential environment
+carry) remain, then W6 to rewire `GissConvection`. W1 is unblocked but still
+wants the `nlpi > 1` generalisation from §26.
