@@ -41,10 +41,9 @@ from typing import NamedTuple
 import jax.numpy as jnp
 from jax import lax
 
-import jcm.constants as c
 from jcm.physics.convection import giss_microphysics as microphysics
 from jcm.physics.convection.giss_thermodynamics import (
-    DELTX, LHE, LHS, RGAS as RGAS_AIR, SHA, condensate_evaporation,
+    DELTX, GRAV, LHE, LHS, RGAS as RGAS_AIR, SHA, condensate_evaporation,
     condensation, safe_divide)
 
 # Fraction of the buoyancy force that goes into vertical kinetic energy. ModelE
@@ -111,7 +110,12 @@ def buoyancy_work_increments(buoyancy: jnp.ndarray,
         ``(d_kew, d_bdzsum)`` to add to the running integrals.
     """
     a_buoy = jnp.where(buoyancy >= 0.0, _A_BUOY_BUOYANT, _A_BUOY_OVERSHOOT)
-    bdz = a_buoy * c.grav * buoyancy * layer_thickness
+    # `GRAV` is ModelE's 9.80665, not jcm's 9.81. The 0.034% difference is
+    # negligible as physics but not as a port: it enters the vertical kinetic
+    # energy at every level, and the accumulated error in `w` feeds the
+    # entrainment closure and the condensate loading, which is enough to move a
+    # marginal blend across the buoyancy-sorting threshold.
+    bdz = a_buoy * GRAV * buoyancy * layer_thickness
     return bdz * plume_mass, bdz * (1.0 - entrainment_efficiency)
 
 
