@@ -1697,3 +1697,77 @@ At 0.53% in the condensate this is a small residual, but it is what compounds
 into the four remaining branch flips, so it is still the thing worth chasing.
 Untested candidates: the parcel temperature `TP` handed to the microphysics, and
 `rvl`/`cloudrvl_mstcnv`, which we hold at 10 µm.
+
+## 24. Retraction: the branch flips were not the cause, and the bsort stack is not wired in
+
+### The prediction that failed
+
+§20 closed with: *"Closing the 2.5% would very likely close the whole remaining
+gap."* That is now falsified and is retracted here, as the §19 claim that the
+mid-level excess was "not downdraft-related" was retracted in §20.
+
+The three microphysics-coupling corrections (`wcupass` extrapolation,
+pre-condensation `TP`, scaled CDNC) landed as intended. Measured against the
+oracle they took the condensate removal to 0.0001% median, the free-running
+plume mass to 0.00210%, the detrained mass to 0.00443%, and **eliminated all
+four downdraft branch flips** (268 both / 0 ModelE-only / 0 ours-only).
+
+The tendency comparison did not move at all: dth +0.9793 / peak 1.158 against
++0.9793 / 1.163 before, dq +0.9812 / 0.947 against +0.9813 / 0.947.
+
+### Why it did not move
+
+`GissConvection` — the `PhysicsTerm` the single-column harness runs, and the
+only thing the tendency comparison measures — does not call any of this code.
+It calls `giss_plume.plume_ascent_column` (a single entraining plume with a
+saturation-adjustment detrainment) and `giss_tendencies.convective_tendencies`
+(a plain mass-flux operator). `grep` for callers of
+`giss_downdraft.downdraft_descent` outside its own tests returns nothing;
+`giss_bsort.plume_ascent` and `bsort_environment_tendencies` are likewise
+reachable only from their tests.
+
+Confirmed directly: stashing `giss_downdraft.py` and re-running the comparison
+reproduced the metrics to the digit.
+
+So every hypothesis in §17-§23 about *why the tendencies disagree* was tested
+against a scheme that contains none of the ported physics. Those sections
+remain valid as oracle-agreement results for the bsort components in isolation
+— that is how they were measured — but none of them says anything about the
+tendency gap, and the sub-cloud, mid-level and heating-magnitude discrepancies
+were never evidence about the port at all.
+
+### What the tendency comparison actually measures today
+
+Free-running harness, all active BOMEX periods, `GissConvection` as wired:
+
+| | corr | rms ratio |
+|---|---|---|
+| `dth_mc` | +0.7517 | 2.119 |
+| `dq_mc` | +0.6051 | 1.384 |
+
+Median peak-heating ratio JCM/ModelE 1.87x. Cloud base within one level 48/48.
+These are the numbers for the *old* scheme; the +0.979 correlations quoted
+earlier came from a single oracle-driven column, not this harness.
+
+### Bugs the exercise did find
+
+Chasing the (irrelevant) tendency gap still surfaced three real porting bugs in
+the downdraft, all fixed in `f5fbc1b`: `condpr` never entered the falling
+precipitation flux, `dp_from_cldtop` was measured from the model top rather
+than the plume top, and `prcp_mixrat` was missing its `mb2kg` factor. Together
+these left the shaft dry, so it read as buoyant and shed 75% of itself per
+level, collapsing in three levels. It now descends to the surface, entrains at
+every level, and detrains exactly 0.5 per level below `dcl`, as ModelE does.
+
+### Next
+
+Wiring the bsort stack into `GissConvection` in place of
+`giss_plume.plume_ascent_column` is now the blocking item — no tendency
+measurement is informative about the port until it is done. That needs the
+plume spectrum (the `iplume` loop), per-plume cloud-base mass flux, the
+continuity/subsidence step, and `bsort_environment_tendencies` replacing
+`convective_tendencies`.
+
+Open and *not* explained by any of the above: one sort flip at l=14, where the
+blend buoyancy sits on the -0.2 K threshold and a 0.03% upstream mass drift is
+enough to move it. It costs 6.048 of ModelE's 15.907 total downdraft source.
