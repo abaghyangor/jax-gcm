@@ -1912,3 +1912,72 @@ Still last in the order, but no longer blocked and no longer unmeasurable:
 generalize the source blend to `nlpi > 1` (~50 LOC), then validate iteration by
 iteration against the bisection trace before wiring the closure in. R1
 (`wturb` for `wbases`) is unchanged and still the one input with no oracle.
+
+## 27. W3 done: the descent is coupled, and the continuity chain has an oracle
+
+### What changed
+
+`bsort_environment_tendencies` now takes the descent's outputs rather than the
+plume's formation-level downdraft:
+
+* `downdraft_detrained_*` -- where the shaft actually hands its air back, which
+  is several hundred metres below where the sort routed it.
+* `downdraft_entrained_air` -- `edraft`, a removal alongside the plume's own.
+* `evaporation_heat` / `evaporation_water` -- `dsm_evp` / `dqm_evp`. ModelE
+  applies these straight to `sm`/`qm` at `MSTCNV.F90:4743`, *before* continuity
+  runs, so they belong in the state the subsidence advects, not in the
+  deposition. They add vapour without adding air, so they do not enter the mass
+  tendency.
+
+`deposit_downdraft_locally` is gone; it only ever chose between two known-wrong
+placements.
+
+### A second bug the oracle exposed
+
+Both ends of the circulation dump their remainder, and only one was ported:
+
+* `DM(LMAX) += MPLUME` (`MSTCNV.F90:1998`) -- already implemented, via the
+  `dump()` path in `plume_ascent`.
+* `dm(ldmin) += ddraft` (`MSTCNV.F90:4809`) -- **was missing**. The descent
+  detrains nothing at level 0, so the shaft's remaining mass was vanishing and
+  the environment's budget did not close. Now handed to `ldmin`.
+
+### Validation
+
+`continuity_diag.txt` is this chain's own oracle and had never been used --
+§24 flagged it as "the one part of the tendency chain never checked against its
+own oracle". Two tests:
+
+1. **The integration itself.** Feeding ModelE's own `dm`/`dmr` through our
+   `cm(l) = cm(l-1) - dm(l) - dmr(l)` reproduces its `cm` to a worst relative
+   error of **6.3e-7** across all 52 plume blocks -- dump precision (`es14.6`).
+   The continuity operator is exact.
+2. **The coupled chain**, driven from our own free-running plume and descent:
+
+| level | `dm` ours / ModelE | `dmr` ours / ModelE |
+|---|---|---|
+| 9 | 32.493 / 32.493 | -21.895 / -22.037 |
+| 10 | 10.428 / 10.428 | -19.542 / -19.698 |
+| 11 | 25.065 / 25.081 | -13.189 / -13.408 |
+| 0 | 0.267 / 0.369 | -7.397 / -7.397 |
+
+`dmr` agrees within ~1% everywhere and to four figures in the boundary layer,
+which validates the source draw, the plume's entrainment and the downdraft's
+entrainment together. `dm` agrees exactly where the plume dominates.
+
+The two places it does not agree are both already-identified upstream issues,
+not tendency-side ones:
+
+* level 13: 18.163 vs 12.097 -- the §24 sort flip, which routes 6.048 to
+  detrainment instead of the downdraft. Its excess then propagates down the
+  `cm` cumsum, which is the whole of the remaining mid-level `cm` gap.
+* levels 0-6: our downdraft carries 0.62-0.72 of ModelE's mass, so it detrains
+  proportionally less. Same root cause -- the missing 6.048 of source.
+
+Both reduce to the single knife-edge blend at l=14. That is now the highest-value
+open item: it is the only thing standing between this chain and a clean match.
+
+### Note for later
+
+`ruff` is not installed in the jax-gcm venv, so the changed files were not
+linted. Tests: 308 pass, 3 skipped.
