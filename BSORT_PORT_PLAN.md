@@ -1771,3 +1771,83 @@ continuity/subsidence step, and `bsort_environment_tendencies` replacing
 Open and *not* explained by any of the above: one sort flip at l=14, where the
 blend buoyancy sits on the -0.2 K threshold and a 0.03% upstream mass drift is
 enough to move it. It costs 6.048 of ModelE's 15.907 total downdraft source.
+
+## 25. Scope: wiring the bsort stack into `GissConvection`
+
+### Configuration facts that shrink the job
+
+Read from the Fortran defaults and confirmed against the BOMEX oracle:
+
+* `lessent_scheme` defaults to **2** (`MSTCNV.F90:629`). That sets
+  `mplumes(1) = 0` (`MSTCNV.F90:2814`), so the less-entraining plume never
+  fires and `plumes_per_base` collapses to a single plume, `iplume=2`. The
+  oracle agrees: every one of the 52 plumes in the 48-step BOMEX run has
+  `iplume=2`.
+* Consequently `contce = entrainment_cont2 = 0.6` (`MSTCNV.F90:506`), a
+  constant, not a per-plume spectrum.
+* The base loop runs **downward**, `lmin = lmcm-1 → dcl` (`MSTCNV.F90:1452-1459`),
+  with `lmcm = ls1-1`.
+* Plume bases in BOMEX sit at levels 6-9, ~1.1 plumes per step. The trip count
+  is short in practice but must be static in JAX: the number of candidate
+  `lmin` values, roughly 10-15.
+
+### The structural constraint
+
+`apply_continuity_tendencies` is called **inside** the plume loop
+(`MSTCNV.F90:2376`), so `sm`/`qm` are updated after every plume and the next
+plume ascends through an environment its predecessors already modified. The
+loop is therefore inherently sequential: a `lax.scan` over a fixed-length list
+of candidate `lmin` values carrying the environment, with inactive iterations
+masked out. It cannot be vectorised over plumes.
+
+### Work items
+
+| | Item | Where | Est. LOC | Notes |
+|---|---|---|---|---|
+| W1 | `cloud_base_closure` wrapper | new, wraps `giss_mass_flux` | ~120 | See risks R1/R2 |
+| W2 | Per-plume driver: ascent → descent → tendency | new module | ~150 | Also builds `tvl`, `gzl`, `delz`, `zl`, `fpi` source weights |
+| W3 | Extend `bsort_environment_tendencies` to consume the descent | `giss_tendencies.py` | ~40 | |
+| W4 | Subsidence substepping | `giss_tendencies.py` | ~50 | |
+| W5 | Outer `lmin` scan with sequential environment carry | new module | ~80 | |
+| W6 | Rewire `GissConvection.__call__` | `giss_mstcnv.py` | ~60 | Keep the `giss_plume` path behind a flag |
+
+**W3** is the smallest and most overdue. `bsort_environment_tendencies` still
+deposits downdraft air at the level where it formed, and its docstring still
+says `dd_evap_precip_loop` "is not ported" — stale since `giss_downdraft.py`
+landed. It needs to take the descent's detrained mass/heat/water and the
+environmental evaporation (`dsm_evp`, `dqm_evp`) instead.
+
+**W4**: the function computes a `courant` field and never uses it. ModelE
+substeps up to `ksubmax=20` times whenever `cmneg(l) > 0.999*ml(l)`
+(`MSTCNV.F90:4915-4935`). Static 20-trip scan, most iterations no-ops.
+
+### Risks
+
+* **R1 — `wturb` is not available.** `wbases = max(0.5, [2,1]*maxval(wturb(lmin0+1:lmin+1)))`
+  needs the PBL turbulent velocity profile, which no jcm diagnostic currently
+  publishes. Derive it from the TTE-TKE term when that is in the stack,
+  otherwise fall back to the convective velocity scale already computed in
+  `giss_mstcnv.surface_flux_scales`. Affects the plume's initial `w`, which
+  feeds the entrainment closure.
+* **R2 — the closure has no oracle.** `giss_mass_flux.py` ports `MASS_FLUX2`
+  for the single-source case (`nlpi=1`) and is validated for *behaviour*, not
+  level-by-level agreement. The `closure_diag.txt` dump (unit 772) exists in
+  the instrumented Fortran but is gated behind `SCMopt%PlumeDiag`, whose rerun
+  crashed, so no closure oracle has been collected. This is the largest
+  correctness risk: the closure sets the mass-flux *magnitude*, which is
+  exactly what the 1.87x peak-heating ratio is about.
+* **R3 — cost.** Static trip count `nlmin` x (ascent scan + descent scan +
+  substep scan), all over `nlev`, per column per step. Benchmark before
+  running anything at grid resolution.
+* **R4 — `dcl`** (dry convective layer top) sets both the `lmin` range and the
+  downdraft's `boundary_layer_top`. The harness currently reads it from the
+  oracle; it needs a real diagnosis.
+* **R5** — the l=14 knife-edge sort flip from §24, still open.
+
+### Suggested order
+
+W3 → W2 → W4 → W5 → W6, leaving **W1 last** and driving the first end-to-end
+run with cloud-base mass fluxes taken from the oracle. That holds the closure
+fixed while the ported physics is measured, so a residual tendency gap can be
+attributed to one side or the other instead of to both at once. It also means
+R1 and R2 do not block the first useful measurement.
