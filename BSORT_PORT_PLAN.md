@@ -2204,3 +2204,57 @@ so explicitly.
 W4 (subsidence substepping) and W5 (the `lmin` scan with sequential environment
 carry) remain, then W6 to rewire `GissConvection`. W1 is unblocked but still
 wants the `nlpi > 1` generalisation from §26.
+
+## 31. W4 done: the subsidence is substepped
+
+`bsort_environment_tendencies` advected in a single pass with the whole
+interface flux, which draws a layer past empty whenever the flux exceeds its
+mass. ModelE splits the flux until no step takes more than 99.9% of a layer,
+updating the layer mass between steps (`MSTCNV.F90:4931-4941`), and calls a
+layer driven negative fatal. `courant` was computed and never used; it now
+reports how far over the limit the column went.
+
+The trip count is fixed at ModelE's `ksubmax = 20`, since JAX needs it static.
+Once the flux is exhausted the clip returns zero, so the remaining substeps are
+exact no-ops -- a column under the limit gets bit-identical results to the old
+single pass, which the `continuity_diag.txt` comparison confirms unchanged to
+every digit.
+
+Exercised at Courant 4.8 (a 600 kg/m^2 mixed layer under 25 kg/m^2 layers):
+
+| substeps | humidity at level 1 |
+|---|---|
+| 1 | 0.005000 (spike barely moved) |
+| 2 | 0.006177 |
+| 3 | 0.006126 |
+| 5 | 0.006477 |
+| 20 | 0.006477 (converged) |
+
+Upwind monotonicity holds throughout, so no new extreme appears -- overshooting
+one is exactly how the unsubstepped scheme drives humidity negative.
+
+### A deliberate divergence
+
+ModelE's scalars go through `adv1d`, a quadratic-upstream scheme carrying
+moments (`smom`, `qmom`). The `PhysicsState` has no moments, so this port
+applies the same flux splitting to the plain upwind transport it already used --
+which is what ModelE itself does for momentum. The splitting is the part that
+matters for stability; the moments are an accuracy refinement that would need
+the state to carry them.
+
+### The top boundary, found by a failing test
+
+The mass-conservation test failed at -526 kg/m^2 after the change. Cause: in a
+column with no inversion the plume stays buoyant to the model top, never
+terminates, and never dumps -- so the mass it entrained had no way back. The
+old single pass hid this, because the uncancelled flux at the top exactly
+offset the accumulated exchange; the clip cannot reproduce that.
+
+ModelE never meets the case: its ascent loop is bounded by `lm` and the
+stratosphere stops the plume first. A plume still rising at the highest level
+now terminates there and dumps like any other termination. The test column also
+gained a trade inversion, so it tests the physics rather than the boundary.
+
+*This is the second time a conservation test has caught a missing termination
+dump -- the downdraft's `ldmin` remainder in §27 was the first. Both ends of
+every circulation need one.*
