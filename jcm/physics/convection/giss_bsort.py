@@ -721,7 +721,16 @@ def plume_ascent(cloud_base: jnp.ndarray,
         # `DM(LMAX) += MPLUME`, `DSM(LMAX) += SMP`, ...). Without this the
         # remaining mass simply vanishes and the environment's mass budget does
         # not close.
-        terminating = alive & ~survives & ~dumped & (level >= cloud_base)
+        # A plume still rising at the top of the model has nowhere left to go,
+        # so it terminates there and dumps what it carries like any other
+        # termination. ModelE never needs this -- its `cloud_top` loop is
+        # bounded by `lm` and the stratosphere always stops the plume first --
+        # but without it a column that stays buoyant to the top leaves the
+        # entrained mass with no way back into the environment, and the mass
+        # budget does not close.
+        at_model_top = level == (nlev - 1)
+        terminating = (alive & (~survives | at_model_top) & ~dumped
+                       & (level >= cloud_base))
 
         # Record the mass entering this level; ModelE's `mplumearr(l) = mplume`
         # is likewise the incoming value, not the post-sorting one.

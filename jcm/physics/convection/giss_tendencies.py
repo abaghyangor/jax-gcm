@@ -28,10 +28,20 @@ downward. Broadcasting-native: vertical on axis 0.
 from typing import NamedTuple
 
 import jax.numpy as jnp
+from jax import lax
 
 from jcm.physics.convection.giss_thermodynamics import safe_divide as _safe_ratio
 
 
+
+
+# Subsidence substepping. ModelE splits the interface flux until no layer loses
+# more than `_COURANT_LIMIT` of its mass in one step, giving up after
+# `ksubmax` tries (`MSTCNV.F90:4884, 4931-4944`). The trip count is fixed here
+# because JAX needs it static; substeps past the point where the flux is
+# exhausted are exact no-ops.
+_MAX_SUBSTEPS = 20
+_COURANT_LIMIT = 0.999
 
 
 def subsidence_tendency(interface_flux: jnp.ndarray,
@@ -259,25 +269,19 @@ def bsort_environment_tendencies(
     water = environment_water * layer_mass + exchange_water + evaporation_water
 
     # Upwind advection by `cmneg = -cm`: a negative (downward) flux carries the
-    # layer above, a positive one the layer below.
+    # layer above, a positive one the layer below. ModelE splits the flux into
+    # substeps first, so that no single step can draw more than
+    # `_COURANT_LIMIT` of a layer's mass (`MSTCNV.F90:4931-4941`); the mass is
+    # then updated between substeps and the next split sees the new profile.
+    # Without it a layer whose interface flux exceeds its own mass is emptied
+    # and driven negative, which the Fortran treats as fatal.
     down_flux = -interface_flux
-    heat_above = jnp.concatenate(
-        [heat[1:], jnp.zeros((1,) + heat.shape[1:], dtype=heat.dtype)], axis=0)
-    water_above = jnp.concatenate(
-        [water[1:], jnp.zeros((1,) + water.shape[1:], dtype=water.dtype)],
-        axis=0)
-    mass_above = jnp.concatenate(
-        [updated_mass[1:],
-         jnp.ones((1,) + updated_mass.shape[1:], dtype=updated_mass.dtype)],
-        axis=0)
 
-    from_above = down_flux <= 0.0
-    heat_flux = jnp.where(
-        from_above, _safe_ratio(down_flux * heat_above, mass_above),
-        _safe_ratio(down_flux * heat, updated_mass))
-    water_flux = jnp.where(
-        from_above, _safe_ratio(down_flux * water_above, mass_above),
-        _safe_ratio(down_flux * water, updated_mass))
+    def shift_down(field, pad):
+        """`field(l+1)`, i.e. the layer above, with the top edge padded."""
+        return jnp.concatenate(
+            [field[1:], jnp.full((1,) + field.shape[1:], pad, field.dtype)],
+            axis=0)
 
     def convergence(flux):
         below = jnp.concatenate(
@@ -285,11 +289,38 @@ def bsort_environment_tendencies(
             axis=0)
         return below - flux
 
-    advected_mass = convergence(down_flux)
+    def substep(carry, _):
+        remaining, mass, heat, water = carry
+        mass_above = shift_down(mass, 1.0)
+        # `cmn = cmneg` clipped so neither the donor layer nor the one above it
+        # can give up more than 99.9% of what it holds. Once `remaining` reaches
+        # zero the clip returns zero and the rest of the fixed trip count costs
+        # nothing.
+        step = jnp.clip(remaining, -_COURANT_LIMIT * mass_above,
+                        _COURANT_LIMIT * mass)
+        remaining = remaining - step
+
+        heat_above = shift_down(heat, 0.0)
+        water_above = shift_down(water, 0.0)
+        from_above = step <= 0.0
+        heat_flux = jnp.where(
+            from_above, _safe_ratio(step * heat_above, mass_above),
+            _safe_ratio(step * heat, mass))
+        water_flux = jnp.where(
+            from_above, _safe_ratio(step * water_above, mass_above),
+            _safe_ratio(step * water, mass))
+        return (remaining, mass + convergence(step),
+                heat + convergence(heat_flux),
+                water + convergence(water_flux)), None
+
+    (_, subsided_mass, subsided_heat, subsided_water), _ = lax.scan(
+        substep, (down_flux, updated_mass, heat, water), None,
+        length=_MAX_SUBSTEPS)
+
     return EnvironmentTendency(
-        heat=exchange_heat + evaporation_heat + convergence(heat_flux),
-        water=exchange_water + evaporation_water + convergence(water_flux),
-        layer_mass=exchange_mass + advected_mass,
+        heat=subsided_heat - environment_heat * layer_mass,
+        water=subsided_water - environment_water * layer_mass,
+        layer_mass=subsided_mass - layer_mass,
         interface_flux=interface_flux,
         courant=jnp.max(jnp.abs(_safe_ratio(interface_flux, updated_mass)),
                         axis=0),

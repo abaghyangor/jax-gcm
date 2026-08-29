@@ -38,7 +38,12 @@ def _column(nlev=20, horiz=()):
     # in gives temperatures near 2000 K, outside the Murphy & Koop saturation
     # fit's validity range, and the saturation vapour pressure goes non-finite.
     exner = (pressure / 100.0) ** 0.28622
-    theta = profile((298.5 + 0.30 * np.maximum(0.0, level - 4.0))
+    # Mixed layer, a conditionally unstable cloud layer, then a trade inversion
+    # at level 11 that stops the plume. Without something to stop it the plume
+    # rises to the top of the model, which is not what a real column does and
+    # leaves the test measuring the top-boundary handling instead of the physics.
+    theta = profile((298.5 + 0.30 * np.clip(level - 4.0, 0.0, 7.0)
+                     + 3.0 * np.maximum(0.0, level - 11.0))
                     / 1000.0 ** 0.28622)
     q = profile(np.maximum(0.0165 - 0.0006 * level, 1.0e-5))
     layer_mass = profile(np.full(nlev, 20.0 * 100.0 / 9.80665))
@@ -272,9 +277,12 @@ class RunPlumeTest(unittest.TestCase):
                      (single.tendency.water, block.tendency.water),
                      (single.ascent.plume_mass, block.ascent.plume_mass),
                      (single.descent.mass, block.descent.mass)):
+            # `atol` covers the entries that are exactly zero in the column and
+            # land on XLA's vectorised rounding in the block; 1e-9 kg/m^2 is far
+            # below anything the scheme resolves.
             np.testing.assert_allclose(
                 np.asarray(b), np.broadcast_to(np.asarray(a)[:, None], b.shape),
-                rtol=1e-10, atol=1e-12)
+                rtol=1e-10, atol=1e-9)
 
 
 if __name__ == "__main__":
