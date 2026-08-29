@@ -1,6 +1,7 @@
 """Tests for the GISS compensating-subsidence tendency operator."""
 
 import unittest
+from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -104,9 +105,6 @@ class TestConvectiveTendencies(unittest.TestCase):
             self.layer_mass) ** 2))(self.mass_flux)
         self.assertTrue(jnp.all(jnp.isfinite(g)))
 
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestBsortEnvironmentTendencies(unittest.TestCase):
@@ -249,3 +247,105 @@ class TestBsortEnvironmentTendencies(unittest.TestCase):
                 **{**args, "entrained_air": entrained}).heat)
         grad = jax.grad(f)(args["entrained_air"])
         self.assertTrue(bool(jnp.all(jnp.isfinite(grad))))
+
+
+class SubsidenceSubsteppingTest(unittest.TestCase):
+    """The flux split that keeps a thin layer from being emptied in one step.
+
+    A plume rooted in a deep mixed layer drives its mass flux through much
+    thinner layers above, so the interface flux can be several times a layer's
+    own mass. ModelE splits that into substeps (`MSTCNV.F90:4931-4941`) and
+    treats a layer driven negative as fatal.
+    """
+
+    NLEV = 8
+
+    def _column(self, **over):
+        level = jnp.arange(self.NLEV)
+        # 600 kg/m^2 mixed layer under 25 kg/m^2 layers: a 120 kg/m^2 flux is
+        # nearly five times what the thin layers hold.
+        layer_mass = jnp.where(level < 2, 600.0, 25.0)
+        args = dict(
+            source_removal=jnp.where(level < 2, 60.0, 0.0),
+            entrained_air=jnp.zeros(self.NLEV),
+            detrained_mass=jnp.where(level == 5, 120.0, 0.0),
+            detrained_heat=jnp.where(level == 5, 120.0 * 41.7, 0.0),
+            detrained_water=jnp.where(level == 5, 120.0 * 0.012, 0.0),
+            downdraft_detrained_mass=jnp.zeros(self.NLEV),
+            downdraft_detrained_heat=jnp.zeros(self.NLEV),
+            downdraft_detrained_water=jnp.zeros(self.NLEV),
+            downdraft_entrained_air=jnp.zeros(self.NLEV),
+            # A sharp spike, so that how much gets advected is visible at all.
+            environment_heat=jnp.where(level == 3, 45.0, 41.5),
+            environment_water=jnp.where(level == 3, 0.030, 0.005),
+            layer_mass=layer_mass,
+        )
+        args.update(over)
+        return args, gt.bsort_environment_tendencies(**args)
+
+    def _humidity_after(self, args, tendency):
+        return np.asarray(
+            (args["environment_water"] * args["layer_mass"] + tendency.water)
+            / (args["layer_mass"] + tendency.layer_mass))
+
+    def test_the_case_is_actually_over_the_limit(self):
+        # Guards the test itself: without a Courant number above 1 none of the
+        # rest of this class is exercising anything.
+        _, t = self._column()
+        self.assertGreater(float(t.courant), 4.0)
+
+    def test_converged_by_the_default_trip_count(self):
+        # Twice the substeps must give the same answer, or 20 is not enough.
+        _, t = self._column()
+        with mock.patch.object(gt, "_MAX_SUBSTEPS", 2 * gt._MAX_SUBSTEPS):
+            _, doubled = self._column()
+        np.testing.assert_allclose(np.asarray(t.water),
+                                   np.asarray(doubled.water), rtol=1e-12)
+
+    def test_a_single_step_is_not_enough(self):
+        # The substepping has to be doing real work: one step transports only
+        # what fits under the limit and leaves the profile short.
+        args, t = self._column()
+        with mock.patch.object(gt, "_MAX_SUBSTEPS", 1):
+            single_args, single = self._column()
+        self.assertGreater(
+            float(np.abs(self._humidity_after(args, t)
+                         - self._humidity_after(single_args, single)).max()),
+            1e-3)
+
+    def test_upwind_advection_stays_monotone(self):
+        # Upwind transport may not create a new extreme; overshooting one is how
+        # the unsubstepped scheme drives humidity negative.
+        args, t = self._column()
+        q = self._humidity_after(args, t)
+        source = np.asarray(args["environment_water"])
+        self.assertGreaterEqual(q.min(), source.min() - 1e-12)
+        self.assertLessEqual(q.max(), source.max() + 1e-12)
+
+    def test_no_layer_is_emptied(self):
+        args, t = self._column()
+        after = np.asarray(args["layer_mass"] + t.layer_mass)
+        self.assertGreater(after.min(), 0.0)
+
+    def test_below_the_limit_the_extra_substeps_are_no_ops(self):
+        # A gentle column must give exactly what a single pass would, so the
+        # fixed trip count costs nothing where it is not needed.
+        gentle = dict(layer_mass=jnp.full(self.NLEV, 600.0))
+        _, t = self._column(**gentle)
+        with mock.patch.object(gt, "_MAX_SUBSTEPS", 1):
+            _, once = self._column(**gentle)
+        np.testing.assert_allclose(np.asarray(t.water), np.asarray(once.water),
+                                   rtol=1e-12)
+
+    def test_gradient_is_finite_over_the_limit(self):
+        def loss(layer_mass):
+            _, t = self._column(layer_mass=layer_mass)
+            return jnp.sum(t.heat ** 2)
+
+        level = jnp.arange(self.NLEV)
+        grad = jax.grad(loss)(jnp.where(level < 2, 600.0, 25.0))
+        self.assertTrue(bool(jnp.all(jnp.isfinite(grad))))
+
+
+if __name__ == "__main__":
+    unittest.main()
