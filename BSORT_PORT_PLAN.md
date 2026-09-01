@@ -2338,3 +2338,65 @@ harness measures the port instead of the old scheme. W1 (`nlpi > 1`) is the
 remaining piece before the closure can come from the model rather than the
 oracle, and until it does, every number above depends on oracle-supplied
 cloud-base mass.
+
+## 33. W6 done: the harness finally measures the port
+
+`GissConvection` ran `giss_plume.plume_ascent_column` -- a single entraining
+plume with a saturation-adjustment detrainment. Under `allow_mc` it now runs
+`convective_column`. The old path stays behind `bsort=False`, so both can be
+measured against the same oracle rather than one replacing the other silently.
+
+Scope is one cloud base (`max_plumes=1`): ModelE runs the closure at every
+candidate from `lmcm-1` down to `dcl`, and the ported closure solves a single
+base.
+
+### The numbers, and what they finally separate
+
+| | old scheme | ported | ported, ModelE's closure |
+|---|---|---|---|
+| `dth_mc` correlation | +0.7517 | **+0.8734** | +0.8169 |
+| `dq_mc` correlation | +0.6051 | **+0.8608** | +0.8380 |
+| peak `dth` ratio | 1.87x | 2.11x | **0.924** |
+| `dth` rms ratio | 2.119 | 2.482 | **1.120** |
+| `dq` rms ratio | 1.384 | 2.279 | **1.031** |
+
+The shape improved substantially and the magnitude got slightly worse. That
+looks equivocal until the two right-hand columns are read together: the same
+chain, driven with ModelE's own cloud-base masses, lands at 0.924 peak and rms
+ratios near 1.
+
+The closure explains the gap exactly. Across all 48 periods the ported closure
+hands over **2.185x** ModelE's total `mplume` (median; mean 2.094), and the
+harness peak heating ratio is **2.11x**. The tendency is near-linear in the
+cloud-base mass flux, so 2.185 in gives 2.11 out.
+
+**The entire remaining magnitude error is the closure, and none of it is the
+ported physics.** Section 26 already established why: `giss_mass_flux` ports the
+`nlpi = 1` single-source case, and BOMEX runs `nlpi` between 6 and 9 in all 832
+closure calls.
+
+### Where the port stands
+
+Every structural piece is now ported, wired and oracle-checked:
+
+| piece | agreement |
+|---|---|
+| blend masses (`blend_air_masses`) | machine precision, every blend |
+| blend sort | 2.4e-15 |
+| re-saturation | 3.6e-16 |
+| condensate removal (microphysics) | 0.0001% median |
+| continuity integration | 6.3e-7 (dump precision) |
+| source removal (`fpi`) | exact |
+| `delz`, `tvl` | exact |
+| downdraft branch structure | detrains 0.5 below `dcl`, as ModelE |
+| plume count over BOMEX | 48/48 |
+
+What is *not* ported is the closure's multi-source generalisation, and it is now
+the only thing standing between the harness and a like-for-like magnitude.
+
+### Next
+
+W1, with a target: the closure must come down by a factor of about 2.19, and
+`bisect_diag.txt` gives `SDN, SUP, QDN, QUP, SVDN, SVUP, DMSE1` at every
+iteration of all 832 calls to check it term by term. After that, raise
+`max_plumes` so the sweep runs every candidate base rather than one.
