@@ -17,10 +17,10 @@ The chain, and where each stage lives:
 5. :func:`~jcm.physics.convection.giss_downdraft.downdraft_descent`.
 6. :func:`~jcm.physics.convection.giss_tendencies.bsort_environment_tendencies`.
 
-Scope: one plume. ``MSTCNV`` runs this inside two nested loops -- over cloud
-base levels and over the plume spectrum -- updating the environment after each
-plume, so the caller cannot simply sum what this returns. That sequencing is
-deliberately left out; see ``BSORT_PORT_PLAN.md`` (W5).
+:func:`run_plume` does one plume. :func:`convective_column` runs the sequence:
+``MSTCNV`` sweeps candidate cloud-base levels and applies each plume before the
+next begins, so the plumes are coupled through the environment and cannot be
+summed independently.
 
 Two inputs come from the turbulence scheme and have no jcm diagnostic yet:
 ``dcl`` (the dry convective layer top, ``smixlev`` in ModelE) and ``wturb``,
@@ -41,6 +41,7 @@ Broadcasting-native: vertical on axis 0, trailing axes horizontal.
 from typing import NamedTuple
 
 import jax.numpy as jnp
+from jax import lax
 
 from jcm.physics.convection import giss_bsort as bsort
 from jcm.physics.convection import giss_downdraft as downdraft
@@ -357,3 +358,193 @@ def run_plume(cloud_base: jnp.ndarray,
     return PlumeCycle(tendency=tendency, ascent=ascent, descent=descent,
                       geometry=geometry, source_removal=removal,
                       convective_fraction=mcfrac, cloud_top=plume_top)
+
+
+# --- The plume sequence -------------------------------------------------------
+#
+# `MSTCNV` does not run one plume. It loops over candidate cloud-base levels and
+# applies each plume's effect to the environment *before* the next one starts
+# (`apply_continuity_tendencies` is called inside the loop, MSTCNV.F90:2376), so
+# every plume ascends through an environment its predecessors already modified.
+# The loop cannot be vectorised over plumes and the results cannot be summed
+# independently -- both would drop that coupling.
+#
+# Under `lessent_scheme = 2` (the default, MSTCNV.F90:629) the inner spectrum
+# loop collapses to a single plume, so this is a plain descending sweep over
+# cloud-base levels: `lmin = lmcm-1` down to `dcl` (MSTCNV.F90:1452-1459).
+
+# 300 mb: the deepest span of boundary-layer levels a plume may draw from
+# (MSTCNV.F90:2646-2648).
+_MAX_SOURCE_SPAN = 300.0e2
+
+
+class ColumnConvection(NamedTuple):
+    """What the whole plume sequence does to one column."""
+    potential_temperature: jnp.ndarray   # th after every plume
+    specific_humidity: jnp.ndarray       # qv after every plume
+    heat: jnp.ndarray                    # total extensive change in sm
+    water: jnp.ndarray                   # total extensive change in qm
+    mass_flux: jnp.ndarray               # ccm, summed over plumes [kg/m^2]
+    precipitation: jnp.ndarray           # condpr, summed over plumes [kg/m^2]
+    plume_count: jnp.ndarray             # candidates that actually convected
+    cloud_top: jnp.ndarray               # highest level any plume reached
+
+
+def source_bottom(pressure: jnp.ndarray,
+                  source_top: jnp.ndarray) -> jnp.ndarray:
+    """``lmin0``: the lowest layer a plume based at ``source_top`` draws from.
+
+    ModelE walks up from the surface and stops at the first layer within 300 mb
+    of the base (``MSTCNV.F90:2646-2648``), so the plume blends the whole mixed
+    layer where it is shallow and a bounded slab where it is not. Where no layer
+    qualifies the source collapses to the base layer alone.
+    """
+    nlev = pressure.shape[0]
+    level = jnp.arange(nlev).reshape((nlev,) + (1,) * (pressure.ndim - 1))
+    top_pressure = jnp.sum(jnp.where(level == source_top, pressure, 0.0), axis=0)
+    within = (pressure - top_pressure) < _MAX_SOURCE_SPAN
+    return jnp.where(jnp.any(within, axis=0), jnp.argmax(within, axis=0),
+                     source_top)
+
+
+def convective_column(potential_temperature: jnp.ndarray,
+                      specific_humidity: jnp.ndarray,
+                      layer_mass: jnp.ndarray,
+                      exner: jnp.ndarray,
+                      pressure: jnp.ndarray,
+                      height: jnp.ndarray,
+                      cloud_base_mass: jnp.ndarray,
+                      boundary_layer_top: jnp.ndarray,
+                      highest_base: jnp.ndarray,
+                      timestep: jnp.ndarray,
+                      environment_condensate: jnp.ndarray = None,
+                      cloud_base_velocity: jnp.ndarray = _CLOUD_BASE_VELOCITY,
+                      entrainment_efficiency: jnp.ndarray = (
+                          _ENTRAINMENT_EFFICIENCY),
+                      max_plumes: int = None,
+                      phase: str = "water") -> ColumnConvection:
+    """Run every candidate plume in ModelE's order, carrying the environment.
+
+    Args:
+        potential_temperature: ``th`` [K], surface-first.
+        specific_humidity: ``qv`` [kg/kg].
+        layer_mass: ``ma`` [kg/m^2]. Held fixed: the compensating subsidence
+            exactly balances each plume's mass flux, so the air mass profile is
+            unchanged and only heat and water carry between plumes.
+        exner: ``plk``. See the module docstring on units.
+        pressure: [**Pa**].
+        height: ``zl`` [m].
+        cloud_base_mass: ``mplume`` for a plume based at each level [kg/m^2],
+            from the cloud-base closure. Zero means no plume there, and that
+            candidate is skipped.
+        boundary_layer_top: ``dcl``, the lowest candidate base.
+        highest_base: ``lmcm-1``, the highest candidate base.
+        timestep: ``dtsrc`` [s].
+        environment_condensate: ``qcl + qci``. Defaults to zero.
+        cloud_base_velocity: ``wbases(iplume)`` [m/s].
+        entrainment_efficiency: ``enteff``.
+        max_plumes: How many candidates to sweep, counting down from
+            ``highest_base``. Static, and the scan runs all of them whether or
+            not they convect, so it sets the cost. Defaults to every level.
+        phase: ``"water"`` or ``"ice"``. Static.
+
+    Returns:
+        A :class:`ColumnConvection`.
+
+    Note:
+        The sweep runs **downward**, from the highest candidate base to the
+        lowest, because `lessent_scheme = 2` reverses ModelE's loop
+        (``MSTCNV.F90:1452-1456``). The order is not cosmetic: a deep plume
+        stabilises the column before the shallower ones are tried, so running it
+        the other way lets the shallow plumes consume instability the deep one
+        should have had.
+    """
+    nlev = layer_mass.shape[0]
+    horiz = layer_mass.shape[1:]
+    level = jnp.arange(nlev).reshape((nlev,) + (1,) * len(horiz))
+    if environment_condensate is None:
+        environment_condensate = jnp.zeros_like(layer_mass)
+    if max_plumes is None:
+        max_plumes = nlev
+
+    # The scan carries the environment, so its dtype has to be the one the body
+    # produces. A host handing in single-precision state alongside anything
+    # double-precision would otherwise promote inside the loop and the carry
+    # would not typecheck.
+    dtype = jnp.result_type(potential_temperature, specific_humidity,
+                            layer_mass, exner, pressure, height,
+                            cloud_base_mass, environment_condensate)
+    potential_temperature = potential_temperature.astype(dtype)
+    specific_humidity = specific_humidity.astype(dtype)
+    layer_mass = layer_mass.astype(dtype)
+    exner = exner.astype(dtype)
+    pressure = pressure.astype(dtype)
+    height = height.astype(dtype)
+    cloud_base_mass = cloud_base_mass.astype(dtype)
+    environment_condensate = environment_condensate.astype(dtype)
+
+    def one_candidate(carry, offset):
+        theta, q, mass_flux, precipitation, count, top = carry
+        base = highest_base - offset
+        plume_mass = jnp.sum(
+            jnp.where(level == base, cloud_base_mass, 0.0), axis=0)
+        # A candidate outside the sweep, or one the closure gave no mass, does
+        # nothing. The scan still runs it -- the trip count has to be static --
+        # so its result is masked out rather than skipped.
+        convects = ((base >= boundary_layer_top) & (base <= highest_base)
+                    & (plume_mass > 0.0))
+        # A candidate that does not convect is still traced, so it must be
+        # given a well-posed plume rather than a zero-mass one: a zero-mass
+        # parcel has no temperature, the saturation adjustment divides by it,
+        # and the NaN survives being multiplied by zero afterwards. The dummy
+        # plume's result is discarded below.
+        plume_mass = jnp.where(convects, plume_mass, 1.0)
+
+        cycle = run_plume(
+            cloud_base=base + 1,
+            source_bottom=source_bottom(pressure, base),
+            source_top=base,
+            boundary_layer_top=boundary_layer_top,
+            cloud_base_mass=plume_mass,
+            potential_temperature=theta,
+            specific_humidity=q,
+            layer_mass=layer_mass,
+            exner=exner,
+            pressure=pressure,
+            height=height,
+            timestep=timestep,
+            environment_condensate=environment_condensate,
+            cloud_base_velocity=cloud_base_velocity,
+            entrainment_efficiency=entrainment_efficiency,
+            phase=phase)
+
+        def keep(value):
+            return jnp.where(convects, value, 0.0)
+
+        # `ma` is unchanged by construction, so the intensive update is just the
+        # extensive tendency divided by it.
+        theta = theta + keep(safe_divide(cycle.tendency.heat, layer_mass))
+        q = q + keep(safe_divide(cycle.tendency.water, layer_mass))
+        return (theta, q,
+                mass_flux + keep(cycle.tendency.interface_flux),
+                precipitation + keep(cycle.ascent.precipitation),
+                count + convects.astype(count.dtype),
+                jnp.maximum(top, jnp.where(convects, cycle.cloud_top, 0))), None
+
+    zeros = jnp.zeros_like(layer_mass)
+    scalar = jnp.zeros(horiz)
+    (theta, q, mass_flux, precipitation, count, top), _ = lax.scan(
+        one_candidate,
+        (potential_temperature, specific_humidity, zeros, zeros,
+         scalar, jnp.zeros(horiz, dtype=level.dtype)),
+        jnp.arange(max_plumes))
+
+    return ColumnConvection(
+        potential_temperature=theta,
+        specific_humidity=q,
+        heat=(theta - potential_temperature) * layer_mass,
+        water=(q - specific_humidity) * layer_mass,
+        mass_flux=mass_flux,
+        precipitation=precipitation,
+        plume_count=count,
+        cloud_top=top)
