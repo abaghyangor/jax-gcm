@@ -2400,3 +2400,80 @@ W1, with a target: the closure must come down by a factor of about 2.19, and
 `bisect_diag.txt` gives `SDN, SUP, QDN, QUP, SVDN, SVUP, DMSE1` at every
 iteration of all 832 calls to check it term by term. After that, raise
 `max_plumes` so the sweep runs every candidate base rather than one.
+
+## 34. W1 done: the closure spans a multi-layer source
+
+`cloud_base_closure` handles any `nlpi`. The three-level function it replaces is
+now its `nlpi = 1` special case, and a test asserts the general form reproduces
+it exactly when all the weight sits on one layer.
+
+Three things differ once the source spans more than one layer: the plume draws
+`fmp2*fpi(l)` from each; removing it makes the block subside internally, layer
+`l` carrying its own air down into `l-1` (`MSTCNV.F90:8945-8957`); and
+`SDN`/`QDN` become `fpi`-weighted blends of the updated layers. The Fortran's
+cascade walks down the block subtracting `fpi(l)` from a running total -- the
+flux crossing the bottom of layer `l` is `fmp2` times the weight *below* it,
+which vectorises as an exclusive cumulative sum, no scan needed.
+
+### The arithmetic is verified
+
+`bisect_diag.txt` dumps the closure's internals at every iteration of all 52
+calls, which allows checking the formulas **without needing ModelE's state**:
+
+| check | error |
+|---|---|
+| `FMP2 == FPLUME*AML(NLPI)` | 5.2e-07 relative |
+| `SVDN`/`SVUP` virtual-temperature form | implied condensate 2.4e-07 (BOMEX has none) |
+| `DMSE1` formula | 2.0e-04 absolute, on an O(1) quantity |
+
+All at the dump's own `es14.6` precision.
+
+### Effect on the harness
+
+| | before W1 | after W1 | target |
+|---|---|---|---|
+| closure / ModelE `mplume` | 2.185x | **1.696x** | 1.0 |
+| peak `dth` ratio | 2.110 | **1.773** | 1.0 |
+| `dth` rms ratio | 2.482 | **2.057** | 1.0 |
+| `dq` rms ratio | 2.279 | **1.854** | 1.0 |
+| `dth` / `dq` correlation | +0.873 / +0.861 | +0.870 / +0.859 | |
+
+### The residual is the input state, not the closure
+
+Everything the closure is *given* checks out, and the one thing it *derives*
+from the state does not:
+
+| quantity | ours / ModelE |
+|---|---|
+| `AML(NLPI)` (= `ma(lmin)`) | **exact** |
+| `PRESL(NLPI+1)` | **exact** |
+| `PLKL(NLPI+1)` | 0.999972 |
+| evaluation level `lmin` | **46/48 exact** |
+| `DQSUM0` | **0.910** (range 0.88-1.00) |
+
+`DQSUM0` is the lifted blend's supersaturation -- a difference of two
+near-equal saturation terms, so the 0.17% error in the harness's reconstructed
+sub-cloud humidity (section 30) is more than enough to move it 9%. `DMSE1` is
+the same kind of difference, and the bisection's sensitivity turns a few tenths
+of a Kelvin into a factor of order two in `fmp2`.
+
+**This is the third distinct place the same 0.17% has surfaced**: as a branch
+flip at cloud base (section 30), as sub-cloud tendency errors (section 32), and now
+as the closure's magnitude. It is one root cause, and it is in the bridge's
+state reconstruction (`th - dth_mc*dt` from the post-convection SUBDD output),
+not in the port.
+
+### What would settle it
+
+A dump of `sm`/`qm` as the closure sees them -- roughly fifteen lines of Fortran
+and a two-minute rebuild, the same procedure that produced `wbases`. Every
+remaining discrepancy in the port now traces to the reconstructed state, so
+that dump is worth more than any further work on the ported code.
+
+### Where the port stands
+
+All six work items are done. Every component agrees with its oracle at dump
+precision, the chain runs end to end, and with ModelE's own cloud-base masses it
+reproduces the tendencies at a peak ratio of 0.924 and rms ratios of 1.12 and
+1.03 (section 32). Driven by its own closure it is 1.77x strong, and that gap is
+now attributed rather than merely measured.
