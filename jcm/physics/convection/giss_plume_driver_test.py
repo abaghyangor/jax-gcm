@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from jcm.physics.convection import giss_plume_driver as drv
-from jcm.physics.convection.giss_thermodynamics import DELTX, RGAS
+from jcm.physics.convection.giss_thermodynamics import DELTX, LHE, RGAS, SHA
 
 jax.config.update("jax_enable_x64", True)
 
@@ -280,6 +280,128 @@ class RunPlumeTest(unittest.TestCase):
             # `atol` covers the entries that are exactly zero in the column and
             # land on XLA's vectorised rounding in the block; 1e-9 kg/m^2 is far
             # below anything the scheme resolves.
+            np.testing.assert_allclose(
+                np.asarray(b), np.broadcast_to(np.asarray(a)[:, None], b.shape),
+                rtol=1e-10, atol=1e-9)
+
+
+class SourceBottomTest(unittest.TestCase):
+    """`lmin0`: how deep a slab of boundary layer a plume may draw from."""
+
+    def _bottom(self, mb_per_layer, source_top, nlev=20):
+        pressure = jnp.asarray(
+            (1000.0 - mb_per_layer * np.arange(nlev, dtype=float)) * 100.0)
+        return int(drv.source_bottom(pressure, jnp.array(source_top)))
+
+    def test_a_shallow_column_draws_from_the_surface(self):
+        # 6 layers of 20 mb is 120 mb, well inside the limit.
+        self.assertEqual(self._bottom(20.0, 6), 0)
+
+    def test_a_deep_column_is_cut_off_at_300_mb(self):
+        # 60 mb layers: only levels within 300 mb of the base qualify.
+        self.assertEqual(self._bottom(60.0, 6), 2)
+
+    def test_the_base_layer_always_qualifies(self):
+        # Its own span is zero, so the source can never come out empty.
+        self.assertLessEqual(self._bottom(200.0, 4), 4)
+
+
+class ConvectiveColumnTest(unittest.TestCase):
+    """The sweep over candidate cloud bases, with the environment carried."""
+
+    NLEV = 20
+
+    def _run(self, bases=(4, 6), horiz=(), **over):
+        col = _column(horiz=horiz)
+        level = jnp.arange(self.NLEV).reshape(
+            (self.NLEV,) + (1,) * len(horiz))
+        mass = jnp.zeros_like(col["layer_mass"])
+        for b in bases:
+            mass = jnp.where(level == b, 40.0, mass)
+        args = dict(cloud_base_mass=mass, boundary_layer_top=jnp.array(3),
+                    highest_base=jnp.array(6), timestep=jnp.array(1800.0),
+                    max_plumes=6, **col)
+        args.update(over)
+        return col, drv.convective_column(**args)
+
+    def test_runs_and_is_finite(self):
+        _, r = self._run()
+        for field in (r.heat, r.water, r.mass_flux, r.precipitation,
+                      r.potential_temperature, r.specific_humidity):
+            self.assertTrue(bool(jnp.all(jnp.isfinite(field))))
+
+    def test_counts_the_plumes_that_convect(self):
+        _, r = self._run(bases=(4, 6))
+        self.assertEqual(int(r.plume_count), 2)
+        _, one = self._run(bases=(6,))
+        self.assertEqual(int(one.plume_count), 1)
+
+    def test_candidates_outside_the_sweep_do_not_fire(self):
+        # Level 1 is below `dcl` and level 9 above `highest_base`, so neither
+        # convects however much mass the closure hands them.
+        _, r = self._run(bases=(1, 9))
+        self.assertEqual(int(r.plume_count), 0)
+        self.assertEqual(float(jnp.sum(jnp.abs(r.heat))), 0.0)
+
+    def test_extra_candidates_are_no_ops(self):
+        # The trip count is static and set by `max_plumes`; sweeping more
+        # candidates than can convect must not change the answer.
+        _, few = self._run(max_plumes=6)
+        _, many = self._run(max_plumes=self.NLEV)
+        np.testing.assert_allclose(np.asarray(many.heat), np.asarray(few.heat),
+                                   rtol=1e-12, atol=1e-10)
+
+    def test_plumes_are_coupled_through_the_environment(self):
+        # This is the whole point of the sweep: each plume ascends through what
+        # its predecessors left behind, so the sequence is not the sum of the
+        # parts. If these ever agree, the environment is not being carried.
+        _, both = self._run(bases=(4, 6))
+        _, upper = self._run(bases=(6,))
+        _, lower = self._run(bases=(4,))
+        independent = np.asarray(upper.heat) + np.asarray(lower.heat)
+        self.assertGreater(
+            np.abs(independent - np.asarray(both.heat)).max(), 1.0)
+
+    def test_energy_closes_against_the_water_removed(self):
+        # The column's dry static energy gain is the latent heat of the water
+        # convection took out of it. Any mismatch beyond the condensate still
+        # aloft means heat or water is being created somewhere.
+        col, r = self._run()
+        sensible = float(jnp.sum(r.heat * col["exner"]))
+        latent = (LHE / SHA) * -float(jnp.sum(r.water))
+        self.assertAlmostEqual(sensible / latent, 1.0, delta=0.02)
+
+    def test_convection_warms_aloft_and_cools_below_cloud_base(self):
+        col, r = self._run()
+        dtheta = np.asarray(r.heat / col["layer_mass"])
+        self.assertLess(dtheta[:4].max(), 0.0)     # sub-cloud cooling
+        self.assertGreater(dtheta[7:14].max(), 0.0)   # cloud-layer heating
+
+    def test_gradient_is_finite(self):
+        col = _column()
+        level = jnp.arange(self.NLEV)
+        mass = jnp.where((level == 4) | (level == 6), 40.0, 0.0)
+
+        def loss(theta):
+            r = drv.convective_column(
+                potential_temperature=theta,
+                specific_humidity=col["specific_humidity"],
+                layer_mass=col["layer_mass"], exner=col["exner"],
+                pressure=col["pressure"], height=col["height"],
+                cloud_base_mass=mass, boundary_layer_top=jnp.array(3),
+                highest_base=jnp.array(6), timestep=jnp.array(1800.0),
+                max_plumes=6)
+            return jnp.sum(r.heat ** 2)
+
+        grad = jax.grad(loss)(col["potential_temperature"])
+        self.assertTrue(bool(jnp.all(jnp.isfinite(grad))))
+        self.assertGreater(float(jnp.sum(jnp.abs(grad))), 0.0)
+
+    def test_column_matches_broadcast_block(self):
+        _, single = self._run()
+        _, block = self._run(horiz=(3,))
+        for a, b in ((single.heat, block.heat), (single.water, block.water),
+                     (single.mass_flux, block.mass_flux)):
             np.testing.assert_allclose(
                 np.asarray(b), np.broadcast_to(np.asarray(a)[:, None], b.shape),
                 rtol=1e-10, atol=1e-9)
