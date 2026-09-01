@@ -64,9 +64,16 @@ from jcm.terrain import TerrainData
 from jcm.physics.modele.params import GissConvectionParameters
 from jcm.physics.modele.physics_data import GissConvectionData
 from jcm.physics.convection.giss_cloud_base import lifting_condensation_level
-from jcm.physics.convection.giss_mass_flux import cloud_base_mass_flux_column
+from jcm.physics.convection.giss_mass_flux import (
+    cloud_base_closure,
+    cloud_base_mass_flux_column,
+)
 from jcm.physics.convection.giss_plume import plume_ascent_column
-from jcm.physics.convection.giss_plume_driver import convective_column
+from jcm.physics.convection.giss_plume_driver import (
+    convective_column,
+    source_bottom,
+    source_weights,
+)
 from jcm.physics.convection.giss_tendencies import convective_tendencies
 from jcm.physics.convection.giss_thermodynamics import (
     GRAV,
@@ -548,9 +555,27 @@ class GissConvection(PhysicsTerm):
         # quantity validated against ModelE's ``cldmc`` (47/48 exact).
         closure_base = (cloud_base if blt is None
                         else jnp.clip(blt + 1, 0, nlev - 3))
-        _, fmp2 = cloud_base_closure_mass_flux(
-            t_sf, q_sf, p_sf, air_mass, closure_base,
-            boundary_layer_top=blt, source_dtheta=dtheta, source_dq=dq)
+
+        if self.bsort:
+            # `MASS_FLUX2` blends the source over `lmin0..lmin` rather than
+            # taking it from one layer, and works in ModelE's `th`/`plk` pair.
+            # The single-source form the other branch uses is the `nlpi = 1`
+            # special case, which this configuration never takes.
+            plk = (p_sf / 100.0) ** KAPA
+            theta_modele = t_sf / plk
+            lmin0 = source_bottom(p_sf, closure_base)
+            fpi = source_weights(
+                air_mass, lmin0, closure_base,
+                closure_base - 1 if blt is None else blt)
+            _, fmp2, _ = cloud_base_closure(
+                theta_modele, q_sf, air_mass, plk, p_sf, lmin0, closure_base,
+                fpi)
+            has_cloud = cloud_base < nlev
+            fmp2 = jnp.where(has_cloud, fmp2, 0.0)
+        else:
+            _, fmp2 = cloud_base_closure_mass_flux(
+                t_sf, q_sf, p_sf, air_mass, closure_base,
+                boundary_layer_top=blt, source_dtheta=dtheta, source_dq=dq)
         return cloud_base, fmp2, closure_base, blt
 
     def _plume_seed(self, diagnostics, theta_env, q_sf, air_mass, nlev):

@@ -49,6 +49,7 @@ from jcm.physics.convection.giss_thermodynamics import (
     saturation_specific_humidity,
     virtual_temperature,
 )
+from jcm.physics.convection.giss_thermodynamics import safe_divide as _safe_divide
 
 _DMSE_TOL = 1.0e-3   # neutrality band (K), matches the Fortran exit threshold
 _N_ITER = 9          # fixed bisection count, as in MASS_FLUX2
@@ -312,6 +313,194 @@ def cloud_base_mass_flux_column(theta, specific_humidity, air_mass, exner,
         qsat_new = saturation_specific_humidity(
             sup * exner_up1, pressure_up1, phase)
         dmse1 = (sv_up - sv_dn) * exner_up1 + slh * (qsat_new - qdn)
+
+        fplume = jnp.where(
+            dmse1 > _DMSE_TOL, fplume - dfp,
+            jnp.where(dmse1 < -_DMSE_TOL, fplume + dfp, fplume))
+
+    return fplume, fplume * mass_top, dmse1
+
+
+# --- General multi-source closure ---------------------------------------------
+#
+# `MASS_FLUX2` blends the plume's source over `nlpi` boundary-layer layers, not
+# one. The single-source form above is the `nlpi = 1` special case; BOMEX runs
+# `nlpi` between 6 and 9 in all 832 oracle closure calls, so it is the general
+# form that the model actually needs.
+#
+# Three things differ once `nlpi > 1`:
+#
+#   1. The plume's mass is drawn as `fmp2*fpi(l)` from each source layer rather
+#      than all from one, so the layers deplete in proportion to their weight.
+#   2. Removing that mass makes the source block subside internally: the flux
+#      crossing the bottom of layer `l` is what the layers at and above it gave
+#      up, and it carries layer `l`'s own properties down into `l-1`
+#      (`MSTCNV.F90:8945-8957`).
+#   3. `SDN`/`QDN` are `fpi`-weighted blends of the *updated* layers, so the
+#      closure's sensitivity to `fmp2` is spread across the block instead of
+#      concentrated in a single layer.
+#
+# `fmp2 = fplume*aml(nlpi)` throughout: the trial fraction scales the **top**
+# source layer's mass, however many layers the source spans.
+
+
+def cloud_base_closure(potential_temperature: jnp.ndarray,
+                       specific_humidity: jnp.ndarray,
+                       layer_mass: jnp.ndarray,
+                       exner: jnp.ndarray,
+                       pressure: jnp.ndarray,
+                       source_bottom: jnp.ndarray,
+                       source_top: jnp.ndarray,
+                       source_fraction: jnp.ndarray,
+                       condensate: jnp.ndarray = None,
+                       phase: str = "water"):
+    """``MASS_FLUX2`` for a source spanning any number of layers.
+
+    Args:
+        potential_temperature: ``th`` [K], surface-first, whole column. Units
+            follow ``MSTCNV``: paired with ``exner = (p in mb)**kappa``.
+        specific_humidity: ``qv`` [kg/kg].
+        layer_mass: ``ma`` [kg/m^2].
+        exner: ``plk``.
+        pressure: [**Pa**].
+        source_bottom: ``lmin0``.
+        source_top: ``lmin``. The closure scales its trial mass by *this*
+            layer's mass, and the two layers above it supply the compensating
+            subsidence, so the column must extend at least two levels higher.
+        source_fraction: ``fpi``, summing to one over the source block. Build it
+            with :func:`~jcm.physics.convection.giss_plume_driver.source_weights`.
+        condensate: ``qcl + qci`` [kg/kg], loading the virtual temperatures.
+            Defaults to zero.
+        phase: ``"water"`` or ``"ice"``. Static.
+
+    Returns:
+        ``(fplume, fmp2, dmse1)`` -- the trial fraction, the plume mass
+        ``fplume*ma(lmin)`` [kg/m^2], and the residual instability it stopped at.
+
+    Note:
+        The bisection usually does **not** converge to the ``|DMSE1| <= 1e-3``
+        band. Over the 832 BOMEX calls the final ``|dmse|`` has median 1.83 and
+        `fplume` lands on bisection lattice points, riding the ceiling: the sign
+        of ``DMSE1`` never flips for a column that stays unstable however much
+        mass is removed. Matching ModelE means reproducing that, not converging.
+    """
+    slh = LHE / SHA
+    nlev = layer_mass.shape[0]
+    horiz = layer_mass.shape[1:]
+    level = jnp.arange(nlev).reshape((nlev,) + (1,) * len(horiz))
+    if condensate is None:
+        condensate = jnp.zeros_like(layer_mass)
+
+    def at(index, field):
+        return jnp.sum(jnp.where(level == index, field, 0.0), axis=0)
+
+    mass_top = at(source_top, layer_mass)          # AML(NLPI)
+    mass_up = at(source_top + 1, layer_mass)       # AML(NLPI+1)
+    mass_up2 = at(source_top + 2, layer_mass)      # AML(NLPI+2)
+    exner_top = at(source_top, exner)
+    exner_up = at(source_top + 1, exner)
+    pressure_top = at(source_top, pressure)
+    pressure_up = at(source_top + 1, pressure)
+
+    in_source = (level >= source_bottom) & (level <= source_top)
+    fpi = jnp.where(in_source, source_fraction, 0.0)
+    fpibyaml = _safe_divide(fpi, layer_mass)
+
+    smo1 = potential_temperature * layer_mass
+    qmo1 = specific_humidity * layer_mass
+    smo2, qmo2 = at(source_top + 1, smo1), at(source_top + 1, qmo1)
+    smo3, qmo3 = at(source_top + 2, smo1), at(source_top + 2, qmo1)
+    wm_dn = jnp.sum(condensate * layer_mass * fpibyaml, axis=0)
+    wm_up = at(source_top + 1, condensate)
+
+    # The parcel that gets lifted is the blend, so the supersaturation it
+    # arrives with is set by the blend's properties, not the top layer's.
+    sdn0 = jnp.sum(smo1 * fpibyaml, axis=0)
+    qdn0 = jnp.sum(qmo1 * fpibyaml, axis=0)
+    tplift = exner_up * sdn0
+    qsatc0 = saturation_specific_humidity(tplift, pressure_up, phase)
+    dqsum0 = (qdn0 - qsatc0) / (
+        1.0 + slh * qsatc0 * d_ln_qsat_dt(tplift, phase))
+
+    # The re-evaporation slopes are per-layer, at the top source layer and the
+    # one above -- the two layers the evaporated water is put back into.
+    theta_top = at(source_top, potential_temperature)
+    q_top = at(source_top, specific_humidity)
+    t1 = exner_top * theta_top
+    qsatc1 = saturation_specific_humidity(t1, pressure_top, phase)
+    dq1 = (qsatc1 - q_top) / (1.0 + slh * qsatc1 * d_ln_qsat_dt(t1, phase))
+
+    theta_up = at(source_top + 1, potential_temperature)
+    q_up_env = at(source_top + 1, specific_humidity)
+    t2 = exner_up * theta_up
+    qsatc2 = saturation_specific_humidity(t2, pressure_up, phase)
+    dq2 = (qsatc2 - q_up_env) / (1.0 + slh * qsatc2 * d_ln_qsat_dt(t2, phase))
+
+    # `fm(l)`, the mass crossing the bottom of layer `l`, is what the layers at
+    # and above it gave up -- which is `fmp2` times the weight *below* `l`,
+    # since the weights sum to one. The Fortran reaches the same thing by
+    # walking down the block subtracting `fpi(l)` from a running total.
+    weight_below = jnp.cumsum(fpi, axis=0) - fpi
+    cascades = in_source & (level > source_bottom)
+
+    def shift_down(field):
+        """`field(l+1)`: what the layer above sends down into this one."""
+        return jnp.concatenate(
+            [field[1:], jnp.zeros((1,) + field.shape[1:], field.dtype)], axis=0)
+
+    fplume = jnp.broadcast_to(jnp.asarray(0.5), horiz).astype(layer_mass.dtype)
+    dfp = jnp.full_like(fplume, 0.5)
+    dmse1 = jnp.zeros_like(fplume)
+
+    for _ in range(_N_ITER):
+        dfp = dfp * 0.5
+        fmp2 = fplume * mass_top
+        frat1 = fmp2 / mass_up
+        frat2 = fmp2 / mass_up2
+
+        smn2 = smo2 * (1.0 - frat1) + frat2 * smo3
+        qmn2 = qmo2 * (1.0 - frat1) + frat2 * qmo3
+
+        # Each source layer gives up `fmp2*fpi(l)`; only the top one receives
+        # the subsidence inflow from the layer above the block.
+        smn1 = smo1 * (1.0 - fmp2 * fpibyaml)
+        qmn1 = qmo1 * (1.0 - fmp2 * fpibyaml)
+        smn1 = smn1 + jnp.where(level == source_top, frat1 * smo2, 0.0)
+        qmn1 = qmn1 + jnp.where(level == source_top, frat1 * qmo2, 0.0)
+
+        # Subsidence inside the block: layer `l` sends its own air down into
+        # `l-1`, carrying the original (pre-removal) properties.
+        flux = fmp2 * weight_below
+        heat_down = jnp.where(cascades, flux * potential_temperature, 0.0)
+        water_down = jnp.where(cascades, flux * specific_humidity, 0.0)
+        smn1 = smn1 - heat_down + shift_down(heat_down)
+        qmn1 = qmn1 - water_down + shift_down(water_down)
+
+        # Precip re-evaporation, into the layer above the block first and the
+        # top source layer second, capped by the available supersaturation.
+        dqsum = fmp2 * dqsum0
+        fevap = _FEVAP_FRAC * fplume
+        dq_a = jnp.where(dqsum > 0.0,
+                         jnp.minimum(fevap * mass_up * dq2, dqsum), 0.0)
+        smn2 = smn2 - slh * dq_a / exner_up
+        qmn2 = qmn2 + dq_a
+        dqsum = dqsum - dq_a
+
+        dq_b = jnp.where(dqsum > 0.0,
+                         jnp.minimum(fevap * mass_top * dq1, dqsum), 0.0)
+        smn1 = smn1 + jnp.where(level == source_top,
+                                -slh * dq_b / exner_top, 0.0)
+        qmn1 = qmn1 + jnp.where(level == source_top, dq_b, 0.0)
+
+        sdn = jnp.sum(smn1 * fpibyaml, axis=0)
+        qdn = jnp.sum(qmn1 * fpibyaml, axis=0)
+        sup = smn2 / mass_up
+        qup = qmn2 / mass_up
+        sv_dn = virtual_temperature(sdn, qdn, wm_dn)
+        sv_up = virtual_temperature(sup, qup, wm_up)
+        qsat_up = saturation_specific_humidity(sup * exner_up, pressure_up,
+                                               phase)
+        dmse1 = (sv_up - sv_dn) * exner_up + slh * (qsat_up - qdn)
 
         fplume = jnp.where(
             dmse1 > _DMSE_TOL, fplume - dfp,
