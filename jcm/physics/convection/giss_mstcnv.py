@@ -66,11 +66,13 @@ from jcm.physics.modele.physics_data import GissConvectionData
 from jcm.physics.convection.giss_cloud_base import lifting_condensation_level
 from jcm.physics.convection.giss_mass_flux import cloud_base_mass_flux_column
 from jcm.physics.convection.giss_plume import plume_ascent_column
+from jcm.physics.convection.giss_plume_driver import convective_column
 from jcm.physics.convection.giss_tendencies import convective_tendencies
 from jcm.physics.convection.giss_thermodynamics import (
     GRAV,
     KAPA,
     SHA,
+    safe_divide,
     saturation_specific_humidity,
 )
 
@@ -78,6 +80,11 @@ from jcm.physics.convection.giss_thermodynamics import (
 # ``theta*exner``, so the reference cancels and its specific value is arbitrary;
 # 1000 hPa is the conventional choice and matches the BOMEX validation.
 _P_REF = 100000.0
+
+# `MSTCNV` works in `th = theta/1000**kappa` against `plk = (p in mb)**kappa`,
+# so that `th*plk` is the temperature. This converts its potential temperature
+# back to the conventional one the rest of jcm uses.
+_MODELE_THETA_SCALE = 1000.0 ** KAPA
 
 # Plume-ascent constants used by the (allow_mc) tendency path. These are physical
 # tunables that should graduate to differentiable ``GissConvectionParameters``
@@ -238,6 +245,7 @@ class GissConvection(PhysicsTerm):
         self,
         params: GissConvectionParameters | None = None,
         allow_mc: bool = False,
+        bsort: bool = True,
     ):
         """Hold scheme parameters and the static moist-convection switch.
 
@@ -251,9 +259,16 @@ class GissConvection(PhysicsTerm):
                 only *diagnoses* cloud base + mass flux and returns zero
                 tendencies. It is a plain (non-differentiable) attribute -- a
                 trace-time code-path switch, so it is read with a Python ``if``.
+            bsort: Which scheme the ``allow_mc`` path runs. ``True`` (default)
+                uses the buoyancy-sorting port -- the plume spectrum ModelE
+                actually runs, with its downdraft and substepped subsidence.
+                ``False`` falls back to the earlier single entraining plume in
+                :mod:`giss_plume`, which is kept only so the two can be compared
+                against the same oracle. Static, like ``allow_mc``.
         """
         self.params = nnx.Param(params or GissConvectionParameters.default())
         self.allow_mc = allow_mc
+        self.bsort = bsort
 
     def __call__(
         self,
@@ -289,10 +304,14 @@ class GissConvection(PhysicsTerm):
         nlev = shape[0]
         nodal_shape = shape[1:]
 
-        cloud_base, fmp2, closure_base = self._diagnose(
+        cloud_base, fmp2, closure_base, boundary_layer_top = self._diagnose(
             state, diagnostics, nlev, nodal_shape)
 
-        if self.allow_mc:
+        if self.allow_mc and self.bsort:
+            dtemp_dt, dq_dt, dth_mc, dq_mc = self._bsort_tendencies(
+                state, diagnostics, closure_base, fmp2, boundary_layer_top,
+                nlev, nodal_shape, dtsrc)
+        elif self.allow_mc:
             dtemp_dt, dq_dt, dth_mc, dq_mc = self._convective_tendencies(
                 state, diagnostics, cloud_base, fmp2, nlev, nodal_shape, dtsrc)
         else:
@@ -309,6 +328,86 @@ class GissConvection(PhysicsTerm):
             cloud_base=cloud_base, cloud_base_mass_flux=fmp2,
             dth_mc=dth_mc, dq_mc=dq_mc)
         return tendency, {**diagnostics, "convection": convection}
+
+    def _bsort_tendencies(self, state, diagnostics, closure_base, fmp2,
+                          boundary_layer_top, nlev, nodal_shape, dtsrc):
+        """Convective tendencies from the buoyancy-sorting port.
+
+        Hands the column to
+        :func:`~jcm.physics.convection.giss_plume_driver.convective_column`,
+        which runs the plume, its downdraft and the substepped compensating
+        subsidence, and carries the environment between plumes. Works
+        **surface-first** and flips the result back for the ``PhysicsTendency``.
+
+        Two conversions matter. ``MSTCNV`` works in ``th = theta/1000**kappa``
+        against ``plk = (p in mb)**kappa``, so the potential temperature handed
+        in and the tendency handed back are both scaled; and geopotential
+        becomes height by dividing out gravity, where only differences are used
+        so the datum cancels.
+
+        Scope: **one cloud base.** ModelE sweeps every candidate from ``lmcm-1``
+        down to ``dcl``, running the closure at each. The ported closure
+        (:mod:`giss_mass_flux`) solves a single base, so only that one is swept
+        here. Widening it needs the ``nlpi > 1`` closure -- see
+        ``BSORT_PORT_PLAN.md`` W1 -- and until then a column that would support
+        several plumes gets only its deepest.
+
+        Needs ``pressure_full``/``layer_thickness``/``air_density``; without
+        them returns zeros.
+
+        Returns:
+            ``(dT/dt [K/s], dq/dt [g/kg/s])`` top-first, and
+            ``(dth_mc, dq_mc)`` surface-first per-step diagnostics, in the
+            conventional potential temperature and kg/kg the rest of the term
+            reports.
+        """
+        shape = state.temperature.shape
+        pressure_full = diagnostics.get("pressure_full")
+        thickness = diagnostics.get("layer_thickness")
+        density = diagnostics.get("air_density")
+        if pressure_full is None or thickness is None or density is None:
+            zero2d = jnp.zeros(shape)
+            zero3d = jnp.zeros((nlev,) + nodal_shape)
+            return zero2d, zero2d, zero3d, zero3d
+
+        p = jnp.flip(pressure_full, axis=0)
+        t = jnp.flip(state.temperature, axis=0)
+        q = jnp.flip(state.specific_humidity, axis=0) / 1000.0
+        layer_mass = jnp.flip(density, axis=0) * jnp.flip(thickness, axis=0)
+        # `zl = gz*bygrav` (ATM_UTILS.f:874). Only differences are used -- the
+        # layer depth and the 1 km lag lookback -- so the datum does not matter.
+        height = jnp.flip(state.geopotential, axis=0) / GRAV
+
+        exner_modele = (p / 100.0) ** KAPA
+        theta_modele = t / exner_modele
+
+        levels = jnp.arange(nlev).reshape((nlev,) + (1,) * len(nodal_shape))
+        base = jnp.clip(closure_base, 1, nlev - 3)
+        cloud_base_mass = jnp.where(levels == base, fmp2, 0.0)
+        # `dcl` comes from the turbulence scheme in ModelE (`smixlev`); with no
+        # such diagnostic the layer below the plume's root is the best stand-in,
+        # and it is what bounds both the source draw and the downdraft.
+        blt = base - 1 if boundary_layer_top is None else boundary_layer_top
+
+        column = convective_column(
+            potential_temperature=theta_modele,
+            specific_humidity=q,
+            layer_mass=layer_mass,
+            exner=exner_modele,
+            pressure=p,
+            height=height,
+            cloud_base_mass=cloud_base_mass,
+            boundary_layer_top=blt,
+            highest_base=base,
+            timestep=dtsrc,
+            max_plumes=1)
+
+        dth_mc = safe_divide(column.heat, layer_mass) * _MODELE_THETA_SCALE
+        dq_mc = safe_divide(column.water, layer_mass)
+        exner = (p / _P_REF) ** KAPA
+        dtemp_dt = jnp.flip(dth_mc * exner / dtsrc, axis=0)
+        dq_dt = jnp.flip(dq_mc * 1000.0 / dtsrc, axis=0)
+        return dtemp_dt, dq_dt, dth_mc, dq_mc
 
     def _convective_tendencies(self, state, diagnostics, cloud_base, fmp2,
                                nlev, nodal_shape, dtsrc):
@@ -415,7 +514,7 @@ class GissConvection(PhysicsTerm):
         pressure_full = diagnostics.get("pressure_full")
         if pressure_full is None:
             sentinel = jnp.full(nodal_shape, nlev, dtype=int)
-            return sentinel, jnp.zeros(nodal_shape), sentinel
+            return sentinel, jnp.zeros(nodal_shape), sentinel, None
 
         # Surface-first profiles (JCM state is top-first); humidity g/kg -> kg/kg.
         p_sf = jnp.flip(pressure_full, axis=0)
@@ -427,7 +526,7 @@ class GissConvection(PhysicsTerm):
         thickness = diagnostics.get("layer_thickness")
         density = diagnostics.get("air_density")
         if thickness is None or density is None:
-            return cloud_base, jnp.zeros(nodal_shape), cloud_base
+            return cloud_base, jnp.zeros(nodal_shape), cloud_base, None
 
         air_mass = jnp.flip(density, axis=0) * jnp.flip(thickness, axis=0)
         blt, dtheta, dq = self._source_parcel_inputs(
@@ -452,7 +551,7 @@ class GissConvection(PhysicsTerm):
         _, fmp2 = cloud_base_closure_mass_flux(
             t_sf, q_sf, p_sf, air_mass, closure_base,
             boundary_layer_top=blt, source_dtheta=dtheta, source_dq=dq)
-        return cloud_base, fmp2, closure_base
+        return cloud_base, fmp2, closure_base, blt
 
     def _plume_seed(self, diagnostics, theta_env, q_sf, air_mass, nlev):
         """Source parcel and updraft seed for the plume ascent.
