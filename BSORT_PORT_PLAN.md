@@ -2258,3 +2258,83 @@ gained a trade inversion, so it tests the physics rather than the boundary.
 *This is the second time a conservation test has caught a missing termination
 dump -- the downdraft's `ldmin` remainder in §27 was the first. Both ends of
 every circulation need one.*
+
+## 32. W5 done: the plume sequence, and the first end-to-end measurement
+
+`convective_column` sweeps candidate cloud-base levels and applies each plume
+before the next begins. Under `lessent_scheme = 2` the spectrum loop collapses
+to a single plume, so this is one descending sweep from `lmcm-1` to `dcl`
+rather than two nested loops.
+
+**The plumes are coupled.** Each ascends through what its predecessors left
+behind, so the sequence is not the sum of the parts -- a test asserts the two
+differ, because if they ever agree the environment is not being carried.
+
+**`ma` does not carry.** The compensating subsidence exactly cancels each
+plume's mass flux: `cm(l) = cm(l-1) - dm - dmr` makes the per-level mass
+tendency identically zero, and ModelE never reassigns `MA` inside the loop. Only
+heat and water change between plumes.
+
+Also ports `lmin0` -- the lowest layer within 300 mb of the base
+(`MSTCNV.F90:2646-2648`), which is why BOMEX always draws from the surface.
+
+### Two traps from the fixed trip count
+
+JAX needs a static trip count, so every candidate is traced whether it convects
+or not, and both of these are consequences:
+
+* A non-convecting candidate must be given a **dummy 1 kg/m^2 plume**, not a
+  zero-mass one. A zero-mass parcel has no temperature, the saturation
+  adjustment divides by it, and the NaN survives being multiplied by zero.
+  `jnp.where` on the output is not enough; the input has to be well-posed.
+* The scan carry is cast to the **promoted dtype** up front. A host mixing
+  single-precision state with anything double-precision otherwise promotes
+  inside the loop and the carry fails to typecheck -- which is exactly what
+  happened the first time the oracle column was fed in.
+
+### First end-to-end measurement of the port
+
+All 48 BOMEX periods, the whole chain, driven with the oracle's cloud-base
+masses so the unported closure is **not** part of the measurement:
+
+| | value |
+|---|---|
+| plume count vs ModelE | **48/48** |
+| `dth_mc` correlation | **+0.8169** (rms ratio 1.120) |
+| `dq_mc` correlation | **+0.8380** (rms ratio 1.031) |
+| median peak heating ratio | **0.924** |
+
+| level | dth ours / ModelE | dq ours / ModelE |
+|---|---|---|
+| 0 | -2.44 / -1.63 | +0.28 / -1.14 |
+| 4 | 5.39 / 6.13 | -17.83 / -22.03 |
+| 5 | 4.18 / 4.27 | -8.32 / -6.88 |
+| 6 | 5.05 / 5.28 | +0.93 / -0.34 |
+| 7 | 5.50 / 5.65 | +1.01 / +0.53 |
+
+**These are not comparable to §24's +0.7517 / +0.6051 / 1.87x.** Those were the
+*old* scheme, free-running with its own closure over the same periods. This run
+holds the closure at ModelE's values, so it measures the ported physics alone.
+Putting the two side by side would credit the port for the closure being exact.
+
+What it does show: the mid-level heating and drying track closely, and the peak
+heating ratio is 0.924 rather than an order-of-magnitude miss. The sub-cloud
+layers remain the weak point -- cooling about 1.5x too strong, and moistening
+where ModelE dries -- which is the same signature §30 traced to the 0.17% error
+in the reconstructed sub-cloud humidity.
+
+### A unit trap in the oracle reader
+
+`oracle.read_convection_field(..., "dq_mc")` returns **kg/kg/day**, not
+g/kg/day; `bomex_compare_plots` scales it by 1000 internally. Compared without
+that factor the oracle appears to dry a thousand times too slowly. The tell was
+that `|dq|/|dth|` came out at a constant 0.0025 across all 48 periods -- a fixed
+ratio between two independent fields is a unit error, never physics.
+
+### Next
+
+W6 rewires `GissConvection` onto `convective_column`, at which point the
+harness measures the port instead of the old scheme. W1 (`nlpi > 1`) is the
+remaining piece before the closure can come from the model rather than the
+oracle, and until it does, every number above depends on oracle-supplied
+cloud-base mass.
