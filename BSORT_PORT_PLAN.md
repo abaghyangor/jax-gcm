@@ -2618,3 +2618,60 @@ is written per plume and `dth_mc` only per step.
 The dump that would settle it is `sm`/`qm` after each plume's
 `apply_continuity_tendencies`, which would let the sweep be checked plume by
 plume instead of only at its end.
+
+## 37. Per-plume comparison: the column budget does not balance
+
+`sweep_state_diag.txt` (unit 769) writes the environment after every
+`apply_continuity_tendencies`, in sweep order. That gives ModelE's **per-plume**
+tendency, which nothing before it did -- `dth_mc` is a step total and
+`continuity_diag.txt` gives increments without the state they land on.
+
+### It settles the composition question
+
+**44 of the 48 BOMEX steps run exactly one plume**; only 4 run two. So the
+sub-cloud disagreement cannot be about how the sweep composes plumes, which
+section 36 had left open as the leading possibility.
+
+### The per-plume tendency, 44 single-plume steps
+
+Driven from ModelE's own pre-plume state (`closure_state_diag.txt`) and compared
+against its own post-plume state:
+
+| level | `dth` ours / ModelE | `dq` ours / ModelE |
+|---|---|---|
+| 0 | -2.254 / -1.501 | **+0.118 / -1.137** |
+| 1 | -1.724 / -1.186 | -0.328 / -1.689 |
+| 2 | -1.093 / -1.245 | -0.794 / -1.339 |
+| 3 | +0.130 / -0.436 | -3.747 / -4.820 |
+| 4 | 7.044 / 6.640 | -22.037 / -22.977 |
+| 5 | 5.501 / 4.268 | -7.646 / -5.712 |
+
+Cloud base and above track well; the lowest two levels do not, and level 0's
+moisture tendency has the wrong sign.
+
+### It is not redistribution
+
+Column-integrated, per plume:
+
+| | ours | ModelE |
+|---|---|---|
+| water [kg/m^2] | **-0.036** | **-0.077** |
+| heat [K kg/m^2] | **+9.70** | **+5.57** |
+
+The port removes **half** the water and adds **1.74x** the heat. A profile that
+differed only in shape would integrate to the same totals, so this is a source
+or sink, not the advection -- which is consistent with section 36 having found the
+advection state, the interface flux and every exchange term correct.
+
+### What that rules out, and what it leaves
+
+Ruled out across sections 36 and 37: the clear-air evaporation (10% weak), the
+downdraft's temperature (1.6 K warm) and humidity (drier), the `fevap` formula,
+the per-level exchange terms, the interface flux, the advection state, and the
+sweep composition.
+
+What is left is where the plume's water *goes*: precipitated, detrained as
+condensate, or returned as vapour. ModelE routes twice as much of it out of the
+vapour budget as the port does, and releases proportionally less heat doing so.
+`condpr` and the detrained condensate are the two sinks to compare, and neither
+is yet dumped as a per-plume column total.
