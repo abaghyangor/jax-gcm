@@ -2551,3 +2551,70 @@ attributable to either.
 *Standing lesson, now three times over: when a ratio comes out at a clean
 constant -- 2.185 tracking a 2.11 heating ratio, `|dq|/|dth|` at 0.0025, `fmp2`
 at exactly 2.00000 -- look for a missing factor before looking for physics.*
+
+## 36. The sub-cloud layers: the per-plume operator is not the problem
+
+The last structured disagreement is sub-cloud: level 0 cools 2.46 K/day against
+ModelE's 1.63, and moistens 0.19 g/kg/day where ModelE dries 1.14. Four
+candidates were tested against the oracle and three were eliminated.
+
+### Eliminated
+
+| candidate | measurement | verdict |
+|---|---|---|
+| rain evaporating into clear air | `dqm_evp` ours 0.001641 vs 0.001815 at level 0 | **10% weaker** than ModelE -- would cool and moisten *less* |
+| downdraft temperature | `thdn` 41.2565 vs 41.0369, i.e. ~1.6 K **warmer** at the surface | detrains warmer air -- cools *less* |
+| downdraft humidity | `qldn` 0.015211 vs 0.015427, **drier** | moistens *less* |
+| `fevap` formula | matches `MSTCNV.F90:4228-4242`; `geometric_fevapfac = 0` in the active preset | correct |
+
+All three physical candidates point the *wrong way*: each would make the
+sub-cloud tendency weaker, not stronger.
+
+### The per-plume operator is right
+
+Teacher-forcing a single plume with the oracle's own inputs and comparing every
+sub-cloud term against `continuity_diag.txt`:
+
+| term | agreement at levels 0-5 |
+|---|---|
+| `dsmr` (removal heat) | 0.5% |
+| `dqmr` (removal water) | ~1% |
+| `dsm` (deposited heat) | ~2% |
+| `dqm` (deposited water) | ~2% |
+| `cm` (interface flux) | 0.03% |
+| advection-state `th` | **0.004%** |
+| advection-state `qv` | **0.07%** |
+
+The state the subsidence advects, and the flux that advects it, both reproduce
+ModelE. Whatever is wrong is not in the tendency operator.
+
+### A comparison that was not valid
+
+Much of this section was initially read off a comparison of **one plume's**
+tendency against the SUBDD total for a **two-plume step** -- -2.19 against
+-3.95, which looked like severe under-cooling and pointed at entirely the wrong
+things. `dth_mc` is the step total over every plume; a single-plume result can
+only be compared against the summed continuity dump, never against SUBDD.
+
+### An interaction worth knowing
+
+Adding the `tstar`/`qstar` enhancement improved the self-consistent harness
+(peak 1.773 -> 1.286) but *worsened* the run driven with ModelE's cloud-base
+masses pinned (0.924 -> 1.266, section 32). That is not a contradiction: pinning
+ModelE's `mplume` while enriching the parcel breaks the consistency between
+closure and parcel that ModelE maintains. The oracle-pinned diagnostic was a
+clean measurement of the ported physics only while the parcel matched ModelE's;
+now that both the parcel and the closure are ported, the self-consistent harness
+is the meaningful one.
+
+### Where that leaves it
+
+Every per-plume component is verified against its own oracle, and the plume
+count matches 48/48. The residual sub-cloud discrepancy is therefore in how the
+sweep composes plumes, or in a term ModelE applies once per step rather than per
+plume -- neither of which the current dumps resolve, since `continuity_diag.txt`
+is written per plume and `dth_mc` only per step.
+
+The dump that would settle it is `sm`/`qm` after each plume's
+`apply_continuity_tendencies`, which would let the sweep be checked plume by
+plume instead of only at its end.
