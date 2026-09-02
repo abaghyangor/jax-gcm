@@ -2477,3 +2477,77 @@ precision, the chain runs end to end, and with ModelE's own cloud-base masses it
 reproduces the tendencies at a peak ratio of 0.924 and rms ratios of 1.12 and
 1.03 (section 32). Driven by its own closure it is 1.77x strong, and that gap is
 now attributed rather than merely measured.
+
+## 35. The closure-state dump, and three missing terms
+
+Section 34 attributed the closure's residual to the harness's reconstructed
+state. Dumping what the closure actually sees (`closure_state_diag.txt`, unit
+770: both the raw `sm`/`qm` and the enhanced `smo1`/`qmo1`, plus `fpi`, `aml`,
+`plkl`, `presl`, `tstar`, `qstar`) showed that attribution was **wrong**, and
+found three terms the port was missing.
+
+### The reconstruction was never the problem
+
+| | ours / ModelE |
+|---|---|
+| `th` | 1.000029 (**+0.003%**) |
+| `qv` | 1.000503 (**+0.050%**) |
+
+The 0.17% of section 30 was a *blend* comparison, and what it was really seeing
+was the missing enhancement below.
+
+### Three terms, all in ModelE, none in the port
+
+1. **Surface-flux enhancement** (`MSTCNV.F90:2725-2746`). `tstar` and `qstar`
+   are added to every source layer at or below `dcl` before the closure or the
+   plume sees it; the moisture term is capped at half the layer's humidity and
+   the environment is left untouched. On BOMEX it is **1.06% of the source
+   humidity** -- twenty times the reconstruction error. `giss_mstcnv` already
+   computed the scales (`surface_flux_scales` matches ModelE's `tstar`/`qstar`
+   to 0.49%); the bsort path just never applied them.
+2. **`tadj` relaxation** (`MSTCNV.F90:2820`). `FMP2 = FMP2*min(1, dtime/tadj)`,
+   inside the closure and before ModelE's own dump. At `dtsrc = 1800` and
+   `tadj = 3600` that is exactly one half.
+3. **Saturation guard** (`MSTCNV.F90:2804`). ModelE returns before the
+   bisection when the lifted blend never saturates. **51 of the 98** BOMEX
+   closure calls take that exit; without the guard the port returns a mass flux
+   for columns ModelE declines to convect at all.
+
+The `tadj` factor was diagnosable only because the dump made an exact-input
+comparison possible: the ratio came out at **2.00000**, and a clean integer
+ratio is a missing constant, never physics -- the same tell as the constant
+`|dq|/|dth|` in section 32.
+
+### The closure now reproduces ModelE
+
+Driven with ModelE's exact `smo1`/`qmo1`/`fpi`/`aml`:
+
+| | |
+|---|---|
+| ratio median | **1.000000** |
+| within 0.1% | 23/47 |
+| within 1% | 43/47 |
+
+### End to end on the harness
+
+| | W6 | after W1 | now |
+|---|---|---|---|
+| peak `dth` ratio | 2.110 | 1.773 | **1.286** |
+| `dth` rms ratio | 2.482 | 2.057 | **1.398** |
+| `dq` rms ratio | 2.279 | 1.854 | **1.191** |
+| `dth` correlation | +0.873 | +0.870 | +0.862 |
+| `dq` correlation | +0.861 | +0.859 | +0.849 |
+
+At the heating peak, level 4 now gives 7.06 against 6.13 K/day and **-22.41
+against -22.03 g/kg/day**.
+
+### What is left
+
+The sub-cloud layers: level 0 cools 3.44 against ModelE's 1.63 and moistens
+slightly where ModelE dries 1.14. That is the last structured disagreement, and
+with the closure and the state both now accounted for it is no longer
+attributable to either.
+
+*Standing lesson, now three times over: when a ratio comes out at a clean
+constant -- 2.185 tracking a 2.11 heating ratio, `|dq|/|dth|` at 0.0025, `fmp2`
+at exactly 2.00000 -- look for a missing factor before looking for physics.*
