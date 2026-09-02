@@ -67,6 +67,11 @@ _CCMUL = 2.0
 # active preset sets, so the boost is inert and kept only to name the term.
 _QBOOST = 1.0
 
+# `mc_tqstar_fac`, scaling the surface-flux enhancement of the source parcel.
+# 1.0 in the active preset (MSTCNV.F90:299); the cold-pool factor
+# `(1 - 2*wtcp*(1-wtcp))` that multiplies it is 1.0 with no cold pool.
+_TQSTAR_FACTOR = 1.0
+
 
 class ColumnGeometry(NamedTuple):
     """Profiles ``MSTCNV`` derives from the column before any plume runs."""
@@ -164,13 +169,59 @@ def source_weights(layer_mass: jnp.ndarray,
     return safe_divide(weight, jnp.sum(weight, axis=0))
 
 
+def enhanced_source(potential_temperature: jnp.ndarray,
+                    specific_humidity: jnp.ndarray,
+                    exner: jnp.ndarray,
+                    boundary_layer_top: jnp.ndarray,
+                    source_dtheta: jnp.ndarray = 0.0,
+                    source_dq: jnp.ndarray = 0.0,
+                    factor: jnp.ndarray = _TQSTAR_FACTOR):
+    """Warm and moisten the sub-cloud source by the surface-flux scales.
+
+    ``MSTCNV`` adds ``tstar`` and ``qstar`` to every source layer at or below
+    ``dcl`` before either the closure or the plume sees it, and leaves the
+    environment itself untouched (``MSTCNV.F90:2725-2746``). The moisture term
+    is capped at half the layer's own humidity so a strongly forced surface
+    cannot run away with the parcel.
+
+    It is a small term that matters more than its size: on BOMEX it adds 1.06%
+    to the source humidity, and the closure's ``DQSUM0`` and ``DMSE1`` are both
+    differences of near-equal saturation terms, so a percent on the source moves
+    them by several.
+
+    Args:
+        potential_temperature: ``th``, the environment.
+        specific_humidity: ``qv``, the environment.
+        exner: ``plk``. ``tstar`` is a temperature, so it enters ``th`` divided
+            by the Exner function.
+        boundary_layer_top: ``dcl``. Layers above it get nothing.
+        source_dtheta: ``tstar`` [K].
+        source_dq: ``qstar`` [kg/kg].
+        factor: ``mc_tqstar_fac`` times the cold-pool factor.
+
+    Returns:
+        ``(potential_temperature, specific_humidity)`` for the source draw only.
+    """
+    nlev = potential_temperature.shape[0]
+    level = jnp.arange(nlev).reshape(
+        (nlev,) + (1,) * (potential_temperature.ndim - 1))
+    enhanced = level <= boundary_layer_top
+    dtheta = factor * source_dtheta / exner
+    dq = jnp.minimum(factor * source_dq, 0.5 * specific_humidity)
+    return (potential_temperature + jnp.where(enhanced, dtheta, 0.0),
+            specific_humidity + jnp.where(enhanced, dq, 0.0))
+
+
 def source_parcel(potential_temperature: jnp.ndarray,
                   specific_humidity: jnp.ndarray,
                   layer_mass: jnp.ndarray,
                   plume_mass: jnp.ndarray,
                   source_bottom: jnp.ndarray,
                   source_top: jnp.ndarray,
-                  boundary_layer_top: jnp.ndarray):
+                  boundary_layer_top: jnp.ndarray,
+                  exner: jnp.ndarray = None,
+                  source_dtheta: jnp.ndarray = 0.0,
+                  source_dq: jnp.ndarray = 0.0):
     """Draw the plume out of the sub-cloud layers.
 
     ModelE removes ``mplume*fpi(l)`` from each source layer and gives the plume
@@ -185,6 +236,12 @@ def source_parcel(potential_temperature: jnp.ndarray,
     fpi = source_weights(layer_mass, source_bottom, source_top,
                          boundary_layer_top)
     source_removal = plume_mass * fpi
+    # The parcel is drawn from the *enhanced* source, but the mass comes out of
+    # the untouched environment, so only the properties are boosted.
+    if exner is not None:
+        potential_temperature, specific_humidity = enhanced_source(
+            potential_temperature, specific_humidity, exner,
+            boundary_layer_top, source_dtheta, source_dq)
     heat = jnp.sum(source_removal * potential_temperature, axis=0)
     water = jnp.sum(source_removal * specific_humidity, axis=0) * _QBOOST
     return source_removal, heat, water, jnp.zeros_like(heat)
@@ -236,6 +293,8 @@ def run_plume(cloud_base: jnp.ndarray,
               environment_condensate: jnp.ndarray = None,
               cloud_base_velocity: jnp.ndarray = _CLOUD_BASE_VELOCITY,
               entrainment_efficiency: jnp.ndarray = _ENTRAINMENT_EFFICIENCY,
+              source_dtheta: jnp.ndarray = 0.0,
+              source_dq: jnp.ndarray = 0.0,
               phase: str = "water") -> PlumeCycle:
     """Run one plume and return what it does to the environment.
 
@@ -269,7 +328,8 @@ def run_plume(cloud_base: jnp.ndarray,
 
     removal, parcel_heat, parcel_water, parcel_condensate = source_parcel(
         potential_temperature, specific_humidity, layer_mass, cloud_base_mass,
-        source_bottom, source_top, boundary_layer_top)
+        source_bottom, source_top, boundary_layer_top, exner=exner,
+        source_dtheta=source_dtheta, source_dq=source_dq)
 
     # `plume_ascent` takes its seed already condensed -- it skips the arrival
     # processing at the base level, because that is where ModelE's ascent loop
@@ -421,6 +481,8 @@ def convective_column(potential_temperature: jnp.ndarray,
                       cloud_base_velocity: jnp.ndarray = _CLOUD_BASE_VELOCITY,
                       entrainment_efficiency: jnp.ndarray = (
                           _ENTRAINMENT_EFFICIENCY),
+                      source_dtheta: jnp.ndarray = 0.0,
+                      source_dq: jnp.ndarray = 0.0,
                       max_plumes: int = None,
                       phase: str = "water") -> ColumnConvection:
     """Run every candidate plume in ModelE's order, carrying the environment.
@@ -516,6 +578,8 @@ def convective_column(potential_temperature: jnp.ndarray,
             environment_condensate=environment_condensate,
             cloud_base_velocity=cloud_base_velocity,
             entrainment_efficiency=entrainment_efficiency,
+            source_dtheta=source_dtheta,
+            source_dq=source_dq,
             phase=phase)
 
         def keep(value):

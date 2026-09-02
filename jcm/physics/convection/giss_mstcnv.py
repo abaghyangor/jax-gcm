@@ -71,6 +71,7 @@ from jcm.physics.convection.giss_mass_flux import (
 from jcm.physics.convection.giss_plume import plume_ascent_column
 from jcm.physics.convection.giss_plume_driver import (
     convective_column,
+    enhanced_source,
     source_bottom,
     source_weights,
 )
@@ -337,7 +338,7 @@ class GissConvection(PhysicsTerm):
         return tendency, {**diagnostics, "convection": convection}
 
     def _bsort_tendencies(self, state, diagnostics, closure_base, fmp2,
-                          boundary_layer_top, nlev, nodal_shape, dtsrc):
+                          boundary_layer_top, nlev, nodal_shape, dtsrc):  # noqa: D401
         """Convective tendencies from the buoyancy-sorting port.
 
         Hands the column to
@@ -395,6 +396,10 @@ class GissConvection(PhysicsTerm):
         # such diagnostic the layer below the plume's root is the best stand-in,
         # and it is what bounds both the source draw and the downdraft.
         blt = base - 1 if boundary_layer_top is None else boundary_layer_top
+        # The plume's own source parcel is drawn from `smo1` too, so it carries
+        # the same surface-flux enhancement the closure saw.
+        _, source_dtheta, source_dq = self._source_parcel_inputs(
+            diagnostics, q, jnp.flip(density, axis=0)[0], nlev)
 
         column = convective_column(
             potential_temperature=theta_modele,
@@ -407,6 +412,8 @@ class GissConvection(PhysicsTerm):
             boundary_layer_top=blt,
             highest_base=base,
             timestep=dtsrc,
+            source_dtheta=source_dtheta,
+            source_dq=source_dq,
             max_plumes=1)
 
         dth_mc = safe_divide(column.heat, layer_mass) * _MODELE_THETA_SCALE
@@ -564,12 +571,16 @@ class GissConvection(PhysicsTerm):
             plk = (p_sf / 100.0) ** KAPA
             theta_modele = t_sf / plk
             lmin0 = source_bottom(p_sf, closure_base)
-            fpi = source_weights(
-                air_mass, lmin0, closure_base,
-                closure_base - 1 if blt is None else blt)
+            bl_top = closure_base - 1 if blt is None else blt
+            fpi = source_weights(air_mass, lmin0, closure_base, bl_top)
+            # `MASS_FLUX2` runs on `smo1`/`qmo1`, which are the environment
+            # *after* the surface-flux enhancement, so the closure gets the
+            # boosted source rather than the raw column.
+            theta_src, q_src = enhanced_source(
+                theta_modele, q_sf, plk, bl_top, dtheta, dq)
             _, fmp2, _ = cloud_base_closure(
-                theta_modele, q_sf, air_mass, plk, p_sf, lmin0, closure_base,
-                fpi)
+                theta_src, q_src, air_mass, plk, p_sf, lmin0, closure_base,
+                fpi, timestep=self.params.get_value().dtsrc)
             has_cloud = cloud_base < nlev
             fmp2 = jnp.where(has_cloud, fmp2, 0.0)
         else:
