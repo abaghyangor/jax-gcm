@@ -55,6 +55,9 @@ _DMSE_TOL = 1.0e-3   # neutrality band (K), matches the Fortran exit threshold
 _N_ITER = 9          # fixed bisection count, as in MASS_FLUX2
 _FEVAP_FRAC = 0.005  # precip re-evaporation fraction of FPLUME (Fortran FEVAP)
 _TEENY = 1.0e-20     # guards divisions at masked (zero-mass) levels
+# `tadjmc(1)`, the cloud-base adjustment timescale (MSTCNV.F90:286). One hour,
+# so a half-hour physics step applies half the neutralising mass flux.
+_TADJ_SECONDS = 3600.0
 
 
 def cloud_base_mass_flux(theta, specific_humidity, air_mass, exner, pressure,
@@ -353,6 +356,8 @@ def cloud_base_closure(potential_temperature: jnp.ndarray,
                        source_top: jnp.ndarray,
                        source_fraction: jnp.ndarray,
                        condensate: jnp.ndarray = None,
+                       timestep: jnp.ndarray = None,
+                       adjustment_time: jnp.ndarray = _TADJ_SECONDS,
                        phase: str = "water"):
     """``MASS_FLUX2`` for a source spanning any number of layers.
 
@@ -371,11 +376,22 @@ def cloud_base_closure(potential_temperature: jnp.ndarray,
             with :func:`~jcm.physics.convection.giss_plume_driver.source_weights`.
         condensate: ``qcl + qci`` [kg/kg], loading the virtual temperatures.
             Defaults to zero.
+        timestep: ``dtime`` [s]. ``MSTCNV`` relaxes the neutralising mass flux
+            over ``tadj`` rather than applying all of it in one step --
+            ``FMP2 = FMP2*min(1, dtime/tadj)`` (``MSTCNV.F90:2820``) -- so at the
+            default half-hour step and one-hour ``tadj`` only half of it is
+            applied. Omitting this returns the unrelaxed flux, which is twice
+            what ModelE reports.
+        adjustment_time: ``tadj`` [s], one hour in the active preset.
         phase: ``"water"`` or ``"ice"``. Static.
 
     Returns:
         ``(fplume, fmp2, dmse1)`` -- the trial fraction, the plume mass
-        ``fplume*ma(lmin)`` [kg/m^2], and the residual instability it stopped at.
+        ``fplume*ma(lmin)`` [kg/m^2] after the ``tadj`` relaxation, and the
+        residual instability it stopped at. ``fmp2`` is zero where the lifted
+        blend is subsaturated: ModelE returns before running the bisection at
+        all in that case (``MSTCNV.F90:2804``), since there is no cloud base to
+        neutralise.
 
     Note:
         The bisection usually does **not** converge to the ``|DMSE1| <= 1e-3``
@@ -506,4 +522,12 @@ def cloud_base_closure(potential_temperature: jnp.ndarray,
             dmse1 > _DMSE_TOL, fplume - dfp,
             jnp.where(dmse1 < -_DMSE_TOL, fplume + dfp, fplume))
 
-    return fplume, fplume * mass_top, dmse1
+    # ModelE gives up before the bisection when the lifted blend does not
+    # reach saturation -- there is no cloud to close on (`MSTCNV.F90:2804`).
+    # Without the guard the closure happily returns a mass flux for columns
+    # ModelE declines to convect at all.
+    saturated = qdn0 >= qsatc0
+    fmp2 = jnp.where(saturated, fplume * mass_top, 0.0)
+    if timestep is not None:
+        fmp2 = fmp2 * jnp.minimum(1.0, timestep / adjustment_time)
+    return fplume, fmp2, dmse1
