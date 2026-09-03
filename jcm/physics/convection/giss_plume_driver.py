@@ -405,9 +405,26 @@ def run_plume(cloud_base: jnp.ndarray,
     # The rain the seed shed at cloud base is precipitation like any other: it
     # has to reach the falling flux and the diagnostics, or that water simply
     # disappears from the column.
+    base_rain = jnp.where(level == cloud_base, base_rained_mass, 0.0)
+
+    # `detrain_cloud_mode_only` (MSTCNV.F90:2096-2121, on by default): detrained
+    # condensate represents the cloud mode alone, so it is capped at
+    # `dm*qc_updraft` and whatever is over that becomes precipitation instead.
+    # Without it the port detrains condensate ModelE rains out -- which is the
+    # whole of the difference in how the two split their water, the totals
+    # having agreed all along.
+    # Applied only where the microphysics actually ran. ModelE's ascent loop
+    # `exit`s *before* the microphysics at its terminating level, so
+    # `qc_updraft(lmax)` there is whatever a previous plume left in the array --
+    # which would cap the plume's dumped condensate against stale memory. The
+    # port leaves that level's condensate alone rather than reproducing an
+    # uninitialised read.
+    cap = ascent.detrained_mass * ascent.cloud_mode_ratio
+    over = jnp.where(ascent.active & (ascent.detrained_mass > 0.0),
+                     jnp.maximum(ascent.detrained_condensate - cap, 0.0), 0.0)
     ascent = ascent._replace(
-        precipitation=ascent.precipitation
-        + jnp.where(level == cloud_base, base_rained_mass, 0.0))
+        precipitation=ascent.precipitation + base_rain + over,
+        detrained_condensate=ascent.detrained_condensate - over)
 
     plume_top = jnp.max(jnp.where(ascent.active, level, 0), axis=0)
     # `ldraft`, the highest level the downdraft was seeded at.
