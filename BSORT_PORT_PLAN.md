@@ -2986,3 +2986,61 @@ did key it that way and read some arbitrary plume's numbers. `continuity_diag.tx
 carries the step and gives the same deposition, so it is the right reference;
 the downdraft dump is only usable per-plume when the plume is identified some
 other way.
+
+## 43. The downdraft sheds in the wrong place, and why
+
+`downdraft_diag.txt` now carries the step (unit 776), so the shaft can be
+matched to a plume for the first time.
+
+### The source and the total are right
+
+| per plume | ours / ModelE |
+|---|---|
+| downdraft source (sort -> shaft) | **0.978** |
+| total detrained (shaft -> environment) | **0.921** |
+| peak shaft mass | 12.05 against 12.9 |
+
+Nothing is missing or collapsing. What differs is *where* it sheds.
+
+### The distribution is not
+
+| level | ours | ModelE |
+|---|---|---|
+| 0 | 0.004 | 0.508 |
+| 2 | 0.008 | 0.947 |
+| 4 | 0.061 | 3.549 |
+| 5 | 0.240 | 4.035 |
+| 8 | 9.385 | 6.443 |
+| 9 | 7.234 | 3.532 |
+| **sum 0-6** | **1.27** | **12.22** |
+| **sum 7+** | **28.84** | **20.03** |
+
+ModelE carries 12.9 kg/m^2 down *to* the boundary layer and then halves through
+it -- `detr/ddin` of 0.5000, 0.5000, 0.5004, 0.5012 over levels 1-4. The port
+sheds most of the shaft at levels 8-9 and arrives nearly empty, so the
+boundary-layer halving it does correctly has almost nothing left to work on.
+
+That is the whole of the sub-cloud deposition deficit from section 42: the air
+ModelE puts into levels 0-5 is air the port has already dropped higher up.
+
+### The rule the port is missing
+
+```
+detr = ddraft*min(1d0, dfac + dd_detbyent*etal_)
+```
+
+with `dfac = 1 - fddet` where the shaft is buoyant, `1 - detfac(l)` inside the
+boundary layer, and **zero elsewhere** (`MSTCNV.F90:4573-4585`). Two pieces of
+that are not in the port:
+
+* **`dd_detbyent*etal_`**, an entrainment-proportional detrainment that applies
+  at *every* level, buoyant or not. `dd_detbyent = 0.47769839`
+  (`MSTCNV.F90:458`). The port detrains nothing outside the buoyant and
+  boundary-layer branches.
+* **`detfac(l)`** is a per-level array; the port treats it as the constant 0.5
+  measured from the oracle in section 33, and `_BUOYANT_RETENTION = 0.25` was
+  inferred the same way. Both were fitted to a single column where the two
+  branches happened to coincide.
+
+Porting the expression properly is the next step, and it is the first thing in
+a while that is a formula rather than an accumulation effect.
