@@ -2746,3 +2746,47 @@ against a single plume, a partial integral against a full one.
 The pattern is always the same shape: two quantities that look comparable but
 are taken over different domains. Before drawing a conclusion from any
 oracle comparison, state explicitly what domain each side covers.
+
+## 39. The precipitation split: what the microphysics is fed
+
+Section 38 left one real difference: the port rains out 36% less and detrains 78%
+more condensate, with the total condensed correct to 1.4%. `microphys_diag.txt`
+records what ModelE hands the microphysics at every call, so the inputs can be
+compared directly.
+
+Driven from ModelE's exact pre-plume state, keyed on pressure (454 of 630 calls
+matched; `mplume` is not unique per level and matched only 126):
+
+| input | ours / ModelE |
+|---|---|
+| `TP`, the parcel temperature | 1.0013 |
+| `WCU`, the updraft speed | **1.0465** |
+| `CONDMU`, the condensate density | **0.8467** |
+
+`TP` is exact. The other two are both wrong in the direction that suppresses
+rain: 15% less condensate to precipitate, and a 4.7% faster updraft carrying
+what there is further before it can fall. `PRECIPLIQ_GAMMA` is strongly
+superlinear in condensate, so a 15% deficit there is easily enough to give the
+36% shortfall in `condpr`.
+
+The picture is self-consistent: less condensate at the microphysics call means
+less rain, which leaves more condensate in the plume to be detrained -- which is
+exactly the sink split measured in section 38, at the right sign and roughly the
+right size.
+
+### An independent confirmation of section 28
+
+The first microphysics call of every plume has `WCU = 0.5` exactly -- ModelE's
+`wbases` floor. That is the seed the port was given in section 28 after finding
+`wcupass` was extrapolating against an unset value, and the dump now shows it is
+literally the number ModelE passes.
+
+### What is not yet explained
+
+Why `CONDMU` is 15% low per level when the plume's *total* condensation is
+correct to 1.4%. The two are only compatible if the condensate is distributed
+differently over the ascent -- held less at each microphysics call but shed more
+to detrainment -- which is the same equilibrium seen from the other side. Which
+of the two drives the other is not resolved: the sort's condensate partition
+and the re-saturation are both exact when teacher-forced, so this is again an
+accumulation effect rather than a formula error.
