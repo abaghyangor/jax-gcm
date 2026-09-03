@@ -2857,3 +2857,74 @@ condensate correspondingly high, and the totals still agreeing to about 4%. The
 cloud-base call accounts for 0.0016 of the gap. The condensate the microphysics
 is *given* is now right at every level it was measured, so the remaining
 difference is in the removal itself rather than its input.
+
+## 41. The removal was right; the cap was missing
+
+Section 40 left `condpr` short and the detrained condensate high, with the
+totals agreeing. The removal itself turned out to be correct, and the
+difference was a step after it.
+
+### The microphysics is not at fault
+
+Now that `CONDMU` is known to be the *pre*-precipitation condensate and `wmp0`
+the post, ModelE's own removal fraction is computable from its dumps, and the
+port's alongside it:
+
+| level above cloud base | condensate in, ours/ModelE | removed, ours | ModelE |
+|---|---|---|---|
+| 0 | 1.0002 | 0.0818 | 0.0818 |
+| 1 | 1.0001 | 0.1048 | 0.1048 |
+| 2 | 0.9998 | 0.1023 | 0.1027 |
+| overall | 0.9994 | 0.1513 | 0.1494 |
+
+`critical_diameter` also reproduces ModelE's `DCW` **exactly** (1.000000 over
+every dumped call). The partition is right, and it is given the right
+condensate.
+
+### The missing step
+
+`detrain_cloud_mode_only` (`MSTCNV.F90:2096-2121`, default true) treats the
+detrained condensate array as the cloud mode alone: it caps `dwm(l)` at
+`dm(l)*qc_updraft(l)` and moves the excess into `condpr(l)`.
+
+`qc_updraft` comes from a **second** partition of the same condensate with a
+different size cut -- ModelE calls `precipliq_gamma` twice per level, once with
+the speed-dependent `DCW` for the rain and once with a fixed `dcw_qc = 80 um`
+for the cloud mode. That cut is *smaller* than a typical `DCW` (27-387 um), so
+the cap bites hard by design.
+
+| per plume | before | after | ModelE |
+|---|---|---|---|
+| `condpr` | 0.01776 | **0.03023** | 0.02772 |
+| detrained condensate | 0.02618 | **0.01498** | 0.01469 |
+| downdraft condensate | 0.01174 | 0.01187 | 0.01251 |
+
+The detrained condensate goes from **78% high to 2.0% high**.
+
+### A deliberate divergence
+
+The cap is applied only where the microphysics actually ran. ModelE's ascent
+loop `exit`s *before* the microphysics at its terminating level, so
+`qc_updraft(lmax)` is whatever a previous plume left in the array -- the cap
+there runs against stale memory. Applying it anyway overshoots badly
+(detrained 0.01062, `condpr` 0.03459 against 0.01469 / 0.02772); leaving that
+level alone gives the numbers above. Reproducing an uninitialised read is not
+worth doing, and this is recorded as a divergence rather than a match.
+
+### Where the port stands
+
+| | |
+|---|---|
+| closure `fmp2` on exact inputs | median **1.000000** |
+| condensate entering the microphysics | 1.0002 / 1.0001 / 0.9998 |
+| removal fraction | 0.1513 against 0.1494 |
+| `critical_diameter` | **exact** |
+| detrained condensate | 2.0% |
+| total condensed | 3.9% |
+| harness peak heating | 1.274 |
+| harness `dth` / `dq` correlation | +0.863 / +0.848 |
+
+The water split is now right to a few percent in every channel. The open item
+is unchanged from section 38: the sub-cloud *profile*, which the column budget
+says is redistribution, with ModelE's quadratic-upstream advection against the
+port's plain upwind as the leading candidate.
