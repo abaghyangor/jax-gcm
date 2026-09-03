@@ -45,6 +45,7 @@ from jax import lax
 
 from jcm.physics.convection import giss_bsort as bsort
 from jcm.physics.convection import giss_downdraft as downdraft
+from jcm.physics.convection import giss_microphysics as microphysics
 from jcm.physics.convection import giss_tendencies as tendencies
 from jcm.physics.convection.giss_thermodynamics import (
     DELTX, RGAS, safe_divide)
@@ -71,6 +72,11 @@ _QBOOST = 1.0
 # 1.0 in the active preset (MSTCNV.F90:299); the cold-pool factor
 # `(1 - 2*wtcp*(1-wtcp))` that multiplies it is 1.0 with no cold pool.
 _TQSTAR_FACTOR = 1.0
+
+# Cloud droplet number and radius, matching `plume_ascent`'s defaults; the
+# cloud-base microphysics call has to be given the same ones.
+_DROPLET_NUMBER = 60.0e6
+_DROPLET_RADIUS = 10.0e-6
 
 
 class ColumnGeometry(NamedTuple):
@@ -331,19 +337,48 @@ def run_plume(cloud_base: jnp.ndarray,
         source_bottom, source_top, boundary_layer_top, exner=exner,
         source_dtheta=source_dtheta, source_dq=source_dq)
 
-    # `plume_ascent` takes its seed already condensed -- it skips the arrival
-    # processing at the base level, because that is where ModelE's ascent loop
-    # begins rather than something it does again. The sub-cloud parcel is still
-    # unsaturated, so the condensation it undergoes on reaching cloud base has
-    # to happen here.
+    # `plume_ascent` takes its seed already condensed *and already rained
+    # out*: it skips the arrival processing at the base level, because that is
+    # where ModelE's ascent loop begins rather than something it does again.
+    # The sub-cloud parcel has had neither, so both happen here.
     def at_base(profile):
         nlev = profile.shape[0]
         level = jnp.arange(nlev).reshape((nlev,) + (1,) * (profile.ndim - 1))
         return jnp.sum(jnp.where(level == cloud_base, profile, 0.0), axis=0)
 
+    exner_base = at_base(exner)
+    pressure_base = at_base(pressure)
     seed_heat, seed_water, seed_condensate = bsort.resaturate_plume(
         cloud_base_mass, parcel_heat, parcel_water, parcel_condensate,
-        at_base(exner), at_base(pressure), phase)
+        exner_base, pressure_base, phase)
+
+    # ModelE runs the microphysics at the cloud-base level like any other
+    # (`MSTCNV.F90:1877`), and its first call there passes `wcupass = wbases`
+    # exactly -- visible in `microphys_diag.txt` as `WCU = 0.5` on the first row
+    # of every plume. Skipping it leaves the parcel with about 0.21% too much
+    # water, which lands almost entirely in the condensate: at cloud base the
+    # condensate is only 2.4% of the total water, so the same absolute excess
+    # shows up there as nearly 9%.
+    base_density = at_base(geometry.density)
+    base_temperature = at_base(geometry.temperature)
+    seed_water_content = safe_divide(seed_condensate,
+                                     cloud_base_mass) * base_density
+    # `TPSAV` is formed before this level's condensation (MSTCNV.F90:1690), so
+    # the microphysics sees the parcel's pre-condensation temperature.
+    seed_parcel_temperature = safe_divide(parcel_heat,
+                                          cloud_base_mass) * exner_base
+    base_rained = microphysics.precipitate(
+        seed_water_content, cloud_base_velocity, pressure_base,
+        seed_parcel_temperature,
+        microphysics.scaled_droplet_number(_DROPLET_NUMBER, pressure_base,
+                                           base_temperature),
+        _DROPLET_RADIUS).precipitated
+    base_rained = base_rained * microphysics.finite_ascent_fraction(
+        at_base(layer_mass))
+    base_rained_mass = jnp.minimum(
+        safe_divide(base_rained * cloud_base_mass, base_density),
+        seed_condensate)
+    seed_condensate = jnp.maximum(seed_condensate - base_rained_mass, 0.0)
 
     ascent = bsort.plume_ascent(
         cloud_base=cloud_base,
@@ -366,6 +401,14 @@ def run_plume(cloud_base: jnp.ndarray,
 
     nlev = layer_mass.shape[0]
     level = jnp.arange(nlev).reshape((nlev,) + (1,) * (layer_mass.ndim - 1))
+
+    # The rain the seed shed at cloud base is precipitation like any other: it
+    # has to reach the falling flux and the diagnostics, or that water simply
+    # disappears from the column.
+    ascent = ascent._replace(
+        precipitation=ascent.precipitation
+        + jnp.where(level == cloud_base, base_rained_mass, 0.0))
+
     plume_top = jnp.max(jnp.where(ascent.active, level, 0), axis=0)
     # `ldraft`, the highest level the downdraft was seeded at.
     downdraft_top = jnp.max(jnp.where(ascent.downdraft_mass > 0.0, level, 0),
