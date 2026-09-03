@@ -2790,3 +2790,70 @@ to detrainment -- which is the same equilibrium seen from the other side. Which
 of the two drives the other is not resolved: the sort's condensate partition
 and the re-saturation are both exact when teacher-forced, so this is again an
 accumulation effect rather than a formula error.
+
+## 40. The condensate distribution: a missing cloud-base microphysics call
+
+### First, a retraction
+
+Section 39 reported `CONDMU` running 15% low and drifting to 0.74 over the
+ascent. **That comparison was invalid.** `CONDMU` is formed at
+`MSTCNV.F90:1772`, *before* the level's precipitation; the port's
+`plume_condensate` is the post-precipitation value, which pairs with
+`wmp0_diag` -- dumped at `MSTCNV.F90:3510` under the comment "plume properties
+on entry, before any air is set aside for sorting", i.e. after precipitation.
+Two snapshots of `wmp` at different points in the same level's processing.
+
+ModelE's own dumps say so directly: `CONDMU / (wmp0/mplume0*rho0) = 1.178`, the
+precipitation removed in between.
+
+The valid comparison against `wmp0` gives **1.089 at cloud base**, drifting to
+0.888 -- high at the seed, not low.
+
+*Fourth domain mismatch in this investigation. The check that caught it was
+comparing ModelE's two dumps against each other before comparing either to the
+port.*
+
+### The finding
+
+Checking ModelE against itself at cloud base:
+
+| ModelE-only | ratio |
+|---|---|
+| `sum(mplume*fpi*qmo1/aml)` vs `qmp0 + wmp0` | **1.00212** |
+| `sum(mplume*fpi*smo1/aml)` vs `smp0` | **0.99610** |
+
+The assembled parcel has 0.21% more water and 0.39% less heat than the plume
+reports at cloud base -- condensation releasing heat and **precipitation
+removing water**, at the base level.
+
+`plume_ascent` suppresses precipitation there, on the reasoning that "the seed
+level's condensate arrives already rained out". True while the seed was the
+`wmp0_diag` dump; false once `giss_plume_driver` began building it by
+re-saturating the raw parcel, which condenses but never rains.
+
+Meanwhile the seed's other components were exact: heat 1.000002, vapour
+1.000036, `mplume` 1.000000, and the enhanced source per layer 1.0000000. Only
+the condensate was wrong, at +8.9% -- because it is 2.4% of the parcel's total
+water, so a 0.21% error in the total lands almost entirely on it.
+
+### The fix and its effect
+
+The driver now runs the microphysics on the seed and folds the result into the
+precipitation array. Condensate against `wmp0`, by level above cloud base:
+
+| | 0 | 1 | 2 | 3 |
+|---|---|---|---|---|
+| before | 1.089 | 1.051 | 1.029 | 1.006 |
+| after | **1.0002** | **1.0002** | **1.0001** | **0.9976** |
+
+The systematic drift is gone. Aggregate harness metrics do not move (peak
+heating 1.285 against 1.286), which is what should happen: this corrects where
+the water sits, not how much convection there is. Judge on per-term agreement.
+
+### Still open
+
+`condpr` remains short -- 0.0191 against ModelE's 0.0277 -- with the detrained
+condensate correspondingly high, and the totals still agreeing to about 4%. The
+cloud-base call accounts for 0.0016 of the gap. The condensate the microphysics
+is *given* is now right at every level it was measured, so the remaining
+difference is in the removal itself rather than its input.
