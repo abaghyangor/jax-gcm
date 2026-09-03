@@ -2928,3 +2928,61 @@ The water split is now right to a few percent in every channel. The open item
 is unchanged from section 38: the sub-cloud *profile*, which the column budget
 says is redistribution, with ModelE's quadratic-upstream advection against the
 port's plain upwind as the leading candidate.
+
+## 42. The advection is not the cause; the downdraft is too weak
+
+### The advection hypothesis is dead
+
+Sections 38 and 40 named ModelE's quadratic-upstream advection against the
+port's plain upwind as the leading explanation for the sub-cloud profile. It can
+be tested without implementing anything: drive plain upwind with ModelE's *own*
+`cm`, state and exchange terms, and compare against what ModelE actually did
+(recoverable as `(post - pre) - exchange` from the sweep and continuity dumps).
+
+| level | heat: upwind - ModelE | water: upwind - ModelE |
+|---|---|---|
+| 0 | +0.134 | -0.00099 |
+| 1 | +0.123 | -0.00053 |
+| 2 | +0.221 | -0.00291 |
+
+The schemes do differ -- about 0.4 K/day and 0.46 g/kg/day at level 0, which is
+the right *size* -- but the **sign is wrong in both variables**. Upwind warms
+more and dries more than ModelE, while the port cools more and moistens more.
+Switching to a quadratic-upstream scheme would make the sub-cloud disagreement
+worse, not better. The candidate is retired, and giving `PhysicsState` moments
+is not the way to fix this.
+
+### What the budget says instead
+
+Decomposing the sub-cloud water tendency per plume (levels 0-2 pooled, 44
+single-plume steps):
+
+| term | ours | ModelE | diff |
+|---|---|---|---|
+| deposited `dqm` | **+0.000083** | **+0.010299** | **-0.010216** |
+| removed `-dqmr` | +0.141567 | +0.143332 | -0.001765 |
+| evaporated `dqm_evp` | +0.001688 | +0.000405 | +0.001283 |
+
+The deposition term is short by a factor of **124**, and it dwarfs everything
+else. `dqm/dm` in ModelE's dump is 0.0164 there -- the local specific humidity --
+so this is air being deposited, not water appearing from nowhere.
+
+Per level, ModelE deposits 1-8 kg/m^2 of air into each sub-cloud layer; the port
+deposits 0.004-0.008. The downdraft is the only thing that detrains that low,
+and its 0.5-per-level shedding below `dcl` is working in both -- the profiles
+halve downward the same way. What differs is the mass arriving: the port's shaft
+carries roughly five to six times too little into the boundary layer in this
+configuration.
+
+That is not the collapse fixed in section 33 -- that fix is in place, and in the
+oracle-plume configuration the shaft still matches to 0.9994. It is specific to
+the sweep configuration and is the next thing to chase.
+
+### A measurement caveat worth recording
+
+`downdraft_diag.txt` has **no step column** -- its rows begin with the level --
+so it cannot be keyed by step the way the other dumps can. An earlier pass here
+did key it that way and read some arbitrary plume's numbers. `continuity_diag.txt`
+carries the step and gives the same deposition, so it is the right reference;
+the downdraft dump is only usable per-plume when the plume is identified some
+other way.
