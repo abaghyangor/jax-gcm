@@ -157,7 +157,8 @@ def precipitate(condensate: jnp.ndarray,
                 pressure: jnp.ndarray,
                 temperature: jnp.ndarray,
                 droplet_number: jnp.ndarray,
-                droplet_radius: jnp.ndarray) -> Precipitation:
+                droplet_radius: jnp.ndarray,
+                cutoff_diameter: jnp.ndarray = None) -> Precipitation:
     """Split a plume's condensate into what falls out and what rises on.
 
     Args:
@@ -176,7 +177,13 @@ def precipitate(condensate: jnp.ndarray,
         A :class:`Precipitation`.
     """
     air_density = pressure / (_RGAS * temperature)
-    diameter = critical_diameter(updraft_speed, pressure)
+    # `MSTCNV` calls this twice per level with different size cuts: once with
+    # the speed-dependent `DCW` for the actual precipitation, and once with a
+    # fixed `dcw_qc` to define how much condensate counts as *cloud mode*
+    # (MSTCNV.F90:6813 and 6957). The second is what bounds how much condensate
+    # may be detrained, so the cut has to be selectable.
+    diameter = (critical_diameter(updraft_speed, pressure)
+                if cutoff_diameter is None else cutoff_diameter)
 
     # The cloud mode holds one droplet per nucleus at the assumed radius; the
     # rest of the condensate has nowhere to go but the rain mode.

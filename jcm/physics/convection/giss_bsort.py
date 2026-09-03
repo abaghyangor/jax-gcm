@@ -294,6 +294,11 @@ _NEGATIVE_BUOYANCY = -0.2    # below this it seeds the downdraft
 # plume is dying (verified: 1566/1572 without it, 1572/1572 with it).
 _OVERSHOOT_BUOYANCY = -0.25
 
+# `dcw_qc`, the fixed cutoff diameter separating cloud-mode condensate from the
+# rest (MSTCNV.F90:277). Distinct from the speed-dependent `DCW` the actual
+# precipitation partition uses.
+_CLOUD_MODE_DIAMETER = 80.0e-6
+
 
 class SortedBlends(NamedTuple):
     """Outcome of sorting one level's blends.
@@ -527,6 +532,7 @@ class PlumeAscent(NamedTuple):
     downdraft_heat: jnp.ndarray
     downdraft_water: jnp.ndarray
     downdraft_condensate: jnp.ndarray
+    cloud_mode_ratio: jnp.ndarray    # qc_updraft: condensate that may detrain
     active: jnp.ndarray              # bool: this level was processed
 
 
@@ -674,6 +680,20 @@ def plume_ascent(cloud_base: jnp.ndarray,
             microphysics.scaled_droplet_number(droplet_number, pressure_l,
                                                environment_temperature),
             droplet_radius).precipitated
+        # A second partition with ModelE's fixed `dcw_qc` cut gives
+        # `qc_updraft`, the condensate that counts as cloud mode
+        # (MSTCNV.F90:6957-6967). It is not precipitation -- it is the ceiling
+        # on how much condensate the sorted blends are allowed to carry away,
+        # and the excess is sent to the rain instead.
+        cloud_mode = microphysics.precipitate(
+            water_content, extrapolated_w, pressure_l, risen_temperature,
+            microphysics.scaled_droplet_number(droplet_number, pressure_l,
+                                               environment_temperature),
+            droplet_radius, cutoff_diameter=_CLOUD_MODE_DIAMETER).precipitated
+        # `qc_updraft = (condmu - tmp_cond)*TLOC*RGAS/PL`, i.e. back to a
+        # mixing ratio.
+        cloud_mode_ratio = safe_divide(water_content - cloud_mode, air_density)
+
         # Only the part of the partition realised over this layer's depth.
         rained = rained * microphysics.finite_ascent_fraction(ma)
         rained_mass = jnp.minimum(
@@ -792,6 +812,7 @@ def plume_ascent(cloud_base: jnp.ndarray,
                    keep(sorted_blends.downdraft_heat),
                    keep(sorted_blends.downdraft_water),
                    keep(sorted_blends.downdraft_condensate),
+                   keep(cloud_mode_ratio),
                    survives)
         return carry, outputs
 
