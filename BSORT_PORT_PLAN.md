@@ -2675,3 +2675,74 @@ condensate, or returned as vapour. ModelE routes twice as much of it out of the
 vapour budget as the port does, and releases proportionally less heat doing so.
 `condpr` and the detrained condensate are the two sinks to compare, and neither
 is yet dumped as a per-plume column total.
+
+## 38. Retraction: the column budget does balance, and it is redistribution
+
+Section 37 concluded that the port "removes half the water and adds 1.74x the
+heat" per plume, and that this ruled out redistribution. **Both halves of that
+were a measurement error**, and the conclusion drawn from them was wrong.
+
+The error: ModelE's column vapour change was summed only over the levels
+`closure_state_diag.txt` covers (`lmin0..lmin+2`), because that is where the
+pre-plume state was available, while the port's was summed over the whole
+column. A partial integral was compared against a full one.
+
+### The corrected budget
+
+`sweep_state_diag.txt` now also carries the three sinks -- `condpr` (rained
+out), `dwm` (detrained as condensate) and `wmdnl` (routed into the downdraft).
+All three leave the vapour budget without touching `qm`, and without all three
+the budget will not close for ModelE either. ModelE's full-column vapour change
+comes from `dq_mc`.
+
+| per plume, kg/m^2 | ours | ModelE |
+|---|---|---|
+| `condpr` rained out | +0.01776 | +0.02772 |
+| detrained as condensate | +0.02618 | +0.01469 |
+| routed to the downdraft | +0.01174 | +0.01251 |
+| **total condensed** | **+0.05569** | **+0.05493** |
+| vapour change | -0.03615 | -0.03298 |
+| evaporation returned | +0.01954 | +0.02195 |
+| heat change [K kg/m^2] | +9.70 | +11.82 |
+
+The totals agree to **1.4%**. The port condenses the right amount of water,
+returns nearly the right amount by evaporation, and -- correcting section 37's
+sign as well -- adds **18% less** heat, not 74% more.
+
+### What that means
+
+The column integrals match while the per-level profiles do not, so the sub-cloud
+disagreement **is** redistribution -- the opposite of what section 37 said.
+
+That points at the advection, which section 36 verified the *inputs* to (state,
+flux, exchange terms all correct) but not the *output profile* of. The one
+structural difference there is known and documented: ModelE advects with
+`adv1d`, a quadratic-upstream scheme carrying moments, and the port uses plain
+upwind because the `PhysicsState` has no moments (section 31).
+
+Consistent with that: the discrepancy is larger in `q` than in `th`, and the
+sub-cloud `th` profile is nearly uniform while `q` is not, so only the moisture
+advection has a gradient for the scheme to disagree about. Against it: a
+second-order edge value differs from the layer mean by about half the gradient,
+which accounts for roughly 0.23 of the 1.25 g/kg/day gap at level 0 -- the right
+order, but not obviously all of it. Leading candidate, not a conclusion.
+
+### One real split difference
+
+The sinks agree in total but not in how they divide: the port rains out 36% less
+and detrains 78% more condensate. Total condensation is right, so this is the
+microphysics' removal fraction, not the condensation. It does not affect the
+vapour budget (both paths take water out of `qm`) but it does affect what
+reaches the surface as precipitation and what is handed to the cloud scheme.
+
+### A note on method
+
+This is the **third** consecutive sub-cloud diagnosis to be overturned:
+section 34 blamed the state reconstruction, section 36 blamed the sweep
+composition, section 37 blamed a source or sink. Each time the port was fine and
+the *measurement* was wrong -- a blend compared against a level, a step total
+against a single plume, a partial integral against a full one.
+
+The pattern is always the same shape: two quantities that look comparable but
+are taken over different domains. Before drawing a conclusion from any
+oracle comparison, state explicitly what domain each side covers.
