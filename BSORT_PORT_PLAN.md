@@ -3274,7 +3274,7 @@ periods:
 | downdraft detrainment, levels 0-6 | 1.27 (0.10x) | **8.69 (0.73x)** | 11.96 |
 | downdraft detrainment, levels 7+ | 28.84 (1.44x) | 36.10 (1.79x) | 20.17 |
 | peak heating, ours/ModelE | 1.274 | **1.108** | 1.0 |
-| `dth_mc` profile correlation | +0.863 | **+0.949** | 1.0 |
+| `dth_mc` profile correlation | +0.952 | +0.949 | 1.0 |
 | peak drying, ours/ModelE | -- | 1.071 | 1.0 |
 
 Sub-cloud deposition, the open item since section 42, goes from 10% of ModelE's
@@ -3521,3 +3521,50 @@ the per-blend fate are dumped to `blend_diag.txt` -- but that dump has no step
 column, the same gap that made the downdraft dump unreadable until section 43.
 Keying it by `scm_step_diag` is the prerequisite for a like-for-like per-blend
 comparison.
+
+## 50. Correction, and what the comparison plots actually show
+
+Regenerating `bomex_compare_plots.py` at the pre-`ccmul` commit and at HEAD --
+same script, same oracle, only the code differing -- corrects the record and
+adds something the aggregate numbers were hiding.
+
+**The correction.** Section 46's table reported the `dth_mc` profile
+correlation going `+0.863 -> +0.949` and credited `ccmul` with it. That is
+wrong: `+0.863` was the section 41 baseline, many commits earlier. Measured at
+the actual pre-`ccmul` commit the correlation was already **+0.952**, and the
+fix left it flat at +0.949. The table above now says so. The peak-heating
+figures in it are sound -- re-measuring at the pre-fix commit gives 1.2741
+against the 1.274 quoted. Same error family as sections 30, 36, 37, 43 and 49:
+two numbers taken from different baselines.
+
+**What did change**, median over the 48 periods:
+
+| metric | before | after | |
+| --- | --- | --- | --- |
+| peak heating ours/ModelE | 1.274 | **1.108** | better |
+| RMS error, whole profile | 1.260 | **0.797** | 37% better |
+| RMS error, cloud layer | 2.710 | **1.735** | 36% better |
+| total variation ours/ModelE | 1.536 | **1.432** | slightly smoother |
+| profile correlation | 0.952 | 0.949 | unchanged |
+| correlation, worst decile | 0.801 | **0.576** | worse |
+| worst single-period RMS | 2.560 | **3.858** | worse |
+
+So the *typical* period improved substantially and the *worst* periods got
+worse. The profiles show why. Period 36 now tracks ModelE closely from the
+surface through 1 km in both variables, and period 12's overshoot is gone --
+its peak falls from 14.5 to 8.4 K/day against ModelE's 7.0. But periods 12 and
+47 have picked up new *negative* excursions in the cloud layer: period 47 dips
+to -1.5 K/day at 0.75 km where ModelE is at +2.5, and period 12 swings to -4.0
+at 1.0 km where ModelE is +3.5. Before the fix those same levels were too
+positive.
+
+The trade is a systematic warm overshoot for a more oscillatory profile that
+sometimes undershoots hard. That is what section 49 predicts: the plume is
+still 1.3-1.8x too massive aloft with a removal fraction that drifts, and
+lowering `mcfrac` sharpened the vertical structure without touching the mass.
+The oscillation is where the remaining error now lives.
+
+**Consequence for how this work is judged.** A single median correlation hid
+both the improvement and the regression. Future comparisons should report the
+distribution -- at minimum a worst-decile figure alongside the median -- rather
+than one number.
