@@ -3634,3 +3634,78 @@ base, too negative aloft. That is one signed quantity to chase, and
 Compare `mixbuoy` itself, blend by blend, against the dump. The port computes
 it in `sort_blends` but does not export it per blend, so that needs the same
 treatment `blend_mass_total` just got.
+
+## 52. The paired diagnostic, and a period/step alignment bug
+
+An external review read the plume scatter plots -- 0.06% median error on mass
+flux, updraft speed and detrained mass -- and concluded the buoyancy-sorting
+core was solved. Both halves of that need correcting, and building the fix
+turned up an alignment bug of our own.
+
+**The plotting script was one column out of date.** `plume_compare_plots.py`
+carried a hand-written index block written against the dump *before*
+`scm_step_diag` was prepended, so it read `l` as the plume mass, `ma` as the
+updraft speed and `plk` as pressure -- and still produced plausible figures.
+Its column splitter was broken the same way. Fixed by deriving indices from a
+named column list, grouping on the `(step, lmin)` key, and adding
+`_check_layout`, which fails loudly on both a width change and a same-width
+reordering. Splitting now recovers 52 plumes / 536 levels, matching the closure
+dump. With the map corrected the errors are **0.00%**, better than the figures
+being reviewed -- so those were generated before the drift and were valid then.
+
+**But the inference from them was wrong regardless.** That comparison is
+*oracle-seeded*: cloud-base parcel, the whole environment and `enteff` all come
+from ModelE. Free-running the same code drifts. `plume_seeded_vs_free.png` now
+plots both together -- seeded flat at 1.00 at every level, free-running rising
+to a per-level median of 1.30x by level 15 (1.31x mass-weighted over the
+column) -- with the per-level removal fraction beside it showing why.
+
+### The alignment bug
+
+Pinning the free-running side required knowing which `scm_step_diag` a SUBDD
+period corresponds to. It is **period + 1**: `scm_step_diag` increments at the
+top of every MSTCNV call (`MSTCNV.F90:247,1214`) while period *p* is written at
+the end of step *p+1*. Every per-step comparison in sections 46, 49 and 51
+paired period *N* with step *N*.
+
+The environment cannot detect this -- adjacent BOMEX steps differ by ~0.005 K --
+which is why it survived. Pairing `fmp2` against `mplume_b`, which ranges over
+11.9-51.8 kg/m^2, settles it: correlation **+0.945** at offset +1 against
+**+0.569** at zero.
+
+Re-running the section 49 budget at the correct offset moves the numbers
+little, because those tables aggregate 44 quasi-steady steps:
+
+| level | 6 | 8 | 10 | 12 | 15 | column downdraft | column detrain |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| offset 0 (as published) | 1.03 | 1.20 | 1.27 | 1.45 | 1.84 | 1.346 | 1.041 |
+| offset +1 (correct) | 1.08 | 1.18 | 1.26 | 1.42 | 1.78 | 1.311 | 1.040 |
+
+So sections 49 and 51 stand. `harness.PERIOD_TO_STEP` now pins the mapping with
+its derivation, so it cannot drift again. Sixth instance of the same error
+family, and the first one caught by building a tool rather than by a
+measurement disagreeing.
+
+### What the upgraded free-running figures show
+
+`figures.py` adds a shared provenance stamp and a scorecard reporting median
+**and worst decile**, because a median alone already hid one regression. Over
+48 periods, `dth_mc`:
+
+| metric | median | worst decile |
+| --- | --- | --- |
+| correlation | +0.949 | +0.576 |
+| nRMSE | 0.073 | 0.276 |
+| peak ratio | 1.108 | **2.147** |
+| peak level offset | 0.0 | +2.0 |
+| sign mismatch | 0.065 | 0.267 |
+
+Peak placement is right (median offset 0) while peak *magnitude* reaches 2.1x
+in the worst decile -- the headline "1.1x" is a median over a wide spread.
+
+The residual Hovmoller is the most useful new panel: the remaining error is
+**episodic and level-locked**, a warm/cold dipole confined to periods 9-21 at
+levels 7-11, with periods 27-47 nearly clean. A vertical dipole is misplaced
+heating, which is what a plume detraining at the wrong level produces -- the
+same defect sections 49 and 51 identify from the mass budget, now visible
+directly in the tendencies.
