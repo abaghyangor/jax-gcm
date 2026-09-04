@@ -407,5 +407,51 @@ class ConvectiveColumnTest(unittest.TestCase):
                 rtol=1e-10, atol=1e-9)
 
 
+class TestPresetConstants(unittest.TestCase):
+    """Pin the driver's ModelE-derived constants to the values this run uses.
+
+    ``decks/bomex_scm.R`` overrides no MSTCNV parameter, so every one of these
+    sits at its computed default. Several of those defaults are *conditional*
+    rather than literal, which is what makes them worth a test: ``ccmul`` was
+    wrong here for months at 2.0, because its default is chosen by
+    ``see_debris`` and the port's comment had read the condition backwards.
+    Doubling ``ccmul`` doubles ``mcfrac``, which sets ``prcp_area`` in the
+    downdraft's ``prcp_mixrat``; through the ``**0.6`` evaporation efficiency
+    that halved the shaft's evaporative cooling and made it detrain two levels
+    too high.
+    """
+
+    def test_ccmul_matches_the_see_debris_default(self):
+        # `see_debris` defaults to .true., which selects `ccmul = 1d0`; the 2.0
+        # beside it is the older no-debris proxy (MSTCNV.F90:585-593).
+        self.assertEqual(drv._CCMUL, 1.0)
+
+    def test_entrainment_efficiency_is_the_more_entraining_plume(self):
+        # `bsort_entdet` defaults true, so `enteff = bsort_enteff(iplume)` with
+        # `bsort_enteff2 = .67d0` (MSTCNV.F90:282, 1683). The oracle's plume
+        # dump carries `enteff = 0.67` and `iplume = 2` on all 536 records, so
+        # the `closure2` branch -- which would blend toward 0.5 -- is inactive.
+        self.assertEqual(drv._ENTRAINMENT_EFFICIENCY, 0.67)
+
+    def test_source_parcel_constants(self):
+        # `mc_tqstar_fac = 1d0` in the active preset, which also makes `qboost`
+        # collapse to 1.0 (MSTCNV.F90:2624-2625, 2675-2682).
+        self.assertEqual(drv._TQSTAR_FACTOR, 1.0)
+        self.assertEqual(drv._QBOOST, 1.0)
+        # The source spans at most 300 mb below the base (MSTCNV.F90:2646-2648).
+        self.assertEqual(drv._MAX_SOURCE_SPAN, 300.0e2)
+
+    def test_droplet_constants(self):
+        # `cdnc_ocean_mc = 60` (per cm^3) and `cloudrvl_mstcnv = 10` (microns),
+        # both from the preset defaults (MSTCNV.F90:275, 279).
+        self.assertEqual(drv._DROPLET_NUMBER, 60.0e6)
+        self.assertEqual(drv._DROPLET_RADIUS, 10.0e-6)
+
+    def test_cloud_base_velocity(self):
+        # `wbases(2) = max(0.5, wturb)` (MSTCNV.F90:2838); measured at exactly
+        # 0.5 in all 52 BOMEX plumes, where `max(wturb)` peaks at 0.372.
+        self.assertEqual(drv._CLOUD_BASE_VELOCITY, 0.5)
+
+
 if __name__ == "__main__":
     unittest.main()
