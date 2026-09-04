@@ -3369,3 +3369,84 @@ here), `terminal_aspcp`, `vterm_env`, `mc_fevap_dpref`, `dpthresh_fp1`,
 
 `giss_plume_driver_test.py` now pins the driver's constants, including the two
 whose defaults are conditional.
+
+## 48. `dp_disp` ported: the rule behind the fitted cloud base
+
+Section 47 listed `dp_disp_fac`/`dp_disp_max` as an un-ported feature governing
+"parcel displacement in the conditional-instability check". It turns out to be
+the rule that **selects the cloud base**, which the port had been approximating
+with a fitted offset.
+
+### What it does
+
+```fortran
+dp_disp = min(dp_disp_fac*max(sum(ma(1:dcl)),dmcp)*kg2mb, dp_disp_max)
+do lmax_disp=dcl,lmcm
+  if(pl(dcl)-pl(lmax_disp+1) .gt. dp_disp) exit
+enddo                                              ! MSTCNV.F90:1419-1422
+```
+
+`lmax_disp` then gates how each candidate base builds its source parcel
+(`MSTCNV.F90:2677-2687`):
+
+* **at or below it** the plume blends the whole boundary layer, walking down
+  until 300 mb below the base -- what :func:`source_bottom` implements;
+* **above it** the source collapses to a single layer (`lmin0 = lmin`,
+  `nlpi = 1`) *and* the candidate must survive two early returns: `is_cnv` on
+  the layer above, and a TKE test requiring `wturb(lmin+1)**2` to exceed the
+  work against the local stratification.
+
+In an undisturbed trade-cumulus column that TKE test fails, so every candidate
+above `lmax_disp` yields no plume. Since `lessent_scheme = 2` makes the sweep
+descend from `lmcm-1`, it rejects everything down to `lmax_disp` and converts
+there. The oracle confirms it: **`nlpi == lmin` on all 52 plumes** -- so
+`lmin0 = 1` and every one took the blend branch -- and
+
+| dcl | ModelE LMIN | predicted `lmax_disp` | n |
+| --- | --- | --- | --- |
+| 5 | 6 | 6 | 31 |
+| 6 | 6 | 7 | 2 |
+| 6 | 7 | 7 | 15 |
+| 7 | 8 | 9 | 2 |
+| 7 | 9 | 9 | 2 |
+
+`lmin == lmax_disp` on 48 of 52, `lmin <= lmax_disp` on all 52.
+
+### What changed
+
+`giss_plume_driver.displacement_top` implements the rule and
+`GissConvection._diagnose` now uses it, replacing `closure_base = dcl + 1`.
+That offset was fitted to this same oracle in section W1; it agrees with
+`lmax_disp` wherever one level clears the displacement, and diverges where the
+boundary layer is deep enough to need two -- `dcl = 7` gives `dcl + 2`.
+
+**On this dataset the two rules give identical answers on all 48 periods**, so
+this is a faithfulness change, not an accuracy one, and the harness metrics are
+unchanged (peak heating 1.108, `dth_mc` correlation +0.949, peak drying 1.071;
+suite 371 passed, 3 skipped).
+
+Worth recording *why* they agree where the hand calculation says they should
+not. At `dcl = 7` ModelE's own masses give `dp_disp = 21.37 mb` against a
+20.35 mb two-layer step, so it takes the third layer; the port's layer masses
+run about 5% lower, putting `dp_disp` just under that step, so it takes the
+second. The rule sits on a knife edge there, and the port lands on the correct
+side only by way of a mass-profile error. That is worth knowing before trusting
+`lmax_disp` in a deeper boundary layer.
+
+### Why port it anyway
+
+* It is the actual rule, and the offset it replaces was a fit to 48 samples.
+* `dmcp`, the cold-pool mass, enters as `max(sum(ma(1:dcl)), dmcp)`. There is
+  no cold-pool scheme here so the argument defaults to zero, which is right for
+  an undisturbed case and wrong for a disturbed one -- now an explicit,
+  documented argument rather than an assumption buried in an offset.
+* It is a **prerequisite for sweeping more than one base**. The port currently
+  runs `max_plumes=1`. Widening the sweep without `lmax_disp` would let every
+  candidate from `lmcm-1` downward build a full boundary-layer blend and
+  convect, since the restriction that rejects them is exactly this.
+
+It also explains structurally why `closure2` never fires in BOMEX, which
+section 47 could only establish empirically: `dp_disp2` falls below
+`dp_disp2_min = 50` and is zeroed, so `lmax_disp2 == lmax_disp1` and
+`closure2 = lmin.eq.lmax_disp2 .and. lmax_disp2.gt.lmax_disp1` is false by
+construction.

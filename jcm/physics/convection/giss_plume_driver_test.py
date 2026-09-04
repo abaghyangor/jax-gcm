@@ -407,6 +407,70 @@ class ConvectiveColumnTest(unittest.TestCase):
                 rtol=1e-10, atol=1e-9)
 
 
+class TestDisplacementTop(unittest.TestCase):
+    """``lmax_disp``, which selects the cloud base.
+
+    ModelE's descending sweep rejects every candidate above ``lmax_disp`` -- the
+    source there collapses to one layer and must pass a TKE-against-
+    stratification test -- so the sweep converts at exactly that level. The
+    BOMEX oracle bears this out: ``lmin == lmax_disp`` on 48 of 52 plumes and
+    ``lmin <= lmax_disp`` on all 52.
+    """
+
+    # A BOMEX-like lower column: uniform 103.76 kg/m^2 layers, ~10.2 mb apart.
+    _MASS = jnp.full((14,), 103.763)
+    _PRESSURE = jnp.array(
+        [1009.91, 999.74, 989.56, 979.39, 969.21, 959.03, 948.86, 938.68,
+         928.51, 917.82, 906.12, 892.89, 877.12, 858.30]) * 100.0
+
+    def test_reproduces_the_bomex_base(self):
+        # dcl = 5 (ModelE, 1-based) is index 4 here. The boundary layer holds
+        # 5*103.763 = 518.8 kg/m^2 = 50.9 mb, so dp_disp = 0.3*50.9 = 15.3 mb.
+        # One layer up clears only 10.2 mb, two clear 20.3 -- so the base is
+        # index 5, which is ModelE's LMIN = 6.
+        top = drv.displacement_top(self._MASS, self._PRESSURE,
+                                   jnp.array(4), jnp.array(11))
+        self.assertEqual(int(top), 5)
+
+    def test_deeper_boundary_layer_reaches_further(self):
+        # dcl = 7 (1-based) is index 6: 726.3 kg/m^2 = 71.2 mb, dp_disp = 21.4,
+        # which one layer (10.2) and two (20.3) both fail to clear, so the base
+        # sits two levels up. This is where the old fitted `dcl + 1` breaks.
+        top = drv.displacement_top(self._MASS, self._PRESSURE,
+                                   jnp.array(6), jnp.array(11))
+        self.assertEqual(int(top), 8)
+
+    def test_displacement_is_capped(self):
+        # A very deep boundary layer is held to dp_disp_max = 50 hPa rather
+        # than growing without limit.
+        deep = jnp.full((14,), 4000.0)      # 0.3*4000*g*n would be huge
+        top = drv.displacement_top(deep, self._PRESSURE, jnp.array(4),
+                                   jnp.array(11))
+        base_p = float(self._PRESSURE[4])
+        self.assertGreater(base_p - float(self._PRESSURE[int(top) + 1]),
+                           drv._DISPLACEMENT_MAX)
+        # and the level below it must not already clear the cap
+        self.assertLessEqual(base_p - float(self._PRESSURE[int(top)]),
+                             drv._DISPLACEMENT_MAX)
+
+    def test_returns_sentinel_when_nothing_clears(self):
+        # Layers too thin to ever accumulate dp_disp: no candidate qualifies.
+        flat = jnp.linspace(1000.0, 999.0, 14) * 100.0
+        top = drv.displacement_top(self._MASS, flat, jnp.array(4),
+                                   jnp.array(11))
+        self.assertEqual(int(top), 12)
+
+    def test_broadcasts_over_columns(self):
+        single = drv.displacement_top(self._MASS, self._PRESSURE,
+                                      jnp.array(4), jnp.array(11))
+        block = drv.displacement_top(
+            jnp.broadcast_to(self._MASS[:, None], (14, 3)),
+            jnp.broadcast_to(self._PRESSURE[:, None], (14, 3)),
+            jnp.full((3,), 4), jnp.full((3,), 11))
+        np.testing.assert_array_equal(np.asarray(block),
+                                      np.full((3,), int(single)))
+
+
 class TestPresetConstants(unittest.TestCase):
     """Pin the driver's ModelE-derived constants to the values this run uses.
 
