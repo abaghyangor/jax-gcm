@@ -3200,3 +3200,91 @@ reproduce ModelE when fed ModelE's inputs. The bias therefore lives in the
 inputs -- `ddr`, `smdnl`, `qmdnl` from the plume's buoyancy sorting, or the
 `condpr` rain supply -- and it is a bias of order 0.1-0.6 K in the shaft's
 virtual temperature, large enough to find directly.
+
+## 46. Found it: `ccmul` was 2.0 where the run uses 1.0
+
+Section 45 asked for a `+0.1..+0.6 K` bias in the downdraft's virtual
+temperature. Walking the port's shaft down beside ModelE's on the heaviest
+single-plume steps found it, and the trail is short.
+
+**The shafts agree until one level, then split.** Step 20, margin
+`svmix - svm1` computed with one formula on both sides using ModelE's own
+environment and `wload`, so only the shaft differs:
+
+| level | 12 | 11 | 10 | **9** | 8 | 7 |
+| --- | --- | --- | --- | --- | --- | --- |
+| ours | -0.476 | -0.609 | -0.499 | **+0.019** | +0.096 | +0.092 |
+| ModelE | -0.418 | -0.600 | -0.537 | **-0.057** | -0.028 | +0.038 |
+| difference | -0.058 | -0.008 | +0.038 | **+0.076** | +0.124 | +0.054 |
+| our branch | hold | hold | hold | **BUOY** | BUOY | BUOY |
+| ModelE branch | hold | hold | hold | **hold** | hold | BUOY |
+
+ModelE's margin rises monotonically as the shaft descends and crosses zero at
+level 7. The port's crosses at level 9, from a cumulative warm drift of about
+`+0.04 K` per level. One crossing sheds 75% of the shaft and it never recovers.
+
+**The drift is missing evaporative cooling.** Restricted to levels where both
+shafts still carry the same mass -- so cause is separated from consequence --
+the *specific* evaporation ratio is 0.912-0.919. At roughly `0.3 K` of
+evaporative cooling per level that is `~0.027 K` per level, which over three
+levels is `~0.08 K`: the observed gap.
+
+**And the cause is not the rain supply.** Pooled over the heavy steps the
+port's `condpr` is **1.16x** ModelE's, and `qldn` is *drier* than ModelE's by
+`2.7e-4` (a drier shaft evaporates more, so that is consequence). What is wrong
+is `mcfrac`, the convective area fraction, which the port made **1.4-2.7x** too
+large:
+
+| step 20, level | 12 | 11 | 10 | 9 | 8 |
+| --- | --- | --- | --- | --- | --- |
+| `mcfrac` ours/ModelE | 2.69 | 2.38 | 2.25 | 2.22 | 2.71 |
+
+`mcfrac` sets `precip_area` in `prcp_mixrat = prcp/(prcp_area*depth*mb2kg)`,
+and the evaporation efficiency goes as `prcp_mixrat**0.6`, so too large an area
+spreads the same rain thinner and suppresses exactly the cooling that holds the
+downdraft down.
+
+`ccmul` was the culprit, and its default is conditional:
+
+```fortran
+call sync_param('see_debris', see_debris, default=.true.)
+if(see_debris) then
+  deflt = 1d0 ! stem still included in total MC cloud
+else
+  deflt = 2d0 ! the previous proxy for debris
+endif
+call sync_param('ccmul', ccmul, default=deflt)   ! MSTCNV.F90:585-593
+```
+
+`decks/bomex_scm.R` overrides neither parameter, so `see_debris` is true and
+`ccmul = 1`. The port had `_CCMUL = 2.0`, and its comment -- "2.0 unless
+`see_debris` is set" -- had read the default backwards. Same failure as
+section 44's `dd_detbyent`: a constant taken from the wrong branch of the
+source, with the live default never checked.
+
+### Effect
+
+With `_CCMUL = 1.0` the level-9 flip is gone: step 20's margin there moves
+`+0.019 -> -0.171` and the branch becomes `hold`, matching ModelE; step 17
+moves `+0.040 -> -0.159`. Aggregated over the 43 single-plume steps and all 48
+periods:
+
+| | before | after | ModelE |
+| --- | --- | --- | --- |
+| downdraft detrainment, levels 0-6 | 1.27 (0.10x) | **8.69 (0.73x)** | 11.96 |
+| downdraft detrainment, levels 7+ | 28.84 (1.44x) | 36.10 (1.79x) | 20.17 |
+| peak heating, ours/ModelE | 1.274 | **1.108** | 1.0 |
+| `dth_mc` profile correlation | +0.863 | **+0.949** | 1.0 |
+| peak drying, ours/ModelE | -- | 1.071 | 1.0 |
+
+Sub-cloud deposition, the open item since section 42, goes from 10% of ModelE's
+to 73%. The convection suite passes unchanged (366 passed, 3 skipped).
+
+### What is left
+
+Detrainment above the boundary layer got *worse* in ratio (1.44 -> 1.79),
+because the shaft is now heavier everywhere: at level 9 the port carries 68.09
+against ModelE's 51.35, and at level 12 it carries 32.99 against 17.26. That is
+a different defect -- the plume routes too much mass into the downdraft at
+upper levels -- and it is now the largest one left. The port also still
+detrains one level early (level 8 against ModelE's level 7) rather than two.
