@@ -3126,3 +3126,77 @@ layer empty while every component of the descent is individually exact.
 This is the threshold wall again, now localised to a specific decision
 variable with a measured scale. The lever is upstream: the plume's sorting
 into the downdraft, not the downdraft.
+
+## 45. The buoyancy branch is not a coin flip, and the port needs a real bias
+
+Section 44 read a ~50% buoyant fraction across the downdraft records and called
+the branch a coin flip that accumulated error randomises. Weighting by the mass
+the branch actually acts on says otherwise. Over all exchanging levels the
+record-count buoyant fraction is **0.503** and the mass-weighted fraction is
+**0.220**, because the records are two populations, not one:
+
+| population | n | share of `ddrup` | buoyant fraction |
+| --- | --- | --- | --- |
+| wisps, `ddrup` < 1 | 283 | 1.1% | 0.678 |
+| mid, 1 <= `ddrup` < 5 | 180 | 8.0% | 0.628 |
+| heavy, `ddrup` >= 5 | 287 | **91.0%** | **0.251** |
+| heaviest, `ddrup` >= 15 | 132 | 77.1% | **0.114** |
+
+Half the records are near-empty residual shafts whose sign is set by nothing.
+The shaft that carries the mass is reliably *non*-buoyant, and with room to
+spare -- heavy records only, median `svmix - svm1`:
+
+| level | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| buoyant fraction | 0.00 | 0.00 | 0.00 | 0.05 | 0.15 | 0.15 | 0.54 | 0.24 | 0.04 | 0.20 |
+| median margin [K] | -0.74 | -0.58 | -0.32 | -0.14 | -0.18 | -0.11 | +0.05 | -0.13 | -0.26 | -0.20 |
+
+Level 9, the peak-mass level, is the one genuinely marginal case. Everywhere
+else the heavy shaft sits -0.1 to -0.7 K below the threshold and carries its
+mass to the boundary layer as a structural outcome.
+
+**This changes what the port has to explain.** Section 44 concluded that an
+O(0.1 K) error tips a knife-edge decision, which would make the sub-cloud
+deficit a symptom of the accumulation wall and not separately fixable. That is
+wrong: to shed the shaft at levels 7-12 the port needs a systematic
+**+0.1 to +0.6 K** bias in `svmix - svm1` on the heavy records. That is a
+findable bug, not noise on a threshold.
+
+The mass-weighted correlation `corr(ddrup, dqevp) = +0.93..+0.996` looked at
+first like a stabilising feedback -- heavier shaft, more evaporation, colder,
+stays non-buoyant. It is mechanical: `condensate_evaporation` returns an
+extensive amount, so `dqevp` scales with mass by construction. The *specific*
+evaporation `dqevp/ddrup` is flat between the two branches at levels 5-8
+(ratio 1.00-1.17), so there is no feedback to reproduce. The populations differ
+in mass, not in physics.
+
+### Evaporation is exact too
+
+The teacher-forced test in section 44 fed the port ModelE's own `dqevp`, so it
+never tested the evaporation. Running the port's real `condensate_evaporation`
+and efficiency factor on ModelE's own shaft state and rain flux gives
+`ours/ModelE` = **1.0000** at levels 3, 4, 5, 6, 7, 8 and 10.
+
+(Levels 11-13 read 1.12-1.26, an artifact of the test rig: it accumulates
+`dp_from_cldtop` from the highest *downdraft* record, whereas ModelE starts at
+the plume top `lmax` above it, so the rig under-counts the air the rain has
+fallen through and over-estimates `prcp_mixrat`. The discrepancy is largest at
+the top and vanishes downward, exactly as that explanation requires.)
+
+A first pass at this measurement reported `ours/ModelE = 0.6597`, constant
+across seven levels while the efficiency factor varied 3.6x -- and
+`0.5**0.6 = 0.65975`, which made a missing factor in the precipitation split
+look certain. It was the rig again: `prcp_mixrat` uses the *total* falling flux
+`prcp = prcp_d + prcp_e` (`MSTCNV.F90:4375,4436`), which the port does
+correctly, but the dump carries `prcpd_diag = prcp_d`, the downdraft's half.
+Feeding half the flux into a `**0.6` power produced exactly `0.5**0.6`. Same
+error shape as sections 30, 36, 37 and 43: two quantities over different
+domains, and a clean-looking constant as the tell.
+
+### Where that leaves it
+
+Mass, thermodynamics, evaporation, the buoyancy branch and the detrainment all
+reproduce ModelE when fed ModelE's inputs. The bias therefore lives in the
+inputs -- `ddr`, `smdnl`, `qmdnl` from the plume's buoyancy sorting, or the
+`condpr` rain supply -- and it is a bias of order 0.1-0.6 K in the shaft's
+virtual temperature, large enough to find directly.
