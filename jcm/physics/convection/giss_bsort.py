@@ -321,6 +321,12 @@ class SortedBlends(NamedTuple):
     downdraft_water: jnp.ndarray
     downdraft_condensate: jnp.ndarray
     mixture_buoyancy: jnp.ndarray
+    # Total air put into blends at this level, `updairm + envairm`. The three
+    # fates partition it, so it is what turns the two exported fates into
+    # shares -- without it the rejoining fraction cannot be recovered from the
+    # outputs (the mass budget is satisfied for any split), and the sorting
+    # cannot be compared against ModelE's per-blend `blend_diag.txt` record.
+    blend_mass_total: jnp.ndarray
 
 
 def sort_blends(plume_mass: jnp.ndarray,
@@ -452,6 +458,7 @@ def sort_blends(plume_mass: jnp.ndarray,
         downdraft_water=_gather(to_downdraft, blend_water),
         downdraft_condensate=_gather(to_downdraft, blend_condensate),
         mixture_buoyancy=mixture_buoyancy,
+        blend_mass_total=jnp.sum(blend_mass, axis=0),
     )
 
 
@@ -533,6 +540,7 @@ class PlumeAscent(NamedTuple):
     downdraft_water: jnp.ndarray
     downdraft_condensate: jnp.ndarray
     cloud_mode_ratio: jnp.ndarray    # qc_updraft: condensate that may detrain
+    blend_mass_total: jnp.ndarray    # updairm + envairm, what the fates split
     active: jnp.ndarray              # bool: this level was processed
 
 
@@ -813,6 +821,7 @@ def plume_ascent(cloud_base: jnp.ndarray,
                    keep(sorted_blends.downdraft_water),
                    keep(sorted_blends.downdraft_condensate),
                    keep(cloud_mode_ratio),
+                   keep(sorted_blends.blend_mass_total),
                    survives)
         return carry, outputs
 
