@@ -3450,3 +3450,74 @@ section 47 could only establish empirically: `dp_disp2` falls below
 `dp_disp2_min = 50` and is zeroed, so `lmax_disp2 == lmax_disp1` and
 `closure2 = lmin.eq.lmax_disp2 .and. lmax_disp2.gt.lmax_disp1` is false by
 construction.
+
+## 49. The upper-level excess is a removal-fraction drift, not the sorting target
+
+Section 46 left the plume routing too much mass into the downdraft at upper
+levels as the largest open defect. Measured properly against the step-keyed
+`mass_budget.txt` dump over the 44 single-plume steps, it is a *consequence*.
+
+**One correction to make first.** An initial pass here compared the port's
+`plume_mass` (mass **entering** each level) against ModelE's `mplume` (mass
+**leaving**), which is a one-sided offset of exactly the per-level loss and
+inflated every ratio. The matching column is `mplume0`; the dump's own closure
+note names it (`mp_out = mp_in*(1-frem) + addback - cap`). The corrected
+numbers are below -- the plume-mass excess peaks at **1.84x**, not the 4.74x
+that mismatch produced. Fifth instance of the same error shape.
+
+### What is and is not wrong
+
+| level | 6 | 8 | 10 | 12 | 14 | 15 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `plume_mass` ours/ModelE | 1.03 | 1.20 | 1.27 | 1.45 | 1.66 | 1.84 |
+| entrained mass ours/ModelE | 1.03 | 1.15 | 1.11 | 1.46 | 1.86 | 2.15 |
+| `gzl` ours/ModelE | 0.999 | 0.999 | 0.999 | 0.999 | 0.998 | 0.998 |
+| `ma` ours/ModelE | 1.000 | 1.025 | 1.020 | 1.000 | 1.000 | 1.000 |
+| `tvl` ours/ModelE | 0.9998 | 0.9999 | 1.0000 | 1.0000 | 0.9999 | 0.9999 |
+| `wcu` ours/ModelE | 1.03 | 1.03 | 1.01 | 1.00 | 1.02 | 1.08 |
+
+The closure is right (`fmp2` median **1.004** against `mplume_b`), the plume
+starts right (**1.03** at the base), the geometry is right, and the entrained
+mass tracks the plume mass exactly as `envairm = min(mplume,2*mplume_b)*ent*gzl`
+requires -- so entrainment is not the fault either. The `2*mplume_b` cap never
+binds on either side. Total **detrainment matches at 1.041**; the downdraft
+total (1.346) is what the drift produces.
+
+What is wrong is the fraction removed per level:
+
+| level | 6 | 7 | 8 | 10 | 13 |
+| --- | --- | --- | --- | --- | --- |
+| removed fraction, ours | 0.505 | 0.450 | 0.493 | 0.391 | 0.352 |
+| removed fraction, ModelE | 0.556 | 0.513 | 0.552 | 0.494 | 0.425 |
+| `refblendwt` ours | 1.000 | 0.888 | 0.806 | 0.575 | 0.279 |
+| `refblendwt` ModelE | 1.000 | 0.871 | 0.737 | 0.504 | 0.196 |
+
+### Two effects, one of them self-reinforcing
+
+**At the cloud base the blend construction is identical and the fates are
+not.** At level 6 `refblendwt = 1.000` on both sides, so `fupd` is the
+reference `(.25,.5,.75)`, `updairm = envairm`, and `frem = envairm/mplume =
+0.371` on both. Yet only 67% of our blend mass leaves the plume against
+ModelE's 75%. `blend_diag.txt` confirms the 0.752 independently. So at the
+base our blends are too buoyant and rejoin the updraft where ModelE's detrain.
+
+**Above it, `refblendwt` amplifies.** `refblendwt = min(1, mplume/mplume_lag)`
+weights the blending ratios toward complete mixing as the plume thins, and
+`fupd_fullmix = mplume/(mplume+envairm)` exceeds 0.5 here, so a *lower*
+`refblendwt` raises `fupd`, puts more updraft air into blends, and removes
+more. Our plume is heavier relative to its own 1 km lag, so our `refblendwt`
+stays higher (0.279 against 0.196 at level 13), which removes less, which keeps
+the plume heavier. The port implements the mechanism correctly -- it is being
+fed its own error.
+
+So the seed is the sorting at the base and the amplifier is `refblendwt`. That
+also explains the vertical *shape* of the downdraft excess: at level 7 the port
+sends 0.14x of ModelE's mass down and at level 13 it sends 2.55x.
+
+### Next
+
+The lever is the blend buoyancy at low levels, not the downdraft. `mixbuoy` and
+the per-blend fate are dumped to `blend_diag.txt` -- but that dump has no step
+column, the same gap that made the downdraft dump unreadable until section 43.
+Keying it by `scm_step_diag` is the prerequisite for a like-for-like per-blend
+comparison.
