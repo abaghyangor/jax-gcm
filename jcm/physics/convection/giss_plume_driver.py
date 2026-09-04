@@ -48,7 +48,7 @@ from jcm.physics.convection import giss_downdraft as downdraft
 from jcm.physics.convection import giss_microphysics as microphysics
 from jcm.physics.convection import giss_tendencies as tendencies
 from jcm.physics.convection.giss_thermodynamics import (
-    DELTX, RGAS, safe_divide)
+    DELTX, GRAV, RGAS, safe_divide)
 
 # `bsort_enteff(2)`, the entraining plume's entrainment efficiency
 # (MSTCNV.F90:282). The less-entraining plume never fires under
@@ -507,6 +507,12 @@ def run_plume(cloud_base: jnp.ndarray,
 # (MSTCNV.F90:2646-2648).
 _MAX_SOURCE_SPAN = 300.0e2
 
+# `dp_disp`, the pressure distance a boundary-layer parcel may be displaced
+# upward to test for conditional instability: a fraction of the boundary
+# layer's own depth, capped (MSTCNV.F90:291-292, 1419).
+_DISPLACEMENT_FRACTION = 0.3
+_DISPLACEMENT_MAX = 50.0e2      # `dp_disp_max` = 50 hPa
+
 
 class ColumnConvection(NamedTuple):
     """What the whole plume sequence does to one column."""
@@ -535,6 +541,71 @@ def source_bottom(pressure: jnp.ndarray,
     within = (pressure - top_pressure) < _MAX_SOURCE_SPAN
     return jnp.where(jnp.any(within, axis=0), jnp.argmax(within, axis=0),
                      source_top)
+
+
+def displacement_top(layer_mass: jnp.ndarray,
+                     pressure: jnp.ndarray,
+                     boundary_layer_top: jnp.ndarray,
+                     highest_base: jnp.ndarray,
+                     cold_pool_mass: jnp.ndarray = 0.0) -> jnp.ndarray:
+    """``lmax_disp``: the highest cloud base a boundary-layer parcel reaches.
+
+    ModelE displaces a boundary-layer parcel upward by
+
+        dp_disp = min(dp_disp_fac*max(sum(ma(1:dcl)), dmcp)*kg2mb, dp_disp_max)
+
+    and walks up from ``dcl`` to the first level more than ``dp_disp`` above it
+    (``MSTCNV.F90:1419-1422``). The result gates how every candidate base builds
+    its source parcel (``MSTCNV.F90:2677-2687``): at or below it the plume
+    blends the whole boundary layer (:func:`source_bottom`), while above it the
+    source collapses to a single layer *and* the candidate must first pass a
+    TKE-against-stratification test, which in an undisturbed trade-cumulus
+    column it does not. So in practice this is what **selects the cloud base**:
+    the descending sweep rejects everything above ``lmax_disp`` and converts at
+    exactly that level. Against the BOMEX closure oracle, ``lmin == lmax_disp``
+    on 48 of 52 plumes and ``lmin <= lmax_disp`` on all 52.
+
+    This replaces the earlier ``dcl + 1``, which was an offset fitted to the
+    same oracle. The fit holds where the boundary layer is shallow enough that
+    one level clears ``dp_disp``, and breaks where it is deeper: at ``dcl = 7``
+    the true rule gives ``dcl + 2``.
+
+    Args:
+        layer_mass: ``ma`` [kg/m^2], surface-first.
+        pressure: [**Pa**], surface-first.
+        boundary_layer_top: ``dcl``.
+        highest_base: ``lmcm``, the highest level the sweep may consider.
+        cold_pool_mass: ``dmcp`` [kg/m^2], the cold pool's mass, which floors
+            the displacement when a cold pool is deeper than the boundary
+            layer. There is no cold-pool scheme in this port, so it defaults to
+            zero and the ``max`` reduces to the boundary layer's own mass --
+            correct for an undisturbed case like BOMEX, not for a disturbed one.
+
+    Returns:
+        The level index, or ``highest_base + 1`` where nothing clears the
+        displacement.
+    """
+    nlev = pressure.shape[0]
+    level = jnp.arange(nlev).reshape((nlev,) + (1,) * (pressure.ndim - 1))
+
+    boundary_layer_mass = jnp.sum(
+        jnp.where(level <= boundary_layer_top, layer_mass, 0.0), axis=0)
+    # `kg2mb` converts the layer masses to a pressure depth; working in Pa the
+    # conversion is just gravity.
+    displacement = jnp.minimum(
+        _DISPLACEMENT_FRACTION * GRAV
+        * jnp.maximum(boundary_layer_mass, cold_pool_mass),
+        _DISPLACEMENT_MAX)
+
+    base_pressure = jnp.sum(
+        jnp.where(level == boundary_layer_top, pressure, 0.0), axis=0)
+    # ModelE tests `pl(dcl) - pl(lmax_disp+1)`, the pressure at the top edge of
+    # the candidate layer.
+    above = jnp.concatenate([pressure[1:], pressure[-1:]], axis=0)
+    clears = ((base_pressure - above) > displacement) & \
+             (level >= boundary_layer_top) & (level <= highest_base)
+    return jnp.where(jnp.any(clears, axis=0), jnp.argmax(clears, axis=0),
+                     highest_base + 1)
 
 
 def convective_column(potential_temperature: jnp.ndarray,

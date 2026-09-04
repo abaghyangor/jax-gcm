@@ -71,6 +71,7 @@ from jcm.physics.convection.giss_mass_flux import (
 from jcm.physics.convection.giss_plume import plume_ascent_column
 from jcm.physics.convection.giss_plume_driver import (
     convective_column,
+    displacement_top,
     enhanced_source,
     source_bottom,
     source_weights,
@@ -546,10 +547,18 @@ class GissConvection(PhysicsTerm):
         blt, dtheta, dq = self._source_parcel_inputs(
             diagnostics, q_sf, jnp.flip(density, axis=0)[0], nlev)
 
-        # The plume is rooted one level **above the boundary-layer top**: it is
-        # launched from the top of the well-mixed layer. Validated directly
-        # against the ModelE closure oracle -- `LMIN == dcl + 1` on 46 of 48
-        # BOMEX periods (the other two one level lower).
+        # The plume is rooted at `lmax_disp`, the highest level a
+        # boundary-layer parcel can be displaced to (see
+        # :func:`~jcm.physics.convection.giss_plume_driver.displacement_top`).
+        # ModelE's descending sweep rejects every candidate above it -- their
+        # source collapses to one layer and must pass a TKE test it fails in an
+        # undisturbed column -- so the sweep converts at exactly that level:
+        # `LMIN == lmax_disp` on 48 of the 52 BOMEX plumes, `<=` on all 52.
+        #
+        # This previously used `dcl + 1`, an offset fitted to the same oracle.
+        # It agrees with `lmax_disp` wherever one level clears the displacement
+        # and disagrees where the boundary layer is deeper (at `dcl = 7` the
+        # rule gives `dcl + 2`).
         #
         # The closure is very level-sensitive, so this matters: on period 47 it
         # returns 28 / 85 / 82 kg/m^2 at dcl / dcl+1 / dcl+2 against ModelE's 71.
@@ -560,8 +569,10 @@ class GissConvection(PhysicsTerm):
         #
         # The *reported* ``cloud_base`` stays the surface-parcel LCL, which is the
         # quantity validated against ModelE's ``cldmc`` (47/48 exact).
-        closure_base = (cloud_base if blt is None
-                        else jnp.clip(blt + 1, 0, nlev - 3))
+        closure_base = cloud_base if blt is None else jnp.clip(
+            displacement_top(air_mass, p_sf, blt,
+                             jnp.asarray(nlev - 3, dtype=int)),
+            0, nlev - 3)
 
         if self.bsort:
             # `MASS_FLUX2` blends the source over `lmin0..lmin` rather than
