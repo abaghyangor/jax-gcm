@@ -3568,3 +3568,69 @@ The oscillation is where the remaining error now lives.
 both the improvement and the regression. Future comparisons should report the
 distribution -- at minimum a worst-decile figure alongside the median -- rather
 than one number.
+
+## 51. `blend_diag.txt` keyed, and the fate distribution measured
+
+`blend_diag.txt` now carries `(scm_step_diag, lmin)` -- the same key
+`mass_budget.txt` uses -- so a blend can be matched to the plume that made it.
+Without it the 4 multi-plume steps of 48 are unreadable and the dump cannot be
+lined up against the port at all. ModelE rebuilt, BOMEX rerun, `run_status` 13
+over all 48 steps.
+
+Two checks on the rerun. Every other dump came back **byte-identical** to the
+archived copies (`mass_budget.txt`, `closure_diag.txt`, `plume_diag.txt`,
+`microphys_diag.txt`, `sweep_state_diag.txt`), so the run reproduced exactly
+and only the intended dump changed. `downdraft_diag.txt` differs in **19 of 873
+rows and only in `svmix`**, which the old build wrote as 0. All 19 have
+`ddin = ddraft = ddrup = 0` -- the shaft does not exist there -- and every
+analysis filtered them out, so no earlier conclusion is affected. The cause is
+that `svmix` is stale on empty-shaft records and the recompile changed what was
+in it; it is physics-neutral, since `detr = ddraft*(...) = 0` whichever branch
+the buoyancy test picks. It is also a concrete instance of the near-empty
+"wisp" population section 45 identified as flipping on nothing.
+
+### The port's sorting is now auditable
+
+`SortedBlends`/`PlumeAscent` gained `blend_mass_total` (`updairm + envairm`).
+The two exported fates alone cannot give shares: the mass budget is satisfied
+for any split between rejoining and the plume it rejoins, so the rejoining
+fraction was unrecoverable from the outputs. Suite unchanged (376 passed, 3
+skipped), and `modele_jcm_bridge.oracle.read_blend_diag` reads the dump.
+
+### What the fates say
+
+Per level over the 44 single-plume steps, share of blend mass by fate:
+
+| level | blend total o/E | rejoin o/E | detrain o/E | downdraft o/E |
+| --- | --- | --- | --- | --- |
+| 6 | 1.07 | **0.330 / 0.250** | **0.670 / 0.750** | 0.000 / 0.000 |
+| 7 | 1.11 | 0.447 / 0.380 | 0.545 / 0.553 | **0.008 / 0.067** |
+| 8 | 1.11 | 0.429 / 0.380 | 0.351 / 0.394 | 0.220 / 0.226 |
+| 9 | 1.21 | 0.257 / 0.300 | 0.588 / 0.553 | 0.155 / 0.147 |
+| 11 | 1.14 | 0.158 / 0.201 | 0.311 / 0.312 | 0.531 / 0.488 |
+| 12 | 1.27 | 0.256 / 0.295 | **0.347 / 0.441** | **0.397 / 0.263** |
+| 13 | 1.38 | 0.394 / 0.400 | **0.170 / 0.365** | **0.436 / 0.235** |
+| 14 | 1.50 | 0.123 / 0.158 | 0.369 / 0.456 | 0.509 / 0.386 |
+| 15 | 1.82 | 0.000 / 0.000 | 0.077 / 0.142 | 0.923 / 0.858 |
+
+Level 6 reproduces section 49's number exactly from the independent dump: 0.670
+of our blend mass leaves against ModelE's 0.750.
+
+**The overall balance is nearly right and the vertical distribution is not.**
+Column rejoin share is **0.317 against 0.301**. But the fates are misplaced in
+height: at the base we rejoin too much and send almost nothing down (0.008
+against 0.067 at level 7, an eightfold shortfall), while at levels 12-14 we
+send far too much down and detrain too little (0.436 against 0.235 at level 13).
+
+The three fates are cut by two thresholds on the same variable -- rejoin above
+`posbuoy/tvl`, downdraft below `negbuoy/tvl`, detrain between. Too many blends
+land in the upper bin low down and in the lower bin high up, which says our
+`mixbuoy` distribution is tilted relative to ModelE's: too positive near cloud
+base, too negative aloft. That is one signed quantity to chase, and
+`blend_diag.txt` now carries ModelE's value of it per blend.
+
+### Next
+
+Compare `mixbuoy` itself, blend by blend, against the dump. The port computes
+it in `sort_blends` but does not export it per blend, so that needs the same
+treatment `blend_mass_total` just got.
