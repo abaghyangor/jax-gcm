@@ -3288,3 +3288,84 @@ against ModelE's 51.35, and at level 12 it carries 32.99 against 17.26. That is
 a different defect -- the plume routes too much mass into the downdraft at
 upper levels -- and it is now the largest one left. The port also still
 detrains one level early (level 8 against ModelE's level 7) rather than two.
+
+## 47. Constant audit: every ModelE-derived constant checked against its live default
+
+Two constants in two days were wrong for the same reason -- a value read from
+the wrong branch of the source -- so every hand-copied constant in the `giss_*`
+modules was checked against the value this run actually uses. **The starting
+fact that makes the audit tractable: `decks/bomex_scm.R` overrides no MSTCNV
+parameter at all**, so every one sits at its computed default.
+
+**Result: `_CCMUL` (section 46) was the only wrong value.** Everything else
+checks out.
+
+### The conditional defaults, which are the dangerous ones
+
+Five MSTCNV parameters take a default computed by an `if` rather than a
+literal. The port had four of the five right:
+
+| parameter | condition | live value | port | |
+| --- | --- | --- | --- | --- |
+| `ccmul` | `see_debris` defaults **true** | 1.0 | was 2.0 | **fixed** |
+| `mc_fddrt` | `bsort_entdet` **true** -> `preset%mc_fddrt` | 0.5 | `_DOWNDRAFT_PRECIP_SHARE` 0.5 | ok |
+| `tadjmc1` | `lessent_scheme` is 2, not `< 2` | 1 h | `_TADJ_SECONDS` 3600 | ok |
+| `dd_evpeff_qp_scale` | `alt_coldpool` **true** | 1e-3 | `_EVAP_PRECIP_SCALE` 1e-3 | ok |
+| `MINFRAC` | `cold_pool_on` **true** | 5e-4 | `_MIN_PLUME_FRACTION` 5e-4 | ok |
+
+`bsort_entdet` defaulting true also means `entrainment_cont1/2` are never set:
+that `else` branch is unreachable. The port's `_CONTCE = 0.6` is
+`entrainment_cont2` and is used **only** on the legacy `_convective_tendencies`
+path (`giss_mstcnv.py:495`) -- correct for that path, but that path models a
+configuration ModelE does not run here.
+
+### Verified against the source
+
+`giss_bsort.py`: `_A_BUOY_BUOYANT` 1/6 and `_A_BUOY_OVERSHOOT` 1.0
+(`:3531-3535`), `_MAX_DILUTION` .95 (`:3560`), `_DET_RATE` .5 (`:3562`),
+`_ENT_FLOOR_LESS_ENTRAINING` 3e-4 with the 700 mb gate and
+`_ENT_FLOOR_MORE_ENTRAINING` 5e-4 (`:3566-3570`), `_ENT_MAX` 4e-3 (`:3575`),
+`_OVERSHOOT_BUOYANCY` -.25 (`:3578`), `_UPDRAFT_FRACTION_MAX` .99999
+(`:3635`), `_POSITIVE_BUOYANCY` +.05 and `_NEGATIVE_BUOYANCY` -.2
+(`:3414-3415`), `_REMRAT` .333 (`:871`), `_MIN_CLOUD_BASE_FRACTION` .01
+(`:1697`), `_LAG_DISTANCE` 1e3 (`:1916`), `_CLOUD_MODE_DIAMETER` = `dcw_qc`
+80e-6, `_MAX_OVERSHOOT_DT` = `max_dt_overshoot` 1.0.
+
+`giss_mass_flux.py`: `_N_ITER` 9 (`:8994`), `_FEVAP_FRAC` .005 (`:9024`),
+`_DMSE_TOL` 1e-3 (`:9065-9067`).
+
+`giss_tendencies.py`: `_MAX_SUBSTEPS` 20 = `ksubmax` (`:4966`) and
+`_COURANT_LIMIT` .999 (`:5003-5008`) -- both matching ModelE's own subsidence
+limiter rather than being port inventions, which was not previously recorded.
+
+`giss_plume.py`: `_ETADN` 1/3 = `ETADN0` (`:3017`).
+
+`giss_plume_driver.py`: `_ENTRAINMENT_EFFICIENCY` 0.67 -- and this one is
+confirmed from the oracle rather than only from the source, because `enteff`
+depends on a `closure2` flag whose other branch blends toward 0.5. The plume
+dump carries `enteff = 0.67` and `iplume = 2` on **all 536 records**, so
+`closure2` is inactive for BOMEX. The same dump shows the entrainment hitting
+exactly 5.000000e-04 at its floor and exactly 4.000000e-03 at its cap,
+independently confirming both.
+
+### Dead code the port is right to omit
+
+`detr_into_dd_dpscalep = 150d0` and the cap
+`ddmaxmp = min(.5d0, ma(l)/detr_into_dd_dmscalep)*mplume` (`:3654`) looked at
+first like a missing limit on how much plume mass enters the downdraft --
+which is exactly the open defect from section 46. It is inert: two lines above,
+`ddmassp = 0.` with the comment "disabling this kind of downdraft for now",
+so the `if(ddmassp.ge..01d0)` block never runs. The other use of
+`detr_into_dd_dmscale` (`:3182`) is in the legacy non-bsort routine.
+
+### Not ported at all (gaps, not wrong values)
+
+`urelscale` (momentum PGF -- momentum is not ported), `dp_disp_fac/max` and
+`dp_disp2_fac/max/min` (parcel displacement in the conditional-instability
+check), `pthresh_closure2` and the whole `closure2` plume (verified inactive
+here), `terminal_aspcp`, `vterm_env`, `mc_fevap_dpref`, `dpthresh_fp1`,
+`debdecaytime`, and the ice-phase parameters `tfmc`, `cloudrvi_mstcnv`,
+`qci_detrainment_multiplier` (BOMEX is all-liquid on every oracle level).
+
+`giss_plume_driver_test.py` now pins the driver's constants, including the two
+whose defaults are conditional.
