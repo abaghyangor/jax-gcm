@@ -47,16 +47,32 @@ from jcm.physics.convection.giss_thermodynamics import (
 # the surrounding environment (`mc_fddrt`).
 _DOWNDRAFT_PRECIP_SHARE = 0.5
 
-# Fraction of the downdraft *retained* where it has turned positively buoyant;
-# the rest detrains. ModelE's `dfac = 1 - fddet`. Measured from the oracle at
-# 0.25 (so 75% detrains), `fddet` having no assignment left in MSTCNV.F90.
+# ModelE sets the detrained fraction as
+#
+#     detr = ddraft * min(1, dfac + dd_detbyent*etal_)      MSTCNV.F90:4573-4585
+#
+# with `dfac = 1 - fddet` where the shaft is positively buoyant (and `etal_`
+# forced to zero there, so it neither entrains nor picks up the second term),
+# `dfac = 1 - detfac(l)` in the boundary layer, and `dfac = 0` elsewhere.
+#
+# Fraction *retained* where the downdraft has turned positively buoyant;
+# `FDDET = 0.25d0` is a parameter at MSTCNV.F90:42, so 75% detrains.
 _BUOYANT_RETENTION = 0.25
 # In the boundary layer detrainment is forced regardless of buoyancy, at
-# `1 - detfac` with `detfac = 0.5` (MSTCNV.F90:4230).
+# `1 - detfac(l)`. Despite being an array, `detfac` is filled with the constant
+# .5d0 (MSTCNV.F90:4329) -- the mass-weighted `msum/msumup` alternative sitting
+# next to it is commented out.
 _BOUNDARY_LAYER_DETRAINMENT = 0.5
+# Detrainment proportional to the entrainment rate, on top of `dfac`. Zero in
+# the preset this port targets (MSTCNV.F90:295); the tuned presets further down
+# that block set it to 0.28-0.48, so the term is carried explicitly rather than
+# dropped. With it zero the three branches reduce to the exact constants 0.75 /
+# 0.50 / 0.00, which is what the oracle shows on every one of its 873 downdraft
+# records.
+_DD_DETBYENT = 0.0
 
-# Downdraft entrainment: a constant rate times the layer depth. ModelE passes
-# `etal` in; over 561 oracle records `etal/gzl` is 2.0e-4 /m to within 0.8%.
+# Downdraft entrainment: a constant rate times the layer depth, ModelE's
+# `etal(:) = entcon_dd*gzl(:)` (MSTCNV.F90:1250) with `entcon_dd = .2d-3`.
 _DOWNDRAFT_ENTRAINMENT_RATE = 2.0e-4
 
 # Ceiling on entrained environmental air as a fraction of the layer's mass.
@@ -267,21 +283,26 @@ def downdraft_descent(source_mass: jnp.ndarray,
         can_exchange = alive & (level > 0) & (level < cloud_top)
 
         # Where it has turned buoyant the downdraft stops entraining and sheds
-        # most of itself; in the boundary layer it sheds regardless.
-        detrained_fraction = jnp.where(
+        # most of itself; in the boundary layer it sheds regardless. `dfac` and
+        # the entrainment rate together give ModelE's detrained fraction.
+        dfac = jnp.where(
             buoyant, 1.0 - _BUOYANT_RETENTION,
             jnp.where(in_boundary_layer, 1.0 - _BOUNDARY_LAYER_DETRAINMENT,
                       0.0))
+        # A buoyant shaft is given `etal_ = 0`, which suppresses entrainment and
+        # the entrainment-proportional share of the detrainment together.
         entrainment = jnp.where(buoyant, 0.0,
                                 _DOWNDRAFT_ENTRAINMENT_RATE * gzl)
+        detrained_fraction = jnp.minimum(
+            1.0, dfac + _DD_DETBYENT * entrainment)
 
         entrained = jnp.where(can_exchange, mass * entrainment, 0.0)
         # ModelE's "implicit" form, then a ceiling on how much of the layer may
-        # be drawn in.
+        # be drawn in. The detrained mass is *not* limited the same way: ModelE
+        # takes both from the pre-exchange `ddrup` and caps only entrainment.
         entrained = safe_divide(entrained, 1.0 + safe_divide(entrained, ma))
         entrained = jnp.minimum(entrained, _REMRAT * ma)
-        detrained = jnp.where(can_exchange,
-                              mass * jnp.minimum(1.0, detrained_fraction), 0.0)
+        detrained = jnp.where(can_exchange, mass * detrained_fraction, 0.0)
 
         detrained_fraction_actual = safe_divide(detrained, mass)
         detrained_heat = heat * detrained_fraction_actual

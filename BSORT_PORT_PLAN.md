@@ -3044,3 +3044,85 @@ that are not in the port:
 
 Porting the expression properly is the next step, and it is the first thing in
 a while that is a formula rather than an accumulation effect.
+
+## 44. Retraction: the expression is already ported, and the wall is located
+
+Section 43 was wrong, and wrong in a way worth naming. It quoted
+`dd_detbyent = 0.47769839` from `MSTCNV.F90:458` -- which is inside a *tuned*
+preset. `decks/bomex_scm.R` sets no `tuning_name`, so the run uses the
+`preset_t` **defaults** at `MSTCNV.F90:280-300`, where `dd_detbyent = 0d0`.
+The same block also sets `entcon_dd = .2d-3`, `geometric_fevapfac = 0d0`,
+`mc_fddrt = .5d0` and `mc_tqstar_fac = 1d0` -- every one of which already
+matches a constant in the port, which is the consistency check that should
+have been run before reading a value out of the source at all.
+
+`detfac(l)` is likewise a red herring: it is an array, but it is filled with
+the literal `.5d0` (`MSTCNV.F90:4329`), the mass-weighted `msum/msumup`
+alternative next to it being commented out. And `FDDET = 0.25d0` is a
+parameter at `MSTCNV.F90:42`, so `1 - fddet = 0.75`.
+
+With `dd_detbyent = 0` the expression collapses to three exact constants, and
+that is precisely what the oracle shows across all 873 downdraft records:
+
+| branch | n | `detr/ddrup` min | med | max |
+| --- | --- | --- | --- | --- |
+| positively buoyant | 377 | 0.750000 | 0.750000 | 0.750000 |
+| boundary layer, non-buoyant | 188 | 0.500000 | 0.500000 | 0.500000 |
+| free air, non-buoyant | 185 | 0.000000 | 0.000000 | 0.000000 |
+
+The port's `_BUOYANT_RETENTION = 0.25` and `_BOUNDARY_LAYER_DETRAINMENT = 0.5`
+were fitted, but they fit because they are the actual values. The full
+expression is now written out in `giss_downdraft.py` with `_DD_DETBYENT = 0.0`
+carried explicitly rather than dropped, so a preset change cannot silently
+alter the branch, and `giss_downdraft_test.py` pins all four constants
+alongside a structural test of each branch. The rewrite is value-neutral: the
+full convection suite passes unchanged (356 passed, 3 skipped).
+
+### The descent is faithful; its inputs are not
+
+Teacher-forcing the descent on ModelE's own per-level inputs -- its `ddr`,
+`smdnl`, `qmdnl`, its evaporation `dqevp`, its environment -- and stepping the
+port's own arithmetic down the shaft reproduces ModelE:
+
+| quantity | relative error (median) |
+| --- | --- |
+| `ddin`, mass entering each level | 9.7e-7 |
+| `qldn`, shaft humidity | 2.8e-6 |
+| `thdn`, shaft potential temperature | 1.1e-5 |
+| total detrained mass | 0.3% |
+
+and the buoyancy flag agrees on **97.5%** of records. (A first pass reported
+32% disagreement; 234 of those 256 flips were start-of-shaft records where the
+replication's own `thdn` is meaningless because the mass is still zero.
+Restricting to records where the replication is converged leaves 22 flips out
+of 515, uncorrelated with the buoyancy margin.)
+
+So the descent -- mass, thermodynamics, evaporation and the branch -- is not
+where the sub-cloud error lives. It is inherited from `ddr`/`smdnl`/`qmdnl`,
+the plume's buoyancy-sorted routing into the shaft, which is upstream.
+
+### What makes a small upstream error into a large one
+
+The mechanism is now measured rather than asserted. Inverting ModelE's dumped
+`svmix` for the condensate load it actually used gives a median `wload` of
+**2.8e-4**, never within an order of magnitude of the `0.01` cap -- so the
+rain load shifts the virtual temperature by ~0.03% and the buoyancy decision
+is set almost entirely by the shaft's own `tldn` and `qldn`. And the margin
+that decision turns on is thin exactly where the mass is:
+
+| levels | median `svmix - svm1` | buoyant fraction | |
+| --- | --- | --- | --- |
+| 1-4 | -0.31 to -1.17 K | 0.00-0.31 | robustly non-buoyant: the 0.5 branch |
+| 5-12 | **-0.10 to +0.07 K** | 0.44-0.54 | a coin flip |
+| 13+ | +0.23 to +0.93 K | 0.71-1.00 | robustly buoyant |
+
+Levels 5-12 decide on ~0.05 K out of a 295 K virtual temperature -- 2e-4
+relative. An O(0.1 K) error in the shaft's potential temperature, which the
+un-teacher-forced port certainly has, does not perturb the detrainment by a
+few percent there; it moves the branch from **0.00 to 0.75** discretely. That
+is why the port sheds the shaft at levels 8-9 and arrives at the boundary
+layer empty while every component of the descent is individually exact.
+
+This is the threshold wall again, now localised to a specific decision
+variable with a measured scale. The lever is upstream: the plume's sorting
+into the downdraft, not the downdraft.
