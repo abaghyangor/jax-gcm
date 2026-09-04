@@ -60,8 +60,18 @@ _ENTRAINMENT_EFFICIENCY = 0.67
 _CLOUD_BASE_VELOCITY = 0.5
 
 # `ccmul`, the multiplier on the updraft mass flux in the convective fraction.
-# 2.0 unless `see_debris` is set (MSTCNV.F90:588-593).
-_CCMUL = 2.0
+# Its default is conditional: `see_debris` defaults to *true*, which selects
+# `ccmul = 1` because the convecting stem is then already counted in the total
+# convective cloud; the 2.0 is the older proxy used only when debris is not
+# seen (MSTCNV.F90:585-593). `decks/bomex_scm.R` sets neither parameter, so 1.0
+# is what this run uses.
+#
+# This is not a cosmetic factor. `mcfrac` sets `precip_area` in the downdraft's
+# `prcp_mixrat`, and the evaporation efficiency goes as `prcp_mixrat**0.6`, so
+# doubling it spreads the same rain over twice the area, suppresses the
+# evaporative cooling that keeps the downdraft negatively buoyant, and makes
+# the shaft detrain several levels too high.
+_CCMUL = 1.0
 
 # `qboost` scales the source parcel's humidity. Both branches reduce to 1.0
 # whenever `mc_tqstar_fac > 0` (MSTCNV.F90:2624-2625, 2675-2682), which every
