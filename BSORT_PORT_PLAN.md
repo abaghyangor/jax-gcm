@@ -4016,3 +4016,75 @@ only when the convection directory runs as a whole, because
 alone it fails at 1.3e-4 against a 1e-4 tolerance. Not introduced here -- it
 fails identically at the last known-green commit -- but it means that test
 asserts float64 agreement while claiming to test the float32 path.
+
+## 58. The blend-buoyancy error is evaporative cooling, not condensate loading
+
+Splitting section 57's error. `mixbuoy = (tvmix - tvl)/tvl - wmix`, so it has a
+thermal half and a condensate-loading half. As fractions of the `negbuoy`
+threshold width (6.8e-4):
+
+| level | total | thermal | condensate | our `wmix` / ModelE |
+| --- | --- | --- | --- | --- |
+| 6 | +0.30 | **+0.31** | +0.00 | 1.64 |
+| 11 | -0.90 | **-0.97** | +0.10 | 0.85 |
+| 13 | -0.35 | -0.35 | +0.06 | 0.89 |
+| 15 | -1.01 | **-1.31** | +0.30 | 0.61 |
+
+The thermal half carries essentially all of it, and the condensate half is
+small and of *opposite* sign -- it partly offsets rather than contributing. So
+this is not a microphysics-loading error, despite `condpr` measuring 1.16x
+ModelE's.
+
+### Which input
+
+`PlumeAscent` now also carries the blend's pre-evaporation properties and its
+evaporation, matching `smix_raw`, `qmix_raw`, `wmix_raw` and `dqevp` in the
+dump, so the decision variable can be matched term by term:
+
+| level | d(theta) raw | d(q) raw | d(condensate) raw | **d(dqevp)** | airmix o/E |
+| --- | --- | --- | --- | --- | --- |
+| 6 | -0.0077 | +6e-6 | -7e-6 | -9e-6 | 1.115 |
+| 11 | -0.0070 | -2.0e-4 | -3.7e-5 | **+3.0e-5** | 1.667 |
+| 13 | +0.0086 | -6.2e-5 | -1.2e-5 | **+4.9e-5** | 2.076 |
+| 15 | +0.0353 | -3.3e-4 | -4.7e-5 | **+1.6e-4** | 4.973 |
+
+The raw potential temperature differs by 0.007-0.035 in ModelE's `th` units,
+which is **0.006-0.032 K** -- an order too small to move a blend across the
+threshold on its own. What does move it is the **evaporation**: at level 15 the
+port evaporates 1.6e-4 more condensate than ModelE, and
+`smix -= slh*dqevp/plk` turns that into `2489*1.6e-4/0.9 = 0.39` in `th` units,
+about **1.9 threshold widths** of cooling. Against a measured thermal error of
+-1.31 widths that matches in sign and order, and nothing else in the table
+does.
+
+### The likely upstream cause
+
+The blends are too *dry* aloft -- `d(q)` of -2.0e-4 at level 11 and -3.3e-4 at
+level 15. A drier blend has a larger saturation deficit, and
+`condensate_evaporation` is deficit-limited here rather than
+condensate-limited: the port evaporates 1.6e-4 *more* at level 15 while holding
+4.7e-5 *less* condensate, which is only possible if neither side is running out.
+So a humidity deficit of the same order as the extra evaporation feeds straight
+through.
+
+Note also `airmix o/E` rising from 1.1 near cloud base to 5.0 at level 15: the
+blend spectrum is far more massive aloft, which is section 49's plume-mass
+drift showing up in the sorting inputs.
+
+### Next
+
+Two things to separate, in this order:
+
+1. **Why the blends are dry aloft.** The environment is verified correct
+   (section 56), so the humidity has to come from the plume's own water budget.
+   `mass_budget.txt` carries `smp`/`qmp` per level for exactly this, and the
+   plume's own heat and water have never been compared -- only its mass,
+   velocity and detrainment.
+2. **Whether `condensate_evaporation` matches `get_dq_evap`** given identical
+   inputs. It is deficit-limited here, so its saturation calculation is
+   load-bearing, and it has only ever been tested inside the downdraft, where
+   section 44 found it exact at 1.0000 -- but that was at downdraft
+   temperatures, 20-30 K warmer than these blends.
+
+The second is a bounded unit-level check and should come first if the first
+does not immediately explain the size.
