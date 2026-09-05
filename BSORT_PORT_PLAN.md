@@ -3709,3 +3709,64 @@ levels 7-11, with periods 27-47 nearly clean. A vertical dipole is misplaced
 heating, which is what a plume detraining at the wrong level produces -- the
 same defect sections 49 and 51 identify from the mass budget, now visible
 directly in the tendencies.
+
+## 53. The residual window is a downdraft regime, and it is ModelE's own
+
+Section 52's residual Hovmoller localised nearly all the remaining error to
+periods 9-21 at levels 7-11. Asking what is different about that window gives a
+clean answer, and the answer is not in the plume.
+
+Plume-side candidates all correlate weakly with the per-period nRMSE over 48
+periods: plume count +0.125, `lmin` +0.349, cloud depth -0.363, `mplume_b`
++0.429, entrainment rate +0.286. None of them is the discriminator.
+
+The downdraft is. Per step, ModelE's own peak shaft mass `ddin`:
+
+| steps | 10-22 (the residual window) | 28-48 |
+| --- | --- | --- |
+| peak shaft mass | 18-84 kg/m^2 | **1.8-6.5 kg/m^2** |
+| evaporation into the shaft | 0.014-0.093 | 0.0014-0.009 |
+| mass sorted into it (`ddr`) | 26-81 | 12-28 |
+
+The mass *fed* to the downdraft only halves between the two, while the mass it
+*accumulates* drops by a factor of 10-20. So the shaft is shedding as fast as
+it is fed in the later steps and building in the earlier ones.
+
+**BOMEX contains a downdraft regime transition at step 27/28**, and it is
+visible in ModelE alone, with no reference to the port:
+
+| ModelE's own downdraft | steps 1-27 | steps 28-48 |
+| --- | --- | --- |
+| mass-weighted buoyant fraction | **0.145** | **0.967** |
+| median `detr/ddrup` | 0.500 (boundary-layer branch) | 0.750 (buoyant branch) |
+| median margin `svmix - svm1` | **-0.195 K** | **+0.293 K** |
+
+The margin flips sign by about 0.5 K, uniformly across levels 4-15. In the
+first regime the shaft is negatively buoyant and accumulates; in the second it
+is buoyant essentially everywhere, sheds 75% per level, and never builds.
+
+### Why this explains the shape of the error
+
+This is not a new defect. It is the same one section 46 found -- the port's
+shaft crosses into the buoyant branch about two levels too early, from a warm
+bias of order 0.1 K -- and the regime tells us exactly when that bias matters.
+
+In the active regime ModelE's margin sits at **-0.105 to -0.195 K**, which is
+the *same size* as the port's bias, so the port flips where ModelE does not and
+the shaft that should reach 40-80 kg/m^2 does not accumulate. In the quiet
+regime ModelE is already +0.3 K buoyant, comfortably past the threshold, so
+both models shed and a 0.1 K bias changes nothing.
+
+That is why the residual is episodic rather than uniform: the port's error is
+constant, and the oracle's sensitivity to it is not.
+
+### Consequences
+
+* The remaining accuracy work is downdraft buoyancy, not the plume ascent, and
+  the target tolerance is now quantified: the shaft's virtual temperature has
+  to be right to well inside 0.1 K for the active regime to come out right.
+* BOMEX is a better test case than it looked. It contains both regimes, and a
+  single median over all 48 periods averages across them -- which is part of
+  why the headline numbers looked healthier than the port is.
+* Reporting should split by regime, not just by decile. A future case that sits
+  entirely in the quiet regime would look excellent and test almost nothing.
