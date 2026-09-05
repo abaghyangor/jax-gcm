@@ -3902,3 +3902,48 @@ This is a limit on the like-for-like claim, not yet a diagnosis. It needs
 checking on its own before any further downdraft-buoyancy work, because a port
 compared against a 4% drier environment cannot be expected to reproduce a
 threshold crossing.
+
+## 56. Retraction: the harness reconstruction was already correct
+
+Section 55 flagged the port's environment as 4-6% drier and 0.35-0.7 K colder
+than what ModelE's downdraft is compared against, and proposed fixing the
+harness before doing more downdraft work. **That was my own indexing error**,
+and the harness needs no fix.
+
+The comparison script read the port's environment at 0-based levels 6-12 and
+ModelE's `sm1`/`qm1` at **1-based** levels 6-12 -- our 7-13 against their 6-12.
+Humidity falls with height, so the shift showed up as a clean few-percent dry
+bias. Seventh instance of the same error family, and the second this session
+where the tell was a suspiciously clean constant offset.
+
+Measured with the levels aligned, against ModelE's own `sm1`/`qm1`:
+
+| reconstruction | theta bias [K] | q ratio |
+| --- | --- | --- |
+| **undo `dth_mc` only (current)** | **-0.002** | **1.0003** |
+| undo `dth_mc + dth_ss` | +0.008 | 1.0000 |
+| undo `dth_mc + dth_ss + dth_rad` | +0.050 | 1.0000 |
+| undo those plus `dth_ls`, `dth_nudge` | +0.019 | 1.0032 |
+
+The current reconstruction is right to **0.002 K and 0.03%**, far inside the
+0.1-0.2 K margin the downdraft branch turns on. Every additional term makes the
+match *worse by exactly that term's magnitude* (`dth_ss` +0.010, `dth_rad`
++0.050, both matching their per-step sizes), which says the SUBDD snapshot sits
+immediately after convection rather than at the end of the step. That was not
+obvious in advance -- `dth_rad` is the same order as `dth_mc`, 4.2e-2 against
+5.3e-2 per step -- so the question was worth asking even though the answer was
+"no change".
+
+What the exercise produced instead of a fix:
+
+* `single_column_harness_test.py` now **verifies** the reconstruction against
+  `sm1`/`qm1` rather than assuming it, with thresholds tied to the buoyancy
+  margin, plus a test pinning the period-to-step offset it depends on.
+* Section 54's conclusion is unaffected and now rests on a verified
+  comparison: the port's downdraft really is 1.36x ModelE's peak shaft mass in
+  the active regime and 3.13x in the quiet one, and it really does miss the
+  bifurcation at step 27.
+
+The next step is therefore what section 55 deferred: why the port's shaft stays
+on the accumulating branch when ModelE's flips. With the harness verified, that
+is a question about the port's own downdraft thermodynamics and nothing else.
