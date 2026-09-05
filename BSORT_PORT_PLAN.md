@@ -4088,3 +4088,5 @@ Two things to separate, in this order:
 
 The second is a bounded unit-level check and should come first if the first
 does not immediately explain the size.
+
+Suite: 376 passed, 3 skipped -- unchanged by the diagnostic exports.
