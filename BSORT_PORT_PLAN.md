@@ -3824,3 +3824,81 @@ analysis while the port-side half was still running, and the mechanism was
 inferred rather than measured. Both halves were available within minutes of
 each other; publishing the first without the second is what produced a wrong
 claim, and no amount of care in the wording would have caught it.
+
+## 55. What flips ModelE's margin at step 27: a bifurcation, not a forcing change
+
+The decomposition, over shaft levels 6-12, of
+
+    svmix = tldn*(1 + deltx*qldn - wload)
+    svm1  = senv*plk*(1 + deltx*qenv - qcl - qci)
+
+| step | 17 | 21 | 27 | 28 | 48 |
+| --- | --- | --- | --- | --- | --- |
+| `qenv` | 0.01499 | 0.01505 | 0.01458 | 0.01447 | 0.01458 |
+| `tenv` [K] | 293.37 | 293.31 | 293.76 | 293.81 | 294.73 |
+| `qldn - qenv` | -0.00060 | -0.00113 | **+0.00077** | +0.00105 | +0.00163 |
+| `wload` | 0.00038 | 0.00015 | 0.00069 | 0.00040 | 0.00027 |
+| margin | -0.181 | +0.433 | -0.068 | **+0.237** | +0.301 |
+
+First, **`qcl + qci` is identically zero at every step**, so the environment's
+condensate term in `svm1` is inert throughout BOMEX. The port defaults
+`environment_condensate` to zero, which is exactly right here -- and would be
+exactly wrong in a case with stratiform cloud.
+
+Over the run the environment warms about 1.4 K and dries, and the shaft's
+humidity crosses from below the environment's to above it. Splitting the jump
+between steps 27 and 28: the temperature term moves +0.035 -> +0.234 and the
+rain-loading term -0.204 -> -0.117, together the +0.305 K flip.
+
+### The flip is a tipping point
+
+The forcing across that single step is tiny and the response is not:
+
+| across step 27 -> 28 | change |
+| --- | --- |
+| `tenv` | +0.05 K |
+| `qenv` | -1.1e-4 |
+| plume condensate production `CONDMU` | 0.0104 -> 0.0101 (flat; *higher* again by step 48) |
+| **margin** | **-0.068 -> +0.237 K** |
+| **peak shaft mass** | **42 -> 1.9 kg/m^2** |
+
+`CONDMU` being flat rules out the obvious story that the plume simply stops
+making rain. A smooth, monotonic environmental trend produces a step change in
+the downdraft, because the shaft sits near its own buoyancy threshold and the
+branch is self-reinforcing: cold and loaded means it detrains nothing and
+accumulates, which keeps it cold; warm means it sheds 75% per level and stays
+light, which keeps it warm.
+
+**So the remaining error is not a magnitude error, it is a missed
+bifurcation.** The port stays on the accumulating branch for the whole run
+(section 54: peak shaft 3.13x ModelE's in the quiet regime, 13-28x at periods
+27-30). A bistable system's tipping point is set by exactly where the threshold
+falls, which is why an O(0.1 K) bias in the shaft -- small against any
+tendency -- relocates the transition rather than merely shifting a magnitude.
+
+### A measurement limit this turned up
+
+Comparing the port's environment at levels 6-12 against ModelE's `sm1`/`qm1`:
+
+| period | 12 | 20 | 30 | 35 | 40 |
+| --- | --- | --- | --- | --- | --- |
+| `qenv` ours / ModelE | 0.961 | 0.950 | 0.938 | 0.941 | 0.938 |
+| `tenv` ours - ModelE [K] | -0.71 | -0.38 | -0.35 | -0.52 | -0.64 |
+
+The port's environment at cloud levels is 4-6% drier and 0.35-0.7 K colder than
+what ModelE's downdraft is compared against. `sm1(l) = sm(l)` is saved "before
+the current plume" (`MSTCNV.F90:2157`), so for a single-plume step it should be
+the state at the start of the MSTCNV call -- which is what the harness
+reconstructs by undoing one step of `dth_mc`/`dq_mc`.
+
+That reconstruction is approximate by construction: the SUBDD state is written
+after *all* physics, so undoing convection alone recovers "end of step minus
+convection", not "start of step", unless convection runs last. The sub-cloud
+part is evidently good -- `fmp2` matches ModelE's `mplume_b` at a median of
+1.004 -- but the in-cloud part is not verified, and 4-6% in humidity is large
+next to the 0.1 K margins this section is about.
+
+This is a limit on the like-for-like claim, not yet a diagnosis. It needs
+checking on its own before any further downdraft-buoyancy work, because a port
+compared against a 4% drier environment cannot be expected to reproduce a
+threshold crossing.
