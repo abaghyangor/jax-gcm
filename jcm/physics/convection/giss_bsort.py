@@ -322,6 +322,10 @@ class SortedBlends(NamedTuple):
     downdraft_condensate: jnp.ndarray
     mixture_buoyancy: jnp.ndarray
     blend_mass: jnp.ndarray
+    blend_condensate_after_evaporation: jnp.ndarray
+    blend_theta_raw: jnp.ndarray
+    blend_humidity_raw: jnp.ndarray
+    blend_evaporated: jnp.ndarray
     # Total air put into blends at this level, `updairm + envairm`. The three
     # fates partition it, so it is what turns the two exported fates into
     # shares -- without it the rejoining fraction cannot be recovered from the
@@ -461,6 +465,10 @@ def sort_blends(plume_mass: jnp.ndarray,
         mixture_buoyancy=mixture_buoyancy,
         blend_mass_total=jnp.sum(blend_mass, axis=0),
         blend_mass=blend_mass,
+        blend_condensate_after_evaporation=test_condensate,
+        blend_theta_raw=blend_t,
+        blend_humidity_raw=blend_q,
+        blend_evaporated=evaporated,
     )
 
 
@@ -546,8 +554,20 @@ class PlumeAscent(NamedTuple):
     # Per-blend buoyancy and mass, leading axis NMIX. These are what the sort
     # actually decides on, so without them the fates can only be audited in
     # aggregate -- and the aggregate hides which blend crossed which threshold.
-    blend_buoyancy: jnp.ndarray      # mixbuoy, (NMIX, nlev, *horiz)
-    blend_mass: jnp.ndarray          # airmix, (NMIX, nlev, *horiz)
+    blend_buoyancy: jnp.ndarray      # mixbuoy, (nlev, NMIX, *horiz)
+    blend_mass: jnp.ndarray          # airmix, (nlev, NMIX, *horiz)
+    # Condensate the blend still holds after evaporating what it can. It enters
+    # `mixbuoy` with a coefficient of one, so exporting it splits the sort's
+    # decision variable into its thermal and condensate halves -- which is the
+    # difference between a temperature error and a microphysics error.
+    blend_condensate: jnp.ndarray    # (nlev, NMIX, *horiz)
+    # The blend's intensive properties *before* it evaporates, and how much it
+    # evaporates. ModelE dumps exactly these three (`smix_raw`, `qmix_raw`,
+    # `dqevp`), so with them the sort's decision variable can be matched term by
+    # term instead of only in total.
+    blend_theta_raw: jnp.ndarray     # smix before evaporation
+    blend_humidity_raw: jnp.ndarray  # qmix before evaporation
+    blend_evaporated: jnp.ndarray    # dqevp
     active: jnp.ndarray              # bool: this level was processed
 
 
@@ -831,6 +851,10 @@ def plume_ascent(cloud_base: jnp.ndarray,
                    keep(sorted_blends.blend_mass_total),
                    keep(sorted_blends.mixture_buoyancy),
                    keep(sorted_blends.blend_mass),
+                   keep(sorted_blends.blend_condensate_after_evaporation),
+                   keep(sorted_blends.blend_theta_raw),
+                   keep(sorted_blends.blend_humidity_raw),
+                   keep(sorted_blends.blend_evaporated),
                    survives)
         return carry, outputs
 
