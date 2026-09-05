@@ -3947,3 +3947,72 @@ What the exercise produced instead of a fix:
 The next step is therefore what section 55 deferred: why the port's shaft stays
 on the accumulating branch when ModelE's flips. With the harness verified, that
 is a question about the port's own downdraft thermodynamics and nothing else.
+
+## 57. The defect, located: blend buoyancy is too negative aloft
+
+Chaining sections 51, 54 and 56 to a single measured quantity.
+
+**It is not the descent.** Teacher-forced, the downdraft reproduces ModelE
+exactly (section 44: `thdn` 1.1e-5, evaporation 1.0000). **It is not the
+overshoot gate**, which excludes blends from the downdraft when the plume is
+overshooting: over the whole run it fires on **6 of 535** eligible blends
+(1.1%), all at one level. **It is the mass the plume routes into the shaft.**
+Period 12, `ddr` per level, ours against ModelE's:
+
+| level | 15 | 14 | 13 | 12 | 11 | 10 |
+| --- | --- | --- | --- | --- | --- | --- |
+| ours | 7.89 | 10.41 | **15.99** | 17.38 | 14.03 | 14.48 |
+| ModelE | 1.59 | 1.32 | **0.00** | 3.71 | 12.89 | 14.18 |
+
+Five to eight times too much at levels 12-15, and at level 13 ModelE routes
+nothing at all.
+
+### The underlying quantity
+
+`PlumeAscent` now carries `blend_buoyancy` and `blend_mass` per blend, so the
+sort can be compared against `blend_diag.txt` blend by blend rather than in
+aggregate. The error in `mixbuoy`, as a fraction of the width of the
+`negbuoy/tvl` threshold the sort decides on (about -6.8e-4):
+
+| level | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| ours - ModelE, / threshold | **+0.30** | +0.37 | -0.03 | +0.03 | -0.13 | **-0.90** | -0.40 | -0.35 | -0.31 | **-1.01** |
+
+Blend masses agree to about 10% (e.g. 14.25 against 12.96), so this is a fate
+error, not a mass error: a blend ModelE places just *above* the downdraft
+threshold lands just *below* it for the port. The sign matches the fates
+exactly -- too much rejoining near cloud base (section 51: rejoin share 0.330
+against 0.250 at level 6), too much to the downdraft aloft (0.436 against 0.235
+at level 13).
+
+In physical units this is a buoyancy error of 3-7e-4 relative, which at ~294 K
+is **0.1-0.2 K** in virtual temperature -- the same scale as every other
+remaining discrepancy in this port, and the same scale as the downdraft margin
+itself (section 53).
+
+### Why it produces the regime failure
+
+`mixbuoy = (virtual_t - tvl)/tvl - test_condensate`, where `test_*` are the
+blend's properties after it evaporates its own condensate. Too-negative
+blends aloft over-seed the shaft, which then arrives heavy; heavy and cold, it
+stays on the accumulating branch; so the port never reproduces the shutdown
+ModelE undergoes at step 27 (section 54: peak shaft 3.13x in the quiet regime).
+
+### Next
+
+Decompose `mixbuoy` into its three inputs -- `test_t`, `test_q` and
+`test_condensate` -- against the same dump, which carries `smix`, `qmix`,
+`wmix` and `tvmix` per blend for exactly this purpose. The `- test_condensate`
+term is subtracted directly into the buoyancy, so a condensate error enters at
+full weight, and the port's `condpr` already measured 1.16x ModelE's
+(section 52); that is the first term to check.
+
+Suite unchanged at 376 passed, 3 skipped.
+
+**Note on a pre-existing test-isolation issue** found on the way:
+`giss_bsort_test.py::TestPlumeAscent::test_column_matches_vectorized` passes
+only when the convection directory runs as a whole, because
+`giss_plume_driver_test.py` enables `jax_enable_x64` at module import. Run
+alone it fails at 1.3e-4 against a 1e-4 tolerance. Not introduced here -- it
+fails identically at the last known-green commit -- but it means that test
+asserts float64 agreement while claiming to test the float32 path.
