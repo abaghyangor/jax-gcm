@@ -4090,3 +4090,57 @@ The second is a bounded unit-level check and should come first if the first
 does not immediately explain the size.
 
 Suite: 376 passed, 3 skipped -- unchanged by the diagnostic exports.
+
+## 59. The evaporation routine is exact; the inputs are not
+
+Section 58 left two candidates. The second is now closed.
+
+`blend_diag.txt` records the exact inputs (`smix`, `qmix`, `wmix`) and output
+(`dqevp`) of the `get_dq_evap` call the sort makes on every blend, so
+`condensate_evaporation` can be tested with no plume in the loop -- the
+strongest form of check available for it. Over all **1572** calls, joining
+`plk`/`pres` from `mass_budget.txt` on `(step, lmin, l)`:
+
+| | value |
+| --- | --- |
+| median relative error | **2.7e-5** |
+| p90 relative error | 1.1e-4 |
+| max absolute error | 4.2e-8 |
+| condensate cap binds on the same blends | yes, 0.200 both |
+
+That is float32 agreement. Reading the Fortran confirms why: ModelE's `QSAT`
+takes pressure in **Pa** (`QSAT = mrat*wv_psat(tm,lh)/pr`), `DLNQSATDT =
+LH/(RVAP*TM^2)` matches the port's `d_ln_qsat_dt`, `wv_psat` runs the
+`use_mk2005 = .true.` branch the port implements coefficient for coefficient,
+and the three-iteration Newton loop is identical.
+
+**So the port's extra evaporation is entirely a consequence of its inputs.**
+The blends arrive too dry aloft (-2.0e-4 at level 11, -3.3e-4 at level 15,
+section 58), the deficit-limited evaporation converts that into extra cooling,
+and the cooled blends cross the downdraft threshold.
+
+Two corrections to the reasoning that motivated this check:
+
+* The premise was that `condensate_evaporation` had only been validated at
+  downdraft temperatures, "20-30 K warmer than these blends". Wrong: blend
+  temperatures span **281.0-295.9 K**, the same range. The check was still
+  worth running -- it was the cheap one, and it eliminated a candidate -- but
+  not for the reason given.
+* The first pass reported the condensate cap binding on 10% of our blends
+  against ModelE's 20%. That was the test's own tolerance: at any tolerance
+  looser than 1e-9 both are 0.200, and on ModelE-capped blends our `dq/wmix`
+  is 1.000000. The port's docstring also claimed ModelE passes `pres` in mb
+  and "the caller must convert"; it does not, and the dump's ~9.2e4 values are
+  Pa.
+
+`oracle_test.py` now pins this, so the one function the sort's decision
+variable turns on is a checked fact rather than a reading of the Fortran.
+Bridge suite 28 passed.
+
+### What is left
+
+Only the first candidate: **why the plume's blends are dry aloft**. The
+environment is verified (section 56) and the environment share of each blend is
+set by `fupd`, so the humidity has to come from the plume's own water. That has
+never been compared -- `mass_budget.txt` carries `smp`/`qmp` per level and only
+the plume's mass, velocity and detrainment have been checked against it.
