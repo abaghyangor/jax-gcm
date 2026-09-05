@@ -3770,3 +3770,57 @@ constant, and the oracle's sensitivity to it is not.
   why the headline numbers looked healthier than the port is.
 * Reporting should split by regime, not just by decile. A future case that sits
   entirely in the quiet regime would look excellent and test almost nothing.
+
+## 54. Correction to section 53: the port's shaft is too heavy, not too light
+
+Section 53 was committed before the port-side measurement finished, and its
+mechanism is wrong in the direction that matters. The regime finding itself
+stands -- it is measured from ModelE alone -- but the inference about the port
+does not.
+
+**What section 53 claimed:** the port's shaft crosses into the buoyant branch
+early and so fails to accumulate where ModelE reaches 40-80 kg/m^2.
+
+**What the measurement says:** the port's peak shaft mass is *larger* than
+ModelE's, in both regimes, and grossly so in the quiet one.
+
+| ModelE's peak shaft | n | median nRMSE | our shaft / ModelE | our evap / ModelE |
+| --- | --- | --- | --- | --- |
+| active, > 10 kg/m^2 | 26 | 0.127 | **1.36** | 1.45 |
+| quiet, < 10 kg/m^2 | 22 | 0.044 | **3.13** | 2.19 |
+
+Per period the quiet-regime gap is extreme: at periods 27-30 ModelE's shaft
+peaks at 1.8-2.8 kg/m^2 while the port's reaches 27-50, a ratio of 13-28x.
+**The port does not reproduce the regime transition at all.** It keeps a heavy
+downdraft through the second half of the run, where ModelE has essentially
+none.
+
+Where section 46's observation still holds is *below* the peak: at period 20
+the port's peak (69.5) is close to ModelE's (83.6), but it sheds faster
+descending, which is what produced the level-by-level collapse that section
+saw. Peak comparable, decay too fast -- not "fails to accumulate".
+
+### How well does the downdraft explain the residual?
+
+| predictor of per-period nRMSE | correlation |
+| --- | --- |
+| ModelE peak shaft mass | +0.483 |
+| log10 of it | +0.568 |
+| **abs(our peak shaft - ModelE's)** | **+0.724** |
+
+That is much the strongest single predictor found -- against +0.13 to +0.43 for
+every plume-side candidate in section 53 -- so the downdraft really is where
+the remaining error lives. But it is not deterministic, and the exception is
+instructive: period 28 has a 27x shaft ratio and an nRMSE of 0.089, one of the
+better periods. A spurious downdraft is not automatically a large tendency
+error; it matters where it detrains.
+
+So the target is sharper than section 53 said. It is not "make the shaft
+survive"; it is that the port's downdraft is too persistent everywhere, and
+misses the buoyancy transition that shuts ModelE's off after step 27.
+
+**Process note.** Section 53 was written from the ModelE-only half of the
+analysis while the port-side half was still running, and the mechanism was
+inferred rather than measured. Both halves were available within minutes of
+each other; publishing the first without the second is what produced a wrong
+claim, and no amount of care in the wording would have caught it.
