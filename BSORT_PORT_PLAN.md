@@ -4364,3 +4364,83 @@ an algorithm error. What feeds it that is not yet verified:
 `closure_state_diag.txt` (unit 770) dumps `sm`, `qm`, `smo1`, `qmo1`, `fpi`,
 `aml`, `tstar`, `qstar` per closure call for exactly this comparison, and it
 has not been used since it was added.
+
+## 63. The closure deficit was the surface pressure
+
+Section 62 narrowed the whole remaining discrepancy to an 8.4% shortfall in the
+cloud-base mass flux, with nothing lost during the ascent. Comparing every
+closure input against `closure_state_diag.txt` (unit 770, unused since it was
+added) isolates it in one line.
+
+| closure input | ours / ModelE |
+| --- | --- |
+| `lmin`, `lmin0` | 1.00000 |
+| `aml` (layer masses) | 0.99966 |
+| `sm`, `qm` (environment) | 0.99966 |
+| `smo1`, `qmo1` (enhanced source) | 0.99966 / 0.99971 |
+| `tstar`, `qstar` | 1.00489 |
+| **`fpi` (source weights)** | **1.09091** |
+
+Everything matches to 0.03% except the source weights, off by exactly 12/11.
+Printing the arrays shows why:
+
+| | weights over the source layers |
+| --- | --- |
+| ModelE | 0.2, 0.2, 0.2, 0.2, 0.2 |
+| ours | **0.1111**, 0.2222, 0.2222, 0.2222, 0.2222 |
+
+Proportional to `[0.5, 1, 1, 1, 1]`. `source_weights` weights by layer mass and
+is correct; the layer mass was not. **Our bottom layer held exactly half
+ModelE's**: 51.864 against 103.763 kg/m^2, every other layer matching to 0.03%.
+
+`sigma_coords_from_column` was handed `p_3d[0]` as the surface pressure. That
+is the lowest layer's *midpoint*, not the surface, so `sigma = 1` sat half a
+layer too high. ModelE's own `prsurf` is 1015.0 mb against `p_3d[0]` of
+1009.912 -- a gap of 5.088 mb, which is **51.88 kg/m^2**, exactly the missing
+half-layer.
+
+The bottom layer is the warmest and moistest in the column and carries a fifth
+of the source parcel, so halving its weight cooled and dried the parcel and
+left the closure 8% low.
+
+### Effect
+
+| | before | after |
+| --- | --- | --- |
+| `fmp2` / ModelE `mplume_b` | 0.9159 | **1.0006** |
+| plume mass at base | 0.9155 | **1.0006** |
+| peak heating ratio (median) | 0.924 | **1.010** |
+| `dth_mc` bias (median) | -0.086 | **-0.014** |
+| `dth_mc` nRMSE (median) | 0.045 | **0.039** |
+| `dth_mc` RMSE (median) | 0.427 | **0.381** |
+
+Pressure at the lowest level is now exact (1009.912 mb both), and the max error
+below sigma 0.1 is 0.40%, at the model top.
+
+**One metric moves the other way**: exact cloud-base matches fall 45/48 to
+38/48, the other 10 one level low, with "within 1 level" still 48/48. That
+number compares the *surface-parcel LCL* against ModelE's lowest `cldmc` level.
+It is a diagnostic, not the `closure_base` the physics runs on, and the two
+agreed at 45/48 partly by coincidence -- but it has not been explained, and it
+should not be waved away. It is the open item from this section.
+
+### Where the port now stands
+
+Two harness bugs in succession -- the reconstruction missing large-scale
+condensation (section 61) and the surface pressure (here) -- account for
+essentially everything sections 49 and 53-60 attributed to the port. With both
+fixed:
+
+| | value |
+| --- | --- |
+| cloud-base mass flux | 1.0006 |
+| plume mass at base | 1.0006 |
+| peak heating, median | 1.010 |
+| `dth_mc` correlation, median / worst decile | +0.978 / +0.888 |
+| `dth_mc` nRMSE, median / worst decile | 0.039 / 0.110 |
+| peak level offset, median / worst decile | 0.0 / +0.0 |
+| sign mismatch, median | 0.000 |
+
+Both bugs were in *what the port was compared against*, and both were found by
+comparing a quantity that had never been compared -- the closure's inputs, and
+the environment per level rather than pooled.
