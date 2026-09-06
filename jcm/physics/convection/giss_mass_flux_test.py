@@ -24,6 +24,8 @@ from jcm.physics.convection.giss_mass_flux import (
 # A convectively unstable cloud-base stencil (vertical on axis 0):
 # [lmin, lmin+1, lmin+2]. Source layer warm + moist; cooler/drier above.
 _THETA = jnp.array([320.0, 318.0, 316.0])
+_EXNER3 = jnp.array([0.97, 0.96, 0.95])
+_PRESSURE3 = jnp.array([90000.0, 87000.0, 85000.0])
 _Q = jnp.array([0.035, 0.012, 0.008])
 _MASS = jnp.array([600.0, 600.0, 600.0])
 _EXNER = jnp.array([0.96, 0.95])
@@ -180,3 +182,73 @@ class CloudBaseClosureTest(unittest.TestCase):
             jnp.array(0), jnp.array(5), tile(weights))[1]
         self.assertEqual(block.shape, (3,))
         np.testing.assert_allclose(np.asarray(block), float(single), rtol=1e-10)
+
+
+class TestClosureDeclinesToConvect(unittest.TestCase):
+    """ModelE refuses to convect at four points; all four must be ported.
+
+    Found by running the port on DYCOMS-II. ModelE's convective tendencies
+    there are identically zero at every level of every one of the 48 periods --
+    it is stratocumulus, handled entirely by large-scale condensation -- and the
+    port convected in **48 periods out of 48**, at a small but non-zero
+    0.25 K/day. Only the saturation guard had been ported; the instability check
+    and the two `MINFRAC` floors had not.
+
+    BOMEX cannot catch this. Every one of its columns is meant to convect, so a
+    missing veto is invisible there: a scheme that never declines agrees with
+    the oracle on every case that convects, and is wrong only on the cases that
+    do not.
+    """
+
+    def _column(self):
+        """The driver's trade-cumulus column, in ModelE's `th`/`plk` pair.
+
+        Borrowed rather than rebuilt because this closure reads `exner` as
+        ModelE's `(p in mb)**kappa` -- about 7, not the normalised 0.97 -- and a
+        fixture in the wrong convention silently looks subsaturated and gets
+        vetoed for the wrong reason.
+        """
+        import importlib.util
+        import sys
+        spec = importlib.util.spec_from_file_location(
+            "_driver_fixture",
+            __file__.replace("giss_mass_flux_test", "giss_plume_driver_test"))
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["_driver_fixture"] = module
+        spec.loader.exec_module(module)
+        return module._column()
+
+    def _closure(self, column, base=5):
+        from jcm.physics.convection.giss_plume_driver import (
+            source_bottom, source_weights)
+        source_low = source_bottom(column["pressure"], jnp.array(base))
+        weights = source_weights(column["layer_mass"], source_low,
+                                 jnp.array(base), jnp.array(base - 1))
+        return cloud_base_closure(
+            column["potential_temperature"], column["specific_humidity"],
+            column["layer_mass"], column["exner"], column["pressure"],
+            source_low, jnp.array(base), weights,
+            timestep=jnp.array(1800.0))
+
+    def test_unstable_column_still_convects(self):
+        """The vetoes must not suppress a column that should convect."""
+        _, fmp2, _ = self._closure(self._column())
+        self.assertGreater(float(fmp2), 1.0)
+
+    def test_stable_column_gets_no_mass_flux(self):
+        """Saturation alone is not a licence to convect.
+
+        Same column, but with the potential temperature above the base raised
+        steeply so a lifted parcel is always colder than its surroundings.
+        `DMSE` never goes negative and ModelE returns before the bisection.
+        """
+        column = dict(self._column())
+        theta = np.asarray(column["potential_temperature"]).copy()
+        theta[5:] += np.arange(len(theta) - 5) * 2.0 + 2.0
+        column["potential_temperature"] = jnp.asarray(theta)
+        _, fmp2, _ = self._closure(column)
+        self.assertEqual(float(fmp2), 0.0)
+
+    def test_minfrac_floor_is_the_modele_value(self):
+        # MSTCNV.F90:1226, `.0005` whenever `cold_pool_on` -- its default.
+        self.assertEqual(mf._MIN_PLUME_FRACTION, 5.0e-4)

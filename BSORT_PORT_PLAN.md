@@ -4738,3 +4738,70 @@ beside them, and `TestPhaseAssumption` pinning three things:
 Its accuracy below freezing is not claimed and not tested, because nothing
 available can check it. That is the useful state to be in: a known, stated,
 guarded limit rather than a silent one.
+
+## 69. DYCOMS was run first, and it was a negative control the port failed
+
+Checking a recollection that DYCOMS had been tested before BOMEX: it had. The
+SCM run is from June, there is a committed fixture and a test. But of the three
+things I said about it in section 64, two were wrong.
+
+**DYCOMS has no moist convection at all.** Over all 48 periods and 63 levels:
+
+| | |
+| --- | --- |
+| `dth_mc`, `dq_mc`, `cldmc`, `mcp` | **identically zero** |
+| `dth_ss` (large-scale condensation) | max 50.75 K/day |
+| `qcl` | non-zero, max 4.75e-4 kg/kg |
+| `qci` | identically zero |
+
+So it cannot validate convection physics; it can only check that the scheme
+declines to fire. It is also all-liquid, so it cannot test the phase work
+either -- and, contrary to what section 67 assumed, it cannot test the
+environmental-condensate wiring: `qcl` is non-zero but with no downdraft it is
+never consumed.
+
+**And the existing test was near-vacuous.** It calls `GissConvection()` with
+`{}` for diagnostics, which degrades to the pure scaffold -- so it asserted
+zeros against zeros through a path that returns zeros unconditionally.
+
+### Run through the active path, the port fails it
+
+| DYCOMS, 48 periods | before | after |
+| --- | --- | --- |
+| periods convecting (ModelE: none) | **48 / 48** | **0 / 48** |
+| max abs `dth_mc` | 0.275 K/day | 0.0 |
+| `fmp2` | 0.0711 | 0.0 |
+
+ModelE declines to convect at four points and only the first was ported:
+
+1. the lifted blend never saturates (`MSTCNV.F90:2804`) -- **was ported**;
+2. `if(DMSE.gt.-1d-10) return`, the column is not conditionally unstable
+   (`:2847`) -- this is `DMSE` from the *initial* blend, computed before the
+   bisection, and is not the `dmse1` the bisection drives to zero: that one is
+   a residual after a trial flux and says nothing about whether convection
+   should happen at all;
+3. `if(FPLUME.le.MINFRAC) return` (`:2849`);
+4. the two `mplumes` floors at `:2896-2898`.
+
+All four are now in `cloud_base_closure`. BOMEX is unaffected -- every sampled
+period still convects, peak heating 1.005 and correlation +0.985 on a 16-period
+subset -- so the vetoes suppress the spurious case without touching the real
+one.
+
+### Why BOMEX could never have found this
+
+Every BOMEX column is meant to convect. A missing veto is invisible in a case
+where the answer is always "yes": the port agreed with the oracle on all 48
+periods precisely because it never had to decline. It took a case where the
+right answer is "no" to expose it, and the first such case exposed it
+immediately, in every period.
+
+That is the argument for breadth over further depth on one case, made
+concrete. Two of the last three defects -- this and the environmental
+condensate -- were things BOMEX is structurally incapable of showing.
+
+The test now uses the driver's trade-cumulus column rather than a hand-built
+one, because this closure reads `exner` as ModelE's `(p in mb)**kappa` -- about
+7, not the normalised 0.97 -- and a fixture in the wrong convention looks
+subsaturated and gets vetoed for the wrong reason, which is how the first
+version of the positive test failed.
