@@ -1,11 +1,11 @@
 # Status: ModelE → JCM Convection Conversion
 
-**Last updated:** 2026-09-06
+**Last updated:** 2026-09-07
 **Branch:** `modele-convection-port` (based on `upstream/dev`), 698 commits.
 **Companion repo:** `modele-jcm-bridge` (ModelE oracle reading + state conversion).
 
 The long-form engineering record, including every wrong turn and its correction,
-is `BSORT_PORT_PLAN.md` (70 sections). This file is the summary.
+is `BSORT_PORT_PLAN.md` (71 sections). This file is the summary.
 
 ---
 
@@ -39,7 +39,7 @@ inside a free-running JCM integration.
 
 ## What is ported
 
-Roughly 3,500 lines of JAX across nine modules, with 247 tests.
+Roughly 5,000 lines of JAX across ten modules, with 247 tests of its own.
 
 | Module | Lines | What it is |
 | --- | --- | --- |
