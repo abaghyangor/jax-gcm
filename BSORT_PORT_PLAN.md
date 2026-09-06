@@ -4144,3 +4144,72 @@ environment is verified (section 56) and the environment share of each blend is
 set by `fupd`, so the humidity has to come from the plume's own water. That has
 never been compared -- `mass_budget.txt` carries `smp`/`qmp` per level and only
 the plume's mass, velocity and detrainment have been checked against it.
+
+## 60. The chain closes: `refblendwt` -> `fupd` -> dry blends -> the downdraft
+
+Candidate 1 from section 58 resolves, and it joins to section 49.
+
+**The plume's own thermodynamic state is right.** `PlumeAscent` now exports
+`plume_heat`/`plume_water`, matching `smp0`/`qmp0`, which had never been
+compared -- only the plume's mass, velocity and detrainment had. Intensive,
+against the oracle:
+
+| level | 6 | 8 | 10 | 12 | 14 | 15 |
+| --- | --- | --- | --- | --- | --- | --- |
+| plume `q` ours / ModelE | 0.9987 | 0.9924 | 0.9945 | 1.0026 | 1.0030 | 1.0021 |
+| `d(theta)` [th units] | -0.003 | -0.001 | +0.002 | +0.005 | +0.011 | +0.016 |
+
+So the water is not lost or gained. But the *blends* are dry by -2.0e-4 at
+level 11, an order of magnitude more than the plume's own -2e-5. A blend is a
+linear mix of plume and environment air, and both are now verified, so the
+error has to be in the **mixing ratio**.
+
+It is. Recovering each blend's implied updraft fraction from
+`q_blend = fupd*q_plume + (1-fupd)*q_env` and comparing against the `fupd`
+ModelE dumps:
+
+| level | 9 | 10 | 11 | 12 | 13 | 14 |
+| --- | --- | --- | --- | --- | --- | --- |
+| observed `d(q_blend)` | -5.6e-5 | -1.5e-4 | -2.0e-4 | -1.2e-4 | -6.2e-5 | -9.1e-5 |
+| **`d(fupd)`** | -0.010 | -0.019 | **-0.030** | -0.037 | -0.042 | -0.035 |
+| share explained by `d(fupd)*(q_plume-q_env)` | 0.27 | 0.37 | 0.51 | 1.21 | 2.88 | 1.58 |
+
+The mixing-ratio term is the same order as the dryness and at several levels
+larger, so it accounts for it and nothing else needs to. The port's blends
+carry **2-4 percentage points more environmental air** than ModelE's aloft.
+
+### Which joins section 49
+
+`fupd = refblendwt*fupd_reference + (1 - refblendwt)*fupd_fullmix`, with
+`refblendwt = min(1, mplume/mplume_lag)`. The reference spectrum averages 0.5
+and `fupd_fullmix` is 0.76-0.83 aloft, so **a higher `refblendwt` gives a lower
+`fupd`**. Section 49 measured the port's `refblendwt` at 0.279 against ModelE's
+0.196 at level 13 -- higher, because the port's plume is too massive relative
+to its own 1 km lag. Linearising, `d(fupd) = (fref - ffull)*d(rw) =
+-0.28 * 0.083 = -0.023` against the -0.042 observed: right sign, same order.
+
+### The complete chain
+
+1. The plume is too massive relative to its 1 km lag (section 49).
+2. `refblendwt` too high -> `fupd` too low by 0.02-0.04 aloft.
+3. Blends carry more environmental air, so they are too dry by ~2e-4.
+4. Deficit-limited evaporation converts that into 1.6e-4 extra evaporation at
+   level 15 (section 58), and the routine doing it is exact (section 59).
+5. `slh*dqevp/plk` cools the blend by about 1.9 threshold widths.
+6. Blends cross the `negbuoy` threshold that ModelE keeps them above, so the
+   plume routes 5-8x too much mass into the downdraft at levels 12-15
+   (section 57).
+7. The shaft arrives heavy, stays on the accumulating branch, and never
+   reproduces ModelE's shutdown at step 27 (section 54), which is where the
+   residual is concentrated (section 53).
+
+Every link is measured against the oracle rather than inferred.
+
+### Where to intervene
+
+At the root, not the symptom. Section 49 already located it: at cloud base
+`refblendwt = 1.000` on both sides and the blend construction is *identical*
+(`frem = 0.371` both), yet only 67% of the port's blend mass leaves the plume
+against ModelE's 75%. That first-level fate difference is what starts the
+plume too massive, and everything above follows from it. Fixing anything
+further up the chain would be treating a symptom.

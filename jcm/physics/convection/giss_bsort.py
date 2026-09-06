@@ -534,6 +534,12 @@ _LAG_DISTANCE = 1.0e3
 class PlumeAscent(NamedTuple):
     """Per-level results of one plume's ascent. All arrays are ``(nlev, *horiz)``."""
     plume_mass: jnp.ndarray          # mass entering each level
+    # The plume's own heat and water entering each level, extensive, matching
+    # ModelE's `smp0`/`qmp0`. Only the plume's mass, velocity and detrainment
+    # had ever been checked against the oracle; its thermodynamic state had
+    # not, and that is what sets the blends the sort then decides on.
+    plume_heat: jnp.ndarray          # smp0
+    plume_water: jnp.ndarray         # qmp0
     plume_condensate: jnp.ndarray    # condensate the plume holds at this level
     precipitation: jnp.ndarray       # condpr: what rained out of it here
     mass_lag: jnp.ndarray            # mplume_lag: mass ~1 km below
@@ -836,7 +842,8 @@ def plume_ascent(cloud_base: jnp.ndarray,
                  survives,
                  dumped | terminating,
                  history)
-        outputs = (keep(mass), keep(condensate), keep(rained_mass), keep(lag),
+        outputs = (keep(mass), keep(heat), keep(water),
+                   keep(condensate), keep(rained_mass), keep(lag),
                    keep(w), keep(ent), keep(det),
                    keep(environment_air),
                    keep(sorted_blends.detrained_mass) + dump(mass),
