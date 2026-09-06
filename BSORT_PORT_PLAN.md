@@ -4299,3 +4299,68 @@ proportional over-seeding of the downdraft (column total 1.16x). That is
 section 49's mechanism at a third of the size previously attributed to it, and
 it is now the whole of the remaining discrepancy rather than one link in a long
 chain.
+
+## 62. Correction to section 61, and the drift resolves into the closure
+
+**Two rows of section 61's table were wrong.** They came from a scratch script
+that still used a private copy of the pre-convection reconstruction -- undoing
+`dq_mc` only, and pairing SUBDD period with `scm_step_diag` directly rather
+than through `PERIOD_TO_STEP`. Every other row came from
+`harness.run_plume_cycle` and stands. Corrected:
+
+| | section 61 said | actually |
+| --- | --- | --- |
+| plume mass drift | 1.12 -> 1.40 | **0.894 column total, ~0.92 flat with height** |
+| plume -> downdraft, column total | 1.158 | **0.849** |
+| plume -> detrain, column total | -- | 0.943 |
+
+So the sign is opposite: the port's plume is about **10% too small**, not too
+large, and the *drift* with height is essentially gone. This is exactly why
+`harness.run_plume_cycle` was added in section 52 -- so analysis would not run
+against a private copy of the setup -- and the script predated it.
+
+### What the corrected measurement shows
+
+| level | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| plume mass o/E | 0.917 | 0.917 | 0.917 | 0.924 | 0.926 | 0.931 | 0.937 | 0.927 | 0.931 | 0.896 |
+| removed fraction o/E | .556/.556 | .612/.612 | .665/.655 | .569/.572 | .528/.464 | .549/.557 | .548/.549 | .625/.618 | .738/.692 | .825/.648 |
+| `refblendwt` o/E | 1.000/1.000 | .815/.815 | .621/.621 | .435/.436 | .320/.411 | .206/.320 | .145/.239 | .110/.181 | .103/.124 | .087/.112 |
+
+The plume mass ratio is **flat at 0.92**, the removed fraction matches at most
+levels, and `refblendwt` matches to three decimals at levels 6-9 -- a uniform
+scale factor cancels in `mplume/mplume_lag`, which is why the ratio agrees
+while the masses do not.
+
+### It is the closure, and only the closure
+
+| | median |
+| --- | --- |
+| `fmp2` / ModelE `mplume_b` | **0.9159** |
+| plume mass at base / ModelE `mplume0` | **0.9155** |
+
+Identical to four figures. The cloud-base mass flux is 8.4% low and the plume
+inherits exactly that; **nothing further is lost during the ascent**. Section
+49's removal-fraction drift, which four sections were built on, is not present
+once the comparison is correct.
+
+Note this moved *because of* the harness fix: the closure previously measured
+1.004 against `mplume_b`, on a state that was 0.09 K wrong at cloud base. The
+closure is very level-sensitive (section W1 measured 28 / 85 / 82 kg/m^2 at
+`dcl` / `dcl+1` / `dcl+2` against ModelE's 71), so an 0.09 K error there was
+easily worth 8%.
+
+### Next
+
+The closure was verified at median **1.000000** against ModelE on ModelE's own
+exact inputs, so an 8.4% gap on our reconstructed inputs is an input error, not
+an algorithm error. What feeds it that is not yet verified:
+
+* the surface-flux enhancement `tstar`/`qstar` from `_source_parcel_inputs`,
+  which shifts the source parcel before the closure sees it;
+* the source weights `fpi` and the span `lmin0..lmin`;
+* `air_mass`, from `density * layer_thickness` rather than ModelE's `ma`.
+
+`closure_state_diag.txt` (unit 770) dumps `sm`, `qm`, `smo1`, `qmo1`, `fpi`,
+`aml`, `tstar`, `qstar` per closure call for exactly this comparison, and it
+has not been used since it was added.
