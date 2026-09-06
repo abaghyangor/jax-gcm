@@ -4444,3 +4444,63 @@ fixed:
 Both bugs were in *what the port was compared against*, and both were found by
 comparing a quantity that had never been compared -- the closure's inputs, and
 the environment per level rather than pooled.
+
+## 64. The cloud-base "regression" resolved: two different quantities
+
+Section 63's open item was that exact cloud-base matches fell 45/48 to 38/48
+when the surface pressure was corrected. It is explained, and the metric was
+measuring the wrong thing.
+
+**The move is a consequence of the pressure becoming correct.** Working the
+coordinate construction through by hand:
+
+| surface pressure used | resulting `pressure_full[0]` | error vs ModelE |
+| --- | --- | --- |
+| `p_3d[0]` (before) | 1007.368 mb | **-2.544 mb** |
+| `prsurf` (after) | 1009.912 mb | **0.000** |
+
+The LCL is found by lifting the surface parcel, and a parcel starting from a
+*higher* pressure saturates at a higher pressure, i.e. a lower level. So the 10
+periods that moved down did so because their starting pressure was previously
+2.5 mb too low. The old 45/48 agreement was propped up by that error.
+
+**And the metric was not the physics.** The reported `cloud_base` is the
+surface-parcel LCL, compared against ModelE's lowest `cldmc` level. What
+actually drives the scheme is the *closure* base -- where the plume is rooted,
+`lmin` in ModelE. That had never been reported, and it is exact:
+
+| | |
+| --- | --- |
+| closure base vs ModelE `lmin` | **48/48 exact** |
+| LCL vs lowest `cldmc` | 38/48 exact, 48/48 within one level |
+
+The 48/48 includes the two periods where ModelE roots the plume at `lmin = 9`
+rather than `dcl + 1`. Only the `dp_disp` rule ported in section 48 reaches
+those; the fitted `dcl + 1` offset it replaced would have missed both. That is
+the first independent confirmation that porting the rule bought something,
+since on the then-current harness it was value-neutral.
+
+`stats_line` now reports both, so the headline names the quantity that drives
+the physics rather than a diagnostic that happens to correlate with it.
+
+### Current state of the port
+
+| | value |
+| --- | --- |
+| closure base vs ModelE `lmin` | 48/48 exact |
+| cloud-base mass flux `fmp2` / `mplume_b` | 1.0006 |
+| plume mass at base | 1.0006 |
+| peak heating, median | 1.010 |
+| `dth_mc` correlation, median / worst decile | +0.978 / +0.888 |
+| `dth_mc` nRMSE, median / worst decile | 0.039 / 0.110 |
+| `dth_mc` bias, median | -0.014 |
+| peak level offset, median / worst decile | 0.0 / +0.0 |
+| sign mismatch, median | 0.000 |
+
+No open discrepancy is currently attributable to the port. The remaining
+worst-decile spread (correlation +0.888, nRMSE 0.110) has not been traced to a
+cause, and given that the last four investigations each ended at a harness bug,
+the next step should be to ask what the harness still supplies that has never
+been checked against a dump -- `air_density`, `layer_thickness` and
+`geopotential`/`height` are the obvious candidates -- before opening another
+port-side hypothesis.
