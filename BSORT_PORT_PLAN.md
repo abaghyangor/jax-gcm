@@ -4504,3 +4504,71 @@ the next step should be to ask what the harness still supplies that has never
 been checked against a dump -- `air_density`, `layer_thickness` and
 `geopotential`/`height` are the obvious candidates -- before opening another
 port-side hypothesis.
+
+## 65. The vertical grid: layer edges were midpoints, not ModelE's
+
+Section 64 said the standing first question should be which harness-supplied
+quantity has never been checked against a dump. `gzl`, `delz`, `zl`, `tvl`,
+`plk`, `pres` and `ma` are all in `mass_budget.txt` and none had been checked
+with the current harness. Doing so:
+
+| level | 6 | 7 | **8** | 9 | **10** | **11** | 12 | 13 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `ma` ours / ModelE | 0.9997 | 0.9997 | **1.0247** | 0.9997 | **1.0205** | **1.0175** | 0.9997 | 0.9997 |
+
+`gzl`, `zl` and `tvl` were exact; `ma` and `delz` were out by up to 2.5%, and
+only at levels 8, 10 and 11 -- identical across every period. Not an offset: a
+structured error confined to where ModelE's grid stops being uniform. Levels
+8-11 are the inversion the plume detrains through.
+
+`sigma_coords_from_column` placed each layer edge midway between two full
+levels. That is exact where the spacing is uniform and wrong where it
+stretches. **ModelE instead places each full level at the pressure midpoint of
+its own edges**, `pl(l) = 0.5*(pedn(l) + pedn(l+1))`, so the edges follow by
+recursion from `prsurf`:
+
+    pedn(l+1) = 2*pl(l) - pedn(l)
+
+That reproduces ModelE's `ma` to **1e-4 at every level**, and `plk`/`pres`
+become exact rather than drifting to 0.999 aloft.
+
+The recursion alternates in sign, so its stability was checked rather than
+assumed: over all 63 levels the edges stay monotonic and positive, the
+reconstructed full levels match the input to 1.000000, and the recovered edges
+come out as 30, 25, 20, 15 and 10 mb near the top to within 6e-4 mb -- clean
+design values, which is independent confirmation that the convention is right.
+
+### Effect
+
+The closure is unchanged at 1.0006, because the error sat *above* the source
+layers. What moves is the tail:
+
+| `dth_mc` | before | after |
+| --- | --- | --- |
+| nRMSE, worst decile | 0.110 | **0.089** |
+| RMSE, median / worst decile | 0.381 / 1.157 | **0.333 / 0.880** |
+| sign mismatch, worst decile | 0.136 | **0.071** |
+| peak ratio, worst decile | 1.734 | **1.614** |
+| bias, worst decile | +0.088 | **+0.036** |
+
+Correlation is unchanged (median +0.977, worst decile +0.887).
+
+### Current state
+
+| | |
+| --- | --- |
+| closure base vs ModelE `lmin` | 48/48 exact |
+| `fmp2` / `mplume_b` | 1.0006 |
+| layer masses vs ModelE `ma` | 1e-4, every level |
+| peak heating, median | 1.009 |
+| `dth_mc` correlation, median / worst decile | +0.977 / +0.887 |
+| `dth_mc` nRMSE, median / worst decile | 0.037 / 0.089 |
+| peak level offset, median / worst decile | 0.0 / +0.0 |
+| sign mismatch, median / worst decile | 0.000 / 0.071 |
+
+Three harness bugs have now been found by the same question, and each was found
+by comparing a quantity that had simply never been compared. The remaining
+unchecked harness inputs are `air_density` on its own (only its product with
+thickness has been checked) and the surface-flux scales `tstar`/`qstar`, which
+`closure_state_diag` shows at 1.00489 -- a 0.5% discrepancy that has not been
+explained.
