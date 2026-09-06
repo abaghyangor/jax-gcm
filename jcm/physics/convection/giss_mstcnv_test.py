@@ -509,3 +509,60 @@ class TestEnvironmentCondensate(unittest.TestCase):
         np.testing.assert_allclose(np.asarray(bare),
                                    np.asarray(explicit_zero),
                                    rtol=1e-6, atol=1e-12)
+
+
+class TestPhaseAssumption(unittest.TestCase):
+    """This port is all-liquid, and that is a stated limit rather than an oversight.
+
+    ModelE picks the latent heat per level from the *parcel* temperature against
+    `tfmc` and latches it once ice forms (MSTCNV.F90:1716-1721), tracks a second
+    phase for the precipitation, and redistributes the melting heat where the two
+    differ. None of that is ported.
+
+    BOMEX cannot show the difference -- it is all-liquid on every level of every
+    step -- so these tests pin the assumption instead of testing physics they
+    cannot reach: the scheme must stay finite on a sub-freezing column rather
+    than producing nonsense, and the flag must stay honest about what is
+    supported.
+    """
+
+    def setUp(self):
+        holder = TestGissConvectionTerm("test_allow_mc_differentiable")
+        holder.setUp()
+        self.state, self.diag = holder._moist_column()
+        self.term = GissConvection(allow_mc=True)
+
+    def test_flag_states_the_limitation(self):
+        from jcm.physics.convection import giss_mstcnv
+        self.assertFalse(giss_mstcnv.MIXED_PHASE_SUPPORTED)
+        # `tf - 15`, the threshold ModelE would switch on.
+        self.assertAlmostEqual(giss_mstcnv._FREEZING_THRESHOLD, 258.15, places=6)
+
+    def test_sub_freezing_column_stays_finite(self):
+        """Below `tfmc` the answer is liquid-phase, which ModelE's would not be.
+
+        The requirement here is only that the scheme degrades quietly rather
+        than returning NaN, so that a global run cannot be poisoned by a cold
+        column. Its *accuracy* there is not claimed and is not tested, because
+        nothing available can check it.
+        """
+        from jcm.physics.convection import giss_mstcnv
+        cold = self.state.copy(
+            temperature=self.state.temperature - 40.0)
+        self.assertLess(float(jnp.min(cold.temperature)),
+                        giss_mstcnv._FREEZING_THRESHOLD)
+        tendency, _ = self.term(cold, self.diag, None, None)
+        self.assertTrue(bool(jnp.all(jnp.isfinite(tendency.temperature))))
+        self.assertTrue(bool(jnp.all(jnp.isfinite(tendency.specific_humidity))))
+
+    def test_sub_freezing_column_is_differentiable(self):
+        """A cold column must not break the gradient either."""
+        cold = self.state.copy(temperature=self.state.temperature - 40.0)
+
+        def loss(temperature):
+            tendency, _ = self.term(cold.copy(temperature=temperature),
+                                    self.diag, None, None)
+            return jnp.sum((tendency.temperature * 86400.0) ** 2)
+
+        grad = jax.grad(loss)(cold.temperature)
+        self.assertTrue(bool(jnp.all(jnp.isfinite(grad))))

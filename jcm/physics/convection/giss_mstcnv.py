@@ -95,6 +95,32 @@ _P_REF = 100000.0
 # back to the conventional one the rest of jcm uses.
 _MODELE_THETA_SCALE = 1000.0 ** KAPA
 
+# ModelE's `tfmc`, the parcel temperature below which condensate forms as ice
+# (`tf - 15d0` in the preset this port targets, MSTCNV.F90:301). Recorded, not
+# used: this port is **all-liquid**, and the constant is here so the boundary of
+# that assumption is stated in the code rather than only in the plan.
+#
+# Making the port mixed-phase is not a matter of threading a per-level flag.
+# ModelE's criterion (MSTCNV.F90:1716-1721) is
+#
+#     if(tp .ge. tfmc) then ; lhx = lhe ; if(VLAT(L).eq.LHS) LHX=LHS
+#     else                  ; lhx = lhs ; endif
+#
+# which depends on the *parcel* temperature as it ascends -- so it is computed
+# inside the scan -- and latches through `VLAT(L)`, so it is path-dependent
+# state that has to be carried. There is also a second, separate phase field
+# `lhp(l)` for the precipitation (MSTCNV.F90:4295-4302), and the reason for
+# tracking both is the melting/freezing heat redistribution
+# `heat1(l) += (vlat(l)-lhp(l))*condpr(l)*bysha`, which is likewise not ported.
+#
+# No oracle currently available exercises any of it: BOMEX is all-liquid on
+# every level and every step, and so is a warm stratocumulus case. Writing it
+# before there is a case that can check it would be writing physics that cannot
+# be validated.
+_FREEZING_THRESHOLD = 273.15 - 15.0     # K, ModelE `tfmc`
+MIXED_PHASE_SUPPORTED = False
+
+
 # Plume-ascent constants used by the (allow_mc) tendency path. These are physical
 # tunables that should graduate to differentiable ``GissConvectionParameters``
 # leaves; kept as module constants for now because the tendency magnitudes are
