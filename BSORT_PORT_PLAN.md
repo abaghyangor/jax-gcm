@@ -4805,3 +4805,60 @@ one, because this closure reads `exner` as ModelE's `(p in mb)**kappa` -- about
 7, not the normalised 0.97 -- and a fixture in the wrong convention looks
 subsaturated and gets vetoed for the wrong reason, which is how the first
 version of the positive test failed.
+
+## 70. RICO: a second convecting case, and it transferred untouched
+
+RICO (Stevens and Seifert 2008 -- precipitating shallow cumulus off Barbados)
+is the case that answers the question BOMEX cannot: does the agreement hold
+because the physics is right, or because the code was shaped around one case?
+
+The rundeck is `decks/rico_scm.R`, derived from `bomex_scm.R`. `SCM_RICO.nc`
+was already on the search path. Three substantive differences:
+
+* no `SCM_SFLUX` and no `SCM_QRAD` -- the file carries neither, and
+  `SCMopt%sflx`/`SCMopt%Qrad` are set by `file_exists` (`SCM_COM.f90:147ff`),
+  so omitting the keys is how the case asks for interactive surface fluxes and
+  interactive radiation. That departs from the GCSS RICO protocol, which
+  prescribes a uniform 2.5 K/day cooling; it does not matter here, because what
+  the oracle has to be is *a ModelE column*, not the published intercomparison.
+* `SCM_LS_H` is supplied. `SCM_RICO.nc` has `TadvH`/`QadvH` and the case needs
+  them (-0.6 K/day, -1 g/kg/day). The BOMEX deck omits `SCM_LS_H` even though
+  `SCM_BOMEX.nc` also carries the fields -- left alone, since that deck is the
+  validated oracle.
+* 2004-12-29, 18N 61.5W, `Ps` 1015.4 mb, `Tskin` 299.8 K.
+
+It compiled, ran 48 steps and wrote every plume dump on the first attempt.
+
+### The result, with nothing changed in the port
+
+| dth_mc, whole column | BOMEX | **RICO** |
+| --- | --- | --- |
+| corr, median / worst decile | +0.977 / +0.887 | **+0.988 / +0.938** |
+| nrmse | 0.037 / 0.089 | **0.034 / 0.067** |
+| peak ratio | 1.009 / 1.614 | **0.956 / 1.128** |
+| peak level offset | +0.0 / +0.0 | +0.0 / +0.6 |
+| sign mismatch | 0.000 / 0.071 | 0.000 / 0.062 |
+| closure base vs ModelE `lmin` | 48/48 exact | **46/46 exact** |
+
+`dq_mc` correlates +0.986 median, +0.967 worst decile. RICO is *better* than
+BOMEX in the tail on every heating metric, on a case the port had never seen,
+with no constant refitted and no code changed.
+
+### And it exercises both answers
+
+ModelE declines to convect in 2 of the 48 RICO periods. The port declines in
+exactly those two, at `max|dth_mc| = 0`. So RICO is not only a second positive
+case -- it is a second, independent confirmation of section 69's vetoes,
+arrived at without being constructed for the purpose.
+
+Those two periods are also invisible to the scorecard: every metric in it is
+undefined against an identically-zero oracle profile. `quiet_line()` reports
+them separately, because "the case where the answer is no" is precisely the
+one the aggregate cannot see -- the same failure mode as sections 55, 56 and
+64, in a new place.
+
+### The driver is now case-agnostic
+
+`bomex_compare_plots.py` takes `$SCM_CASE` against a `CASES` table. Adding a
+case is two lines plus a rundeck. That is deliberate: agreement that requires
+per-case code is not agreement.
