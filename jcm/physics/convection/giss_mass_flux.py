@@ -59,6 +59,10 @@ _TEENY = 1.0e-20     # guards divisions at masked (zero-mass) levels
 # so a half-hour physics step applies half the neutralising mass flux.
 _TADJ_SECONDS = 3600.0
 
+# `MINFRAC`, the smallest plume ModelE will accept (MSTCNV.F90:1226). It is
+# .0005 whenever `cold_pool_on` is true, which is its default.
+_MIN_PLUME_FRACTION = 5.0e-4
+
 
 def cloud_base_mass_flux(theta, specific_humidity, air_mass, exner, pressure,
                          condensate=None, phase: str = "water"):
@@ -522,12 +526,37 @@ def cloud_base_closure(potential_temperature: jnp.ndarray,
             dmse1 > _DMSE_TOL, fplume - dfp,
             jnp.where(dmse1 < -_DMSE_TOL, fplume + dfp, fplume))
 
-    # ModelE gives up before the bisection when the lifted blend does not
-    # reach saturation -- there is no cloud to close on (`MSTCNV.F90:2804`).
-    # Without the guard the closure happily returns a mass flux for columns
-    # ModelE declines to convect at all.
+    # ModelE declines to convect at four points, and all four matter. Running
+    # only the first of them lets the closure return a small mass flux for
+    # columns ModelE leaves entirely alone: on the DYCOMS stratocumulus case,
+    # where ModelE's convective tendencies are identically zero at every level
+    # of every period, the port convected in 48 periods out of 48.
+    #
+    # 1. The lifted blend never reaches saturation, so there is no cloud to
+    #    close on (`MSTCNV.F90:2804`).
     saturated = qdn0 >= qsatc0
-    fmp2 = jnp.where(saturated, fplume * mass_top, 0.0)
+
+    # 2. The column is not conditionally unstable at this base
+    #    (`MSTCNV.F90:2847`). This is `DMSE` from the *initial* blend, computed
+    #    before the bisection runs, and is not the `dmse1` the bisection drives
+    #    to zero -- that one is a residual after a trial mass flux has been
+    #    applied, and says nothing about whether convection should happen.
+    sup0 = _safe_divide(smo2, mass_up)
+    qup0 = _safe_divide(qmo2, mass_up)
+    qsat_up0 = saturation_specific_humidity(sup0 * exner_up, pressure_up,
+                                            phase)
+    dmse0 = ((virtual_temperature(sup0, qup0, wm_up)
+              - virtual_temperature(sdn0, qdn0, wm_dn)) * exner_up
+             + slh * (qsat_up0 - qdn0))
+    unstable = dmse0 <= -1.0e-10
+
+    # 3. The trial fraction came out below `MINFRAC` (`MSTCNV.F90:2849`), and
+    # 4. the resulting mass is below `MINFRAC` of the source layer -- ModelE's
+    #    own "belt and suspenders" pair (`MSTCNV.F90:2896-2898`).
+    big_enough = fplume > _MIN_PLUME_FRACTION
+
+    fmp2 = jnp.where(saturated & unstable & big_enough, fplume * mass_top, 0.0)
+    fmp2 = jnp.where(fmp2 >= _MIN_PLUME_FRACTION * mass_top, fmp2, 0.0)
     if timestep is not None:
         fmp2 = fmp2 * jnp.minimum(1.0, timestep / adjustment_time)
     return fplume, fmp2, dmse1
