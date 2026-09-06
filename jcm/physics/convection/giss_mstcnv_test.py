@@ -463,3 +463,49 @@ class TestGissConvectionGradient(unittest.TestCase):
                     msg=f"autodiff vs finite difference at level {level}")
                 checked += 1
             self.assertGreaterEqual(checked, 3)
+
+
+class TestEnvironmentCondensate(unittest.TestCase):
+    """The term forwards the environment's cloud condensate from the tracers.
+
+    ModelE loads the environment's virtual temperature with `qcl + qci` when it
+    decides whether the downdraft detrains (`svm1`, MSTCNV.F90:4573). BOMEX
+    cannot test this at all: `qcl + qci` is identically zero on every oracle
+    level and every step, so a port ignoring the term would match the oracle
+    exactly -- and this one did, until the wiring was added.
+
+    **The physics is verified in `giss_downdraft_test`, not here.** The
+    idealised column in this module seeds no downdraft, so the condensate has
+    no consumer and cannot change the answer whatever value it takes; asserting
+    otherwise here would be a test that can only ever pass. What this class
+    checks is the wiring: tracers of either name are accepted, combined as a
+    sum, and treated as zero when absent.
+    """
+
+    def setUp(self):
+        holder = TestGissConvectionTerm("test_allow_mc_differentiable")
+        holder.setUp()
+        self.state, self.diag = holder._moist_column()
+        self.term = GissConvection(allow_mc=True)
+
+    def _heating(self, state):
+        tendency, _ = self.term(state, self.diag, None, None)
+        return tendency.temperature
+
+    def test_runs_with_condensate_tracers(self):
+        cloudy = self._heating(self.state.copy(tracers={
+            "qc": jnp.full_like(self.state.temperature, 5.0e-4),
+            "qi": jnp.full_like(self.state.temperature, 2.0e-4),
+        }))
+        self.assertTrue(bool(jnp.all(jnp.isfinite(cloudy))))
+        self.assertEqual(cloudy.shape, self.state.temperature.shape)
+
+    def test_absent_tracers_behave_as_zero(self):
+        bare = self._heating(self.state)
+        explicit_zero = self._heating(self.state.copy(tracers={
+            "qc": jnp.zeros_like(self.state.temperature),
+            "qi": jnp.zeros_like(self.state.temperature),
+        }))
+        np.testing.assert_allclose(np.asarray(bare),
+                                   np.asarray(explicit_zero),
+                                   rtol=1e-6, atol=1e-12)

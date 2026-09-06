@@ -237,3 +237,57 @@ class TestNumerics(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEnvironmentCondensate(unittest.TestCase):
+    """Environmental condensate shifts the buoyancy threshold, by the right amount.
+
+    `svm1 = sm1*byma*plk*(1 + deltx*qm1*byma - qcl - qci)` (MSTCNV.F90:4573):
+    the environment's own cloud water makes it heavier, so the shaft needs to be
+    correspondingly colder before it counts as buoyant and sheds itself.
+
+    Testing this by "add condensate, see the answer change" does not work, and
+    the reason is worth recording. The reference shaft here sits about 5 K from
+    its threshold, so even an unphysical 5 g/kg cannot flip a branch and the
+    tendency is bit-identical -- which reads exactly like the term being
+    unwired. What is diagnostic is the *threshold itself*: bisect for the source
+    temperature at which a level flips, with and without condensate, and check
+    the shift against `tvl * qcond`.
+    """
+
+    def _detrained_at(self, level, source_theta, condensate):
+        result = _descend(
+            source_heat=jnp.array([0.0, 0.0, 0.0, 0.0, 10.0 * source_theta,
+                                   0.0]),
+            source_water=jnp.array([0.0, 0.0, 0.0, 0.0, 10.0 * 0.002, 0.0]),
+            produced_precipitation=jnp.zeros(_NLEV),
+            environment_condensate=jnp.full((_NLEV,), condensate))
+        return float(np.asarray(result.detrained_mass)[level])
+
+    def _critical_theta(self, level, condensate, lo=280.0, hi=340.0):
+        """Source theta at which `level` flips into the buoyant branch."""
+        for _ in range(40):
+            mid = 0.5 * (lo + hi)
+            if self._detrained_at(level, mid, condensate) > 1e-6:
+                hi = mid          # buoyant: sheds 0.75
+            else:
+                lo = mid
+        return 0.5 * (lo + hi)
+
+    def test_threshold_shifts_by_tvl_times_condensate(self):
+        level = 3
+        exner = float(_EXNER[level])
+        cold = self._critical_theta(level, 0.0)
+        warm = self._critical_theta(level, 1.0e-3)
+        measured = (cold - warm) * exner
+        expected = float(_THETA_ENV[level]) * exner * 1.0e-3
+        self.assertGreater(measured, 0.0,
+                           "condensate must make the environment heavier")
+        self.assertAlmostEqual(measured / expected, 1.0, places=2)
+
+    def test_threshold_shift_is_linear_in_condensate(self):
+        level = 3
+        base = self._critical_theta(level, 0.0)
+        half = base - self._critical_theta(level, 5.0e-4)
+        full = base - self._critical_theta(level, 1.0e-3)
+        self.assertAlmostEqual(full / half, 2.0, places=2)
