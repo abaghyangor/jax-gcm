@@ -14,6 +14,7 @@ reading/conversion tooling; this repo holds only the committed arrays, not the
 NetCDF reader.
 """
 
+import contextlib
 import unittest
 from importlib import resources
 
@@ -364,3 +365,101 @@ class TestCloudBaseClosureMassFlux(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@contextlib.contextmanager
+def _float64():
+    """Run the block in float64, then restore whatever was set before.
+
+    Scoped on purpose. ``giss_plume_driver_test`` enables x64 at *module
+    import*, and the side effect is that ``giss_bsort_test``'s
+    vectorised-agreement check passes only when the whole directory runs
+    together -- it fails at 1.3e-4 against a 1e-4 tolerance when run alone. A
+    finite-difference check genuinely needs float64, but it should not silently
+    change the precision every other test in the process runs at.
+    """
+    previous = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", previous)
+
+
+class TestGissConvectionGradient(unittest.TestCase):
+    """Gradients on a *convecting* column, against finite differences.
+
+    The deliverable for this port is a differentiable ``PhysicsTerm``, and the
+    other gradient tests here take ``PhysicsState.ones(...)`` -- a state where
+    convection never fires, every tendency is zero, and so every gradient is
+    legitimately zero too. Those check that the autodiff plumbing survives the
+    trace; they cannot distinguish a correct gradient from no gradient at all.
+    This one runs the column that actually convects.
+
+    **What this does and does not establish.** The scheme is piecewise smooth:
+    the buoyancy sort routes each blend by a threshold test roughly 7e-4 wide
+    in relative buoyancy, and the downdraft takes a three-way branch. Those
+    decisions are ``jnp.where`` on comparisons, so the derivative *through a
+    branch choice* is zero -- moving a blend across the threshold changes the
+    answer discontinuously and no gradient sees it coming. What is verified
+    here is the derivative *within* a piece, which is what gradient-based
+    fitting actually consumes, and which finite differences can confirm.
+    """
+
+    def _setup(self):
+        term = GissConvection(allow_mc=True)
+        holder = TestGissConvectionTerm("test_allow_mc_differentiable")
+        holder.setUp()
+        state, diag = holder._moist_column()
+        return term, state, diag
+
+    @staticmethod
+    def _loss(term, state, diag):
+        # Heating in K/day rather than K/s. The scaling is not cosmetic: in
+        # K/s the loss is ~1e-10 and a central difference is below float
+        # resolution long before the step is small enough to be a derivative.
+        def loss(temperature):
+            tendency, _ = term(state.copy(temperature=temperature), diag,
+                               None, None)
+            return jnp.sum((tendency.temperature * 86400.0) ** 2)
+        return loss
+
+    def test_gradient_is_nonzero_where_the_column_convects(self):
+        term, state, diag = self._setup()
+        tendency, _ = term(state, diag, None, None)
+        self.assertGreater(float(jnp.max(jnp.abs(tendency.temperature))), 0.0,
+                           "fixture must actually convect for this to mean anything")
+        grad = jax.grad(self._loss(term, state, diag))(state.temperature)
+        self.assertTrue(bool(jnp.all(jnp.isfinite(grad))))
+        # A zero gradient here would pass the older finiteness-only tests.
+        self.assertGreater(int(jnp.sum(grad != 0.0)), 3)
+
+    def test_gradient_matches_finite_differences(self):
+        with _float64():
+            term = GissConvection(allow_mc=True)
+            holder = TestGissConvectionTerm("test_allow_mc_differentiable")
+            holder.setUp()
+            state, diag = holder._moist_column()
+            state = state.copy(
+                temperature=jnp.asarray(state.temperature, jnp.float64))
+            loss = self._loss(term, state, diag)
+            grad = np.asarray(jax.grad(loss)(state.temperature)).squeeze()
+            base = np.asarray(state.temperature).squeeze()
+
+            checked = 0
+            for level in np.argsort(-np.abs(grad))[:4]:
+                if abs(grad[level]) < 1e-8:
+                    continue
+                step = 1e-5
+                up, down = base.copy(), base.copy()
+                up[level] += step
+                down[level] -= step
+                shape = state.temperature.shape
+                forward = float(loss(jnp.asarray(up).reshape(shape)))
+                backward = float(loss(jnp.asarray(down).reshape(shape)))
+                secant = (forward - backward) / (2.0 * step)
+                self.assertAlmostEqual(
+                    grad[level] / secant, 1.0, places=3,
+                    msg=f"autodiff vs finite difference at level {level}")
+                checked += 1
+            self.assertGreaterEqual(checked, 3)
