@@ -22,17 +22,36 @@ column pressure / layer-mass diagnostics are present):
 
 When ``allow_mc`` is set (mirroring ModelE ``SCMopt%allowMC``; **default off**)
 the term also runs the **full tendency chain** (:meth:`_convective_tendencies`):
-closure ``fmp2`` -> full-column entraining plume ascent -> compensating
-subsidence + detrainment deposition -> ``dth_mc``/``dq_mc``, returned as
-temperature/humidity tendencies.
+closure ``fmp2`` -> full-column entraining plume ascent with buoyancy sorting ->
+compensating subsidence + detrainment deposition -> ``dth_mc``/``dq_mc``,
+returned as temperature/humidity tendencies.
 
-**Validation status of the tendencies:** structurally sensible but **not
-magnitude-validated**. On BOMEX the peak ``dth_mc`` lands within ~2x of ModelE
-for well-triggered columns and the plume tops out near the observed inversion,
-but the scheme still under-triggers on some columns and is missing cooling terms
-(evaporation, entrainment removal), so the vertical shape is imperfect. A proper
-fix/validation needs the plume-internal ModelE oracle (deferred -- see
-``STATUS.md``). Off by default for this reason.
+**Validation status of the tendencies.** Measured against ModelE run as an
+oracle, driven from an identical column state, over all 48 periods of two
+convecting SCM cases:
+
+===========================  ==============  ==============
+``dth_mc``, whole column     BOMEX           RICO
+===========================  ==============  ==============
+correlation, median / p10    +0.977 / +0.887 +0.988 / +0.938
+nRMSE, median / p90           0.037 / 0.089   0.034 / 0.067
+peak ratio, median            1.009           0.956
+peak level offset             0               0
+closure base vs ModelE lmin  48/48 exact     46/46 exact
+===========================  ==============  ==============
+
+RICO was never used to choose a constant; the port ran on it unchanged. On
+DYCOMS-II RF02, where ModelE's convective tendencies are identically zero, the
+port declines to convect in all 48 periods, and it matches both of RICO's two
+non-convecting periods.
+
+Gradients through the whole chain agree with float64 finite differences to
+1.0000000x (``giss_mstcnv_test.TestGissConvectionGradient``).
+
+Still off by default: ``allow_mc`` mirrors ModelE's own ``SCMopt%allowMC``, and
+the term has not yet been run inside a free-running jcm integration. What is
+*not* ported is stated where it lives -- mixed phase below (``tfmc``), downdraft
+descent in ``giss_plume``, and see ``BSORT_PORT_PLAN.md``.
 
 Conventions
 -----------
