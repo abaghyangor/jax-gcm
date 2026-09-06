@@ -4213,3 +4213,89 @@ At the root, not the symptom. Section 49 already located it: at cloud base
 against ModelE's 75%. That first-level fate difference is what starts the
 plume too massive, and everything above follows from it. Fixing anything
 further up the chain would be treating a symptom.
+
+## 61. Major correction: a harness bug was driving sections 53-60
+
+Following section 60's instruction to intervene at the plume's first level, the
+term-by-term comparison there did not close: the blend potential temperature
+gap was five times `fupd * d(plume theta)`. Inverting the mix implied the
+*environment* differed by ~0.013 K, which section 56 had ruled out.
+
+Section 56 was wrong, and wrong for a reason this project has now hit three
+times. It asserted the reconstruction against a **column median**. Per level:
+
+| candidate | L4 | L5 | **L6** | **L7** | L8 | L9 | L10 | L11 | L12 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| A: undo `mc` (what it chose) | +0.008 | +0.008 | **-0.078** | **-0.089** | -0.032 | -0.025 | -0.011 | -0.006 | -0.006 |
+| B: undo `mc` + `ss` | +0.008 | +0.008 | +0.008 | +0.008 | +0.008 | +0.008 | +0.008 | +0.008 | +0.008 |
+
+A's median was small only because its level 6-9 errors cancel against the rest
+of the column. B is uniform, and in humidity B matches ModelE's `qm1` to
+**~1e-10 at every level** against A's +3.4e-5 at level 6.
+
+The cause: the SUBDD snapshot is taken after `condse_column`, which runs MSTCNV
+**and then LSCOND**, so both tendencies must be undone. Section 56's inference
+that "the snapshot sits immediately after convection" was an artifact of the
+same cancellation.
+
+The error sat at levels 6-7 -- the cloud-base levels the plume launches from --
+and the blends there are sorted on a threshold 0.1-0.2 K wide. So it was
+largest exactly where it mattered most.
+
+### What the fix changes
+
+The port is unchanged; this is what it was being compared against.
+
+| | before | after |
+| --- | --- | --- |
+| peak heating ratio (median) | 1.108 | **0.924** |
+| `dth_mc` correlation, median / worst decile | +0.949 / +0.576 | **+0.978 / +0.898** |
+| nRMSE, median / worst decile | 0.073 / 0.276 | **0.045 / 0.096** |
+| RMSE, median / worst decile | 0.797 / 2.656 | **0.427 / 1.126** |
+| peak level offset, worst decile | +2.0 | **+0.0** |
+| sign mismatch, median / worst decile | 0.065 / 0.267 | **0.000 / 0.133** |
+
+### Which conclusions this overturns
+
+Most of sections 53-60 were diagnosing the harness, not the port:
+
+| claim | before | after |
+| --- | --- | --- |
+| blend buoyancy error (section 57) | up to **1.01** threshold widths, sign-flipping with height | at most **0.21**, monotone |
+| downdraft over-seeding at levels 12-15 (section 57) | **5-8x** | 1.25-1.56x |
+| plume->downdraft, column total (section 49) | 1.311 | **1.158** |
+| plume mass drift (section 49) | 1.08 -> 1.78 | **1.12 -> 1.40** |
+| shaft mass, quiet regime (section 54) | **3.13x**, 13-28x at periods 27-30 | **0.90x** |
+| shaft mass, active regime (section 54) | 1.36x | **0.95x** |
+
+**Section 54's headline is retracted**: the port *does* reproduce ModelE's
+downdraft regime transition, to within 5-10%. Sections 57, 58 and 60's chain --
+blend buoyancy too negative aloft, driving extra evaporation, driving
+over-seeding -- was largely this artifact. The mechanism they describe is real
+arithmetic, but its measured size was inflated several-fold.
+
+**What survives**, because it never involved the port's own state:
+
+* section 45, the mass-weighted downdraft buoyancy in ModelE;
+* section 53's regime transition, measured from ModelE alone;
+* section 59, `condensate_evaporation` exact against 1572 dumped calls;
+* section 47's constants audit and section 46's `ccmul` fix, both established
+  from the Fortran and confirmed independently by the harness metrics;
+* section 49's plume mass drift and the `refblendwt` mechanism, at the reduced
+  size above.
+
+### The lesson, for the third time
+
+Section 46 quoted a median that hid a worst-decile regression. Section 52 built
+a scorecard to stop that. Section 56 then chose the wrong reconstruction on a
+median anyway, because the metric rewarded cancelling errors. The test now
+asserts **per level** and bounds the spread across levels, which is the only
+form that can catch a sign-changing error.
+
+### What is actually left
+
+A plume-mass drift of 1.12 at level 7 rising to 1.40 at level 15, with
+proportional over-seeding of the downdraft (column total 1.16x). That is
+section 49's mechanism at a third of the size previously attributed to it, and
+it is now the whole of the remaining discrepancy rather than one link in a long
+chain.
