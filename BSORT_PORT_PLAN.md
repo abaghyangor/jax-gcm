@@ -4675,3 +4675,66 @@ with a docstring saying why the physics is verified one level down.
 
 A test that can only ever pass is worse than no test, because it reads as
 coverage. Both of the term-level assertions I wrote first were of that kind.
+
+## 68. Per-level phase is the mixed-phase feature, not a signature change
+
+Section 64 listed "per-level `phase`" alongside the condensate wiring as a small
+item. That sizing was wrong, and it was wrong because I sized it from the
+signature rather than the physics.
+
+ModelE does not carry a per-level phase as a property of the level. It decides
+per level from the *parcel* (MSTCNV.F90:1716-1721):
+
+```fortran
+if(tp .ge. tfmc) then ; lhx = lhe ; if(VLAT(L).eq.LHS) LHX=LHS
+else                  ; lhx = lhs ; endif
+```
+
+* it keys on the **parcel temperature as it ascends**, so it is computed inside
+  the scan, not supplied alongside the column;
+* it **latches** through `VLAT(L)` -- once a level is ice it stays ice -- so it
+  is path-dependent state that has to be carried through the scan;
+* `tfmc = tf - 15d0 = 258.15 K` in the live preset.
+
+And there is a **second** phase field. `lhp(l)` is the precipitation's phase,
+set separately (MSTCNV.F90:4295-4302), and the reason for tracking both is the
+melting/freezing heat redistribution
+
+    heat1(l) += (vlat(l) - lhp(l))*condpr(l)*bysha        MSTCNV.F90:4310
+
+which is the block section W's notes already record as deliberately unported.
+
+So "per-level phase" is: `vlat` tracking with its latch, `lhp` tracking, the
+melting redistribution, and the ice microphysics parameters
+(`cloudrvi_mstcnv`, `qci_detrainment_multiplier`, `new_conv_ice_on`) -- 59
+`phase` sites across five modules.
+
+### Why it is not being written now
+
+**No oracle available exercises it.** BOMEX is all-liquid on every level of
+every step. A warm stratocumulus case is too. Only a deep mixed-phase case
+reaches it, and that case also needs `closure2` (section 47), so the ice work
+and the deep-convection work arrive together or not at all.
+
+Writing it now would mean adding a substantial feature with no way to check it,
+in a port where nearly every unvalidated assumption that has been checked this
+session turned out to be wrong somewhere. The sequencing that follows is: get a
+mixed-phase oracle first, then port `vlat`, `lhp` and melting against it.
+
+### What was done instead
+
+The all-liquid assumption was implicit -- the term never mentioned phase and
+every call downstream took the `"water"` default. It is now explicit:
+`MIXED_PHASE_SUPPORTED = False` and `_FREEZING_THRESHOLD = 258.15` in
+`giss_mstcnv`, with the ModelE criterion and what porting it entails recorded
+beside them, and `TestPhaseAssumption` pinning three things:
+
+* the flag stays honest about what is supported;
+* a sub-freezing column stays **finite** -- the scheme degrades quietly instead
+  of poisoning a global run with NaN, which is the property that actually
+  matters until the physics lands;
+* and it stays **differentiable** there too.
+
+Its accuracy below freezing is not claimed and not tested, because nothing
+available can check it. That is the useful state to be in: a known, stated,
+guarded limit rather than a silent one.
