@@ -402,6 +402,23 @@ class GissConvection(PhysicsTerm):
         _, source_dtheta, source_dq = self._source_parcel_inputs(
             diagnostics, q, jnp.flip(density, axis=0)[0], nlev)
 
+        # `qcl + qci`, the environment's own cloud condensate. It loads the
+        # environment's virtual temperature in the downdraft's buoyancy test
+        # (`svm1`, MSTCNV.F90:4573), so omitting it makes the environment look
+        # lighter than it is and the downdraft correspondingly less likely to
+        # detrain. Read from the state tracers the way
+        # `clouds.cloud_data.radiation_cloud_fields` does, and zero where no
+        # cloud scheme has populated them.
+        #
+        # Invisible on BOMEX -- `qcl + qci` is identically zero on every oracle
+        # level and every step -- which is why it went unwired: the single
+        # validation case cannot distinguish the two. It matters wherever there
+        # is stratiform cloud.
+        environment_condensate = jnp.flip(
+            state.tracers.get("qc", jnp.zeros_like(state.temperature))
+            + state.tracers.get("qi", jnp.zeros_like(state.temperature)),
+            axis=0)
+
         column = convective_column(
             potential_temperature=theta_modele,
             specific_humidity=q,
@@ -413,6 +430,7 @@ class GissConvection(PhysicsTerm):
             boundary_layer_top=blt,
             highest_base=base,
             timestep=dtsrc,
+            environment_condensate=environment_condensate,
             source_dtheta=source_dtheta,
             source_dq=source_dq,
             max_plumes=1)

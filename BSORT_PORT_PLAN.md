@@ -4624,3 +4624,54 @@ gradient is exact, the loss landscape is not smooth, and a smooth-sort variant
 would be a separate experimental mode rather than a fix -- and should stay
 separate until the exact path is locked down, or it will not be possible to
 tell which of the two is being validated.
+
+## 67. Environmental condensate: wired, and tested where it can be
+
+The first of the gaps BOMEX structurally cannot reveal. ModelE loads the
+environment's virtual temperature with its own cloud condensate when deciding
+whether the downdraft detrains:
+
+    svm1 = sm1*byma*plk*(1 + deltx*qm1*byma - qcl - qci)   MSTCNV.F90:4573
+
+`_bsort_tendencies` never passed it, so `environment_condensate` silently
+defaulted to zero all the way down. On BOMEX that is *exactly right* -- `qcl +
+qci` is identically zero on every oracle level and every step (section 55) --
+which is why it survived: the single validation case cannot distinguish a
+correct port from one that ignores the term. It matters wherever there is
+stratiform cloud, which is most of the atmosphere and specifically DYCOMS.
+
+Now read from the state tracers, following the convention
+`clouds.cloud_data.radiation_cloud_fields` already uses (`qc`, `qi`, zero when
+a cloud scheme has not populated them). ModelE's `QCL,QCI` are documented as
+"grid-avg mass mixing ratio (kg/kg) of cloud water, ice", the same quantity.
+
+### Testing it took three attempts, and the failures are the useful part
+
+**"Add condensate, see the answer change" does not work**, and it fails in a way
+that looks exactly like a bug:
+
+* The term-level fixture seeds *no downdraft at all* -- `downdraft_mass` is zero
+  at every level -- so the condensate has no consumer. Neither idealised fixture
+  in the repo (`giss_mstcnv_test._moist_column`, `giss_plume_driver_test._column`
+  through `convective_column`) exercises the descent; it is reached only by the
+  BOMEX comparison and by `giss_downdraft_test`'s direct calls.
+* Even with a shaft present, the reference shaft sits ~5 K from its buoyancy
+  threshold, so an unphysical 5 g/kg still cannot flip a branch and the result
+  is bit-identical.
+
+Both produced "condensate is not reaching the scheme" from a correctly wired
+term. What *is* diagnostic is the threshold itself: bisect for the source
+temperature at which a level flips, with and without condensate.
+
+| | |
+| --- | --- |
+| measured shift for `qcond = 1e-3` | **+0.2730 K** |
+| expected `tvl * qcond` | **+0.2732 K** |
+
+Right sign, right magnitude, 0.1%. `giss_downdraft_test` now pins that and its
+linearity in `qcond`; `giss_mstcnv_test` keeps only what it can honestly check
+-- that the tracers are accepted, summed, and equivalent to zero when absent --
+with a docstring saying why the physics is verified one level down.
+
+A test that can only ever pass is worse than no test, because it reads as
+coverage. Both of the term-level assertions I wrote first were of that kind.
