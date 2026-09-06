@@ -4862,3 +4862,28 @@ one the aggregate cannot see -- the same failure mode as sections 55, 56 and
 `bomex_compare_plots.py` takes `$SCM_CASE` against a `CASES` table. Adding a
 case is two lines plus a rundeck. That is deliberate: agreement that requires
 per-case code is not agreement.
+
+## 71. The documentation was a year out of date, and it is the first thing read
+
+`STATUS.md` and the `giss_mstcnv` module docstring both still described the June
+state. `STATUS.md` said "the convection physics is not translated",
+"`GissConvection` returns zero", "7 tests passing", and asked NASA for the BOMEX
+and RICO input bundles -- both of which have since arrived, been run, and been
+used to validate the port. The docstring said the tendencies were "not
+magnitude-validated", landing "within ~2x" and "missing cooling terms".
+
+None of that has been true since roughly section 45. It survived because every
+section of this plan was appended and nothing summarising was ever rewritten --
+an append-only record grows more accurate while the summary in front of it
+decays, and the summary is what a reader opens first.
+
+Both are now current, and both carry the limits with the same weight as the
+results: two convecting cases, both all-liquid, both topping out near 3.4 km,
+so nothing available exercises the ice phase.
+
+The measurement that made this worth doing: RICO's convective levels reach a
+minimum temperature of 280.7 K and BOMEX's 281.2 K, against `tfmc` = 258.15 K,
+and both cases' convection stops at model level 19 (about 3.37 and 3.38 km).
+RICO is a second *independent* case. It is not a *deeper* one, and it would be
+easy -- and wrong -- to present two shallow all-liquid cases as coverage of the
+scheme's range.
