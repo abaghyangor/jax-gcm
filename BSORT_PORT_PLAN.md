@@ -4572,3 +4572,55 @@ unchecked harness inputs are `air_density` on its own (only its product with
 thickness has been checked) and the surface-flux scales `tstar`/`qstar`, which
 `closure_state_diag` shows at 1.00489 -- a 0.5% discrepancy that has not been
 explained.
+
+## 66. The differentiability deliverable, actually tested
+
+The brief for this port is a *differentiable* JAX `PhysicsTerm`. Until now the
+only gradient coverage on the full term ran on `PhysicsState.ones(...)` -- a
+state where convection never fires, every tendency is zero, and so every
+gradient is legitimately zero. Its own comments say so: "gradients are zero but
+must be defined and finite", "the point is the autodiff plumbing works". Those
+tests cannot distinguish a correct gradient from no gradient at all.
+
+On a column that does convect, in float64, the autodiff gradient matches
+central finite differences:
+
+| level | autodiff | finite difference | ratio |
+| --- | --- | --- | --- |
+| 1 | +8.31848294e+03 | +8.31848293e+03 | 1.00000000 |
+| 11 | +3.30776470e+03 | +3.30776464e+03 | 1.00000002 |
+| 2 | -3.19113944e+03 | -3.19113952e+03 | 0.99999998 |
+| 3 | -1.94566771e+03 | -1.94566771e+03 | 1.00000000 |
+
+11 of 12 levels carry a non-zero gradient. `TestGissConvectionGradient` now
+pins this.
+
+Three details that make the test mean something:
+
+* **The loss is in K/day, not K/s.** In K/s it is ~1e-10 and a central
+  difference falls below float resolution long before the step is small enough
+  to be a derivative -- the first attempt at this check produced ratios of
+  0.71, 3.04 and -0.68 and looked like a gradient bug. It was the probe.
+* **float64 is scoped to the test** via save/restore, not enabled at module
+  import. `giss_plume_driver_test` does the latter, and the consequence is that
+  `giss_bsort_test::test_column_matches_vectorized` passes only when the whole
+  directory runs together (section 57). Verified by running the two modules in
+  sequence: bsort's test still fails alone, so precision really is restored.
+* **The non-zero assertion is separate from the finiteness one**, because a
+  gradient of exactly zero would satisfy every pre-existing test here.
+
+### What this does and does not establish
+
+The scheme is piecewise smooth. The buoyancy sort routes each blend by a
+threshold about 7e-4 wide in relative buoyancy (section 57), and the downdraft
+takes a three-way branch; both are `jnp.where` on comparisons. The derivative
+*through a branch decision* is therefore zero -- moving a blend across the
+threshold changes the answer discontinuously and no gradient anticipates it.
+
+What is verified is the derivative *within* a piece, which is what
+gradient-based fitting consumes, and which finite differences can confirm. The
+distinction matters for anyone planning to optimise through this term: the
+gradient is exact, the loss landscape is not smooth, and a smooth-sort variant
+would be a separate experimental mode rather than a fix -- and should stay
+separate until the exact path is locked down, or it will not be possible to
+tell which of the two is being validated.
