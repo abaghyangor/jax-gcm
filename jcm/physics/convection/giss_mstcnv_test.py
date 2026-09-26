@@ -372,11 +372,11 @@ def _float64():
     """Run the block in float64, then restore whatever was set before.
 
     Scoped on purpose. ``giss_plume_driver_test`` enables x64 at *module
-    import*, and the side effect is that ``giss_bsort_test``'s
-    vectorised-agreement check passes only when the whole directory runs
-    together -- it fails at 1.3e-4 against a 1e-4 tolerance when run alone. A
-    finite-difference check genuinely needs float64, but it should not silently
-    change the precision every other test in the process runs at.
+    import*, and leaking precision that way once made ``giss_bsort_test``'s
+    vectorised-agreement check pass only when the whole directory ran in one
+    process; that test now sets its own precision. A finite-difference check
+    genuinely needs float64, but it should not silently change the precision
+    every other test in the process runs at.
     """
     previous = jax.config.jax_enable_x64
     jax.config.update("jax_enable_x64", True)

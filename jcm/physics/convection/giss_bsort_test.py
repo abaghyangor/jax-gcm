@@ -512,6 +512,29 @@ class TestPlumeAscent(unittest.TestCase):
                             "active levels must be contiguous")
 
     def test_column_matches_vectorized(self):
+        """One column and a 3-wide block must be the same computation.
+
+        Asserted in float64, where the answer is *exact* (0.0), rather than in
+        float32 against a hand-picked tolerance. The scheme ships in float32 and
+        there the two differ by ~1.3e-4 on a `plume_mass` of magnitude 52 --
+        1.9e-6 relative, which is XLA compiling the `(nlev,)` and `(nlev, 3)`
+        shapes to different reduction orders, not a broadcasting defect.
+
+        The precision is set here rather than inherited. This test used to pass
+        only when the whole directory ran in one process, because
+        `giss_plume_driver_test` enables x64 at module import; run alone it
+        failed at 1.3e-4 against a 1e-4 tolerance. An order-dependent test is
+        worse than a flaky one -- it is green on CI and red for whoever runs the
+        file on its own.
+        """
+        previous = jax.config.jax_enable_x64
+        jax.config.update("jax_enable_x64", True)
+        try:
+            self._column_matches_vectorized()
+        finally:
+            jax.config.update("jax_enable_x64", previous)
+
+    def _column_matches_vectorized(self):
         single = _run_column()
 
         def widen(x):
@@ -533,10 +556,12 @@ class TestPlumeAscent(unittest.TestCase):
             exner=widen(_column_profile("plk", 7.0)),
             pressure=widen(_column_profile("pres", 9.0e4)),
             entrainment_efficiency=jnp.full((3,), _COLUMN["enteff"]))
-        self.assertLess(float(jnp.max(jnp.abs(
-            single.plume_mass[:, None] - block.plume_mass))), 1e-4)
-        self.assertLess(float(jnp.max(jnp.abs(
-            single.detrained_mass[:, None] - block.detrained_mass))), 1e-4)
+        # Exact: same inputs, same code, so any difference at all would mean the
+        # vertical scan reads a horizontal axis somewhere.
+        self.assertEqual(float(jnp.max(jnp.abs(
+            single.plume_mass[:, None] - block.plume_mass))), 0.0)
+        self.assertEqual(float(jnp.max(jnp.abs(
+            single.detrained_mass[:, None] - block.detrained_mass))), 0.0)
 
     def test_gradient_finite(self):
         def f(cloud_base_mass):
