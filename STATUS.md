@@ -5,7 +5,10 @@
 **Companion repo:** `modele-jcm-bridge` (ModelE oracle reading + state conversion).
 
 The long-form engineering record, including every wrong turn and its correction,
-is `BSORT_PORT_PLAN.md` (71 sections). This file is the summary.
+is `BSORT_PORT_PLAN.md` (71 sections). It lives in the **private** companion
+repository `modele-jcm-bridge`, not here: it is an internal working record of a
+validation still in progress, and this repository is public. This file is the
+summary meant to be read on its own.
 
 ---
 

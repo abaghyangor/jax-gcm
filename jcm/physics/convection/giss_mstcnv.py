@@ -51,7 +51,8 @@ Gradients through the whole chain agree with float64 finite differences to
 Still off by default: ``allow_mc`` mirrors ModelE's own ``SCMopt%allowMC``, and
 the term has not yet been run inside a free-running jcm integration. What is
 *not* ported is stated where it lives -- mixed phase below (``tfmc``), downdraft
-descent in ``giss_plume``, and see ``BSORT_PORT_PLAN.md``.
+descent in ``giss_plume``, and see ``BSORT_PORT_PLAN.md`` in the companion
+modele-jcm-bridge repository.
 
 Conventions
 -----------
@@ -403,7 +404,8 @@ class GissConvection(PhysicsTerm):
         down to ``dcl``, running the closure at each. The ported closure
         (:mod:`giss_mass_flux`) solves a single base, so only that one is swept
         here. Widening it needs the ``nlpi > 1`` closure -- see
-        ``BSORT_PORT_PLAN.md`` W1 -- and until then a column that would support
+        ``BSORT_PORT_PLAN.md`` W1 (bridge repo) -- and until then a column that
+        would support
         several plumes gets only its deepest.
 
         Needs ``pressure_full``/``layer_thickness``/``air_density``; without
