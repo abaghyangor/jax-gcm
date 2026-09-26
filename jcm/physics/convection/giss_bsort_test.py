@@ -12,8 +12,8 @@ level, chosen to span the four regimes the closure can land in:
   and the blend spectrum collapses to a single pure-updraft blend.
 
 Full-column agreement (536 levels, 1572 blends) is recorded in
-``BSORT_PORT_PLAN.md``; these tests lock in a representative sample plus the
-structural properties.
+the bridge repo's ``BSORT_PORT_PLAN.md``; these tests lock in a
+representative sample plus the structural properties.
 """
 
 import unittest
@@ -443,7 +443,7 @@ class TestPlumeAscent(unittest.TestCase):
     ModelE also condenses (``get_dq_cond``) and runs
     ``CONVECTIVE_MICROPHYSICS`` to remove precipitation, neither of which is
     ported yet. The per-level bsort physics is validated separately over all
-    536 oracle levels; see ``BSORT_PORT_PLAN.md``.
+    536 oracle levels; see the bridge repo's ``BSORT_PORT_PLAN.md``.
     """
 
     def test_cloud_base_level_matches_oracle(self):

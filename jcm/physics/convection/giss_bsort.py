@@ -28,7 +28,8 @@ not to close during this port.
 
 Every formula here was verified against a dump taken from inside ModelE's own
 ascent loop (bridge repo ``oracle_data/bomex_mass_budget.txt`` and
-``bomex_blend_diag.txt``); see ``BSORT_PORT_PLAN.md`` for the agreement table.
+``bomex_blend_diag.txt``); the agreement table is in that repo's
+``BSORT_PORT_PLAN.md``.
 
 Broadcasting-native, per the repository convention: these are *per-level*
 helpers intended for use inside the ascent scan, so their inputs have shape
