@@ -218,7 +218,7 @@ class TestClosureDeclinesToConvect(unittest.TestCase):
         spec.loader.exec_module(module)
         return module._column()
 
-    def _closure(self, column, base=5):
+    def _closure(self, column, base=5, return_gates=False):
         from jcm.physics.convection.giss_plume_driver import (
             source_bottom, source_weights)
         source_low = source_bottom(column["pressure"], jnp.array(base))
@@ -228,7 +228,7 @@ class TestClosureDeclinesToConvect(unittest.TestCase):
             column["potential_temperature"], column["specific_humidity"],
             column["layer_mass"], column["exner"], column["pressure"],
             source_low, jnp.array(base), weights,
-            timestep=jnp.array(1800.0))
+            timestep=jnp.array(1800.0), return_gates=return_gates)
 
     def test_unstable_column_still_convects(self):
         """The vetoes must not suppress a column that should convect."""
@@ -248,6 +248,32 @@ class TestClosureDeclinesToConvect(unittest.TestCase):
         column["potential_temperature"] = jnp.asarray(theta)
         _, fmp2, _ = self._closure(column)
         self.assertEqual(float(fmp2), 0.0)
+
+    def test_gates_say_which_veto_closed(self):
+        """`return_gates` must identify the veto, not just report zero.
+
+        Four vetoes share one output, so `fmp2 == 0` is not diagnosable after
+        the fact: DYCOMS (three vetoes missing, the port convecting 48/48) and
+        TWP-ICE (the saturation gate closing on a quarter of a deep case)
+        present identically. This is the diagnostic that separates them.
+        """
+        column = dict(self._column())
+        column["potential_temperature"] = (
+            column["potential_temperature"].at[5:].add(12.0))
+        *_, gates = self._closure(column, return_gates=True)
+        self.assertFalse(bool(jnp.all(gates["unstable"])))
+        for key in ("saturated", "big_enough", "above_floor", "fplume",
+                    "dmse0", "humidity_deficit"):
+            self.assertIn(key, gates)
+
+    def test_gates_do_not_change_the_answer(self):
+        column = self._column()
+        plain = self._closure(column)
+        with_gates = self._closure(column, return_gates=True)
+        self.assertEqual(len(plain), 3)
+        self.assertEqual(len(with_gates), 4)
+        for a, b in zip(plain, with_gates[:3]):
+            self.assertEqual(float(jnp.max(jnp.abs(a - b))), 0.0)
 
     def test_minfrac_floor_is_the_modele_value(self):
         # MSTCNV.F90:1226, `.0005` whenever `cold_pool_on` -- its default.
