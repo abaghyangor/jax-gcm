@@ -362,7 +362,8 @@ def cloud_base_closure(potential_temperature: jnp.ndarray,
                        condensate: jnp.ndarray = None,
                        timestep: jnp.ndarray = None,
                        adjustment_time: jnp.ndarray = _TADJ_SECONDS,
-                       phase: str = "water"):
+                       phase: str = "water",
+                       return_gates: bool = False):
     """``MASS_FLUX2`` for a source spanning any number of layers.
 
     Args:
@@ -556,7 +557,19 @@ def cloud_base_closure(potential_temperature: jnp.ndarray,
     big_enough = fplume > _MIN_PLUME_FRACTION
 
     fmp2 = jnp.where(saturated & unstable & big_enough, fplume * mass_top, 0.0)
-    fmp2 = jnp.where(fmp2 >= _MIN_PLUME_FRACTION * mass_top, fmp2, 0.0)
+    above_floor = fmp2 >= _MIN_PLUME_FRACTION * mass_top
+    fmp2 = jnp.where(above_floor, fmp2, 0.0)
     if timestep is not None:
         fmp2 = fmp2 * jnp.minimum(1.0, timestep / adjustment_time)
+    if return_gates:
+        # Which veto closed, for a column that produced nothing. Four gates
+        # with one output between them is not diagnosable after the fact: the
+        # DYCOMS defect (three of the four missing) and the TWP-ICE one (a
+        # quarter of a deep case declined) both present identically as
+        # `fmp2 == 0`. Returned only on request, so the hot path is unchanged.
+        gates = dict(saturated=saturated, unstable=unstable,
+                     big_enough=big_enough, above_floor=above_floor,
+                     fplume=fplume, dmse0=dmse0,
+                     humidity_deficit=qdn0 - qsatc0)
+        return fplume, fmp2, dmse1, gates
     return fplume, fmp2, dmse1
