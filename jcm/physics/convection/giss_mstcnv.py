@@ -703,11 +703,25 @@ class GissConvection(PhysicsTerm):
         The closure blends its source parcel over the boundary layer and boosts
         it by the surface-flux scales. Both inputs are read *optionally*:
 
-        * ``boundary_layer_height`` [m] (with ``height_full``) gives ``dcl``, the
-          level **below** the boundary-layer top -- ``MSTCNV`` excludes source
-          levels above it so a parcel displaced through the top is not mixed with
-          free-tropospheric air. Note the off-by-one: ``searchsorted`` returns the
-          insertion index, and ``dcl`` is one below it.
+        * ``mixed_layer_top`` -- ``dcl`` itself, as a level index. ``MSTCNV``
+          excludes source levels above it so a parcel displaced through the top
+          is not mixed with free-tropospheric air. Preferred when offered:
+          ModelE's own ``smixlev`` ("layer to which dry convection or moist
+          turbulence mixes", ``ATURB_COM.f:34``), and in a jcm integration the
+          vertical-diffusion term produces the same quantity.
+        * ``boundary_layer_height`` [m] (with ``height_full``) is the
+          **fallback**, used only when the level is not offered. It cannot
+          recover ``dcl`` in general. ModelE sets ``pblht = dbl`` by
+          interpolating between levels against a critical Richardson number
+          (``ATURB_DRV.f:2341-2372``) while ``dcl = ldbl`` is the index from the
+          same scheme, so ``pblht`` can fall on either side of ``z(dcl)``:
+          *above* it on all 48 BOMEX and 48 RICO periods, *below* it on all 128
+          TWP-ICE periods sampled. Counting the levels under it therefore
+          returns ``dcl`` on the shallow cases and ``dcl - 1`` on the deep one,
+          and no fixed offset satisfies both -- removing the ``- 1`` below takes
+          BOMEX from 48/48 exact cloud bases to 0/48. The ``- 1`` is kept
+          because it is right for the cases the fallback is accurate on, and the
+          fallback is wrong for a deep column either way.
         * ``surface`` (a ``SurfaceData``) supplies the fluxes for
           :func:`surface_flux_scales`; ``ustar`` comes from the momentum fluxes,
           ``ustar = sqrt(|tau|/rho)``.
@@ -716,14 +730,19 @@ class GissConvection(PhysicsTerm):
         column with no surface enhancement, which under-computes the cloud-base
         mass flux (see ``STATUS.md``).
         """
-        height = diagnostics.get("height_full")
-        pbl_height = diagnostics.get("boundary_layer_height")
         boundary_layer_top = None
-        if height is not None and pbl_height is not None:
-            height_sf = jnp.flip(height, axis=0)
-            below_top = jnp.sum(
-                (height_sf < pbl_height[None, ...]).astype(int), axis=0) - 1
-            boundary_layer_top = jnp.clip(below_top, 0, nlev - 3)
+        mixed_layer_top = diagnostics.get("mixed_layer_top")
+        if mixed_layer_top is not None:
+            boundary_layer_top = jnp.clip(
+                jnp.asarray(mixed_layer_top).astype(int), 0, nlev - 3)
+        else:
+            height = diagnostics.get("height_full")
+            pbl_height = diagnostics.get("boundary_layer_height")
+            if height is not None and pbl_height is not None:
+                height_sf = jnp.flip(height, axis=0)
+                below_top = jnp.sum(
+                    (height_sf < pbl_height[None, ...]).astype(int), axis=0) - 1
+                boundary_layer_top = jnp.clip(below_top, 0, nlev - 3)
 
         surface = diagnostics.get("surface")
         if surface is None:
