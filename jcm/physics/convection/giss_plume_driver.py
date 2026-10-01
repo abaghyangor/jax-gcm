@@ -513,6 +513,17 @@ _MAX_SOURCE_SPAN = 300.0e2
 _DISPLACEMENT_FRACTION = 0.3
 _DISPLACEMENT_MAX = 50.0e2      # `dp_disp_max` = 50 hPa
 
+# The *second* displacement (`closure2`), live whenever `lessent_scheme == 2`
+# -- which is its default (`MSTCNV.F90:629`) and what every SCM rundeck here
+# selects. Values are the `preset_t` defaults (`:285-294`), not the tuned
+# blocks, by the same rundeck reasoning as the rest of this port.
+_CLOSURE2_PRESSURE_THRESHOLD = 700.0e2   # `pthresh_closure2`
+_CLOSURE2_FRACTION = 1.0                 # `dp_disp2_fac`
+_CLOSURE2_MAX = 200.0e2                  # `dp_disp2_max`
+_CLOSURE2_MIN = 50.0e2                   # `dp_disp2_min`
+_MELTING_REFERENCE = 550.0e2             # the typical tropical melting level
+_MELTING_OFFSET_MAX = 100.0e2
+
 
 class ColumnConvection(NamedTuple):
     """What the whole plume sequence does to one column."""
@@ -543,11 +554,57 @@ def source_bottom(pressure: jnp.ndarray,
                      source_top)
 
 
+def second_displacement(melting_pressure: jnp.ndarray = None,
+                        cloud_top_pressure: jnp.ndarray = None
+                        ) -> jnp.ndarray:
+    """``dp_disp2``, the second displacement, in **Pa**.
+
+    ``MSTCNV.F90:1441-1447``::
+
+        pthresh_closure2_loc = pthresh_closure2 + min(pmelt - 550, 100)
+        dp_disp2 = min(dp_disp2_max, dp_disp2_fac*(pthresh_closure2_loc - pmct))
+        if(dp_disp2 .lt. dp_disp2_min) dp_disp2 = 0.
+
+    This is what selects the cloud base on a deep column. The base ModelE
+    converts at is ``lmax_disp2`` -- computed from ``max(dp_disp, dp_disp2)`` --
+    on 99% of TWP-ICE steps and ``lmax_disp1`` on only 64%. On BOMEX the two are
+    identical on every step, which is why a port that only had the first
+    displacement matched 48/48 there and 64% on a deep case.
+
+    Both arguments are optional and the result is zero without them, because
+    ``pmct`` is not a column quantity: it is an exponentially weighted running
+    cloud-top pressure with a two-hour time constant
+    (``pmct = pmcwt*pmct + (1-pmcwt)*pmct_``, ``MSTCNV.F90:2583-2585``), so it
+    has to be carried as state by whatever drives this. Returning zero reduces
+    the caller to the single-displacement behaviour, which is correct for a
+    column that never reaches a melting level.
+
+    Args:
+        melting_pressure: ``pmelt`` [Pa], where the column crosses freezing.
+            ModelE defaults it to 550 hPa when there is no melting level
+            (``:1360``), which is every BOMEX and RICO column -- and is exactly
+            why ``dp_disp2`` never bound there.
+        cloud_top_pressure: ``pmct`` [Pa], the running convective cloud top.
+
+    Returns:
+        The displacement [Pa], zero where it falls below ``dp_disp2_min``.
+    """
+    if melting_pressure is None or cloud_top_pressure is None:
+        return jnp.asarray(0.0)
+    threshold = _CLOSURE2_PRESSURE_THRESHOLD + jnp.minimum(
+        melting_pressure - _MELTING_REFERENCE, _MELTING_OFFSET_MAX)
+    displacement = jnp.minimum(
+        _CLOSURE2_MAX, _CLOSURE2_FRACTION * (threshold - cloud_top_pressure))
+    return jnp.where(displacement < _CLOSURE2_MIN, 0.0, displacement)
+
+
 def displacement_top(layer_mass: jnp.ndarray,
                      pressure: jnp.ndarray,
                      boundary_layer_top: jnp.ndarray,
                      highest_base: jnp.ndarray,
-                     cold_pool_mass: jnp.ndarray = 0.0) -> jnp.ndarray:
+                     cold_pool_mass: jnp.ndarray = 0.0,
+                     melting_pressure: jnp.ndarray = None,
+                     cloud_top_pressure: jnp.ndarray = None) -> jnp.ndarray:
     """``lmax_disp``: the highest cloud base a boundary-layer parcel reaches.
 
     ModelE displaces a boundary-layer parcel upward by
@@ -596,6 +653,9 @@ def displacement_top(layer_mass: jnp.ndarray,
         _DISPLACEMENT_FRACTION * GRAV
         * jnp.maximum(boundary_layer_mass, cold_pool_mass),
         _DISPLACEMENT_MAX)
+    displacement = jnp.maximum(
+        displacement,
+        second_displacement(melting_pressure, cloud_top_pressure))
 
     base_pressure = jnp.sum(
         jnp.where(level == boundary_layer_top, pressure, 0.0), axis=0)

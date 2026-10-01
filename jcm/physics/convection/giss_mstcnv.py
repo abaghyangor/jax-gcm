@@ -634,9 +634,20 @@ class GissConvection(PhysicsTerm):
         #
         # The *reported* ``cloud_base`` stays the surface-parcel LCL, which is the
         # quantity validated against ModelE's ``cldmc`` (47/48 exact).
+        # `melting_pressure`/`cloud_top_pressure` drive ModelE's *second*
+        # displacement, which is what selects the base on a deep column: the
+        # sweep converts at `lmax_disp2` on 99% of TWP-ICE steps against 64% for
+        # `lmax_disp1`. They are optional because `pmct` is prognostic -- a
+        # running cloud top with a two-hour constant -- and without them the
+        # second displacement is zero, which is the right answer for a column
+        # whose cloud top sits below the threshold (every BOMEX step).
         closure_base = cloud_base if blt is None else jnp.clip(
             displacement_top(air_mass, p_sf, blt,
-                             jnp.asarray(nlev - 3, dtype=int)),
+                             jnp.asarray(nlev - 3, dtype=int),
+                             melting_pressure=diagnostics.get(
+                                 "melting_pressure"),
+                             cloud_top_pressure=diagnostics.get(
+                                 "convective_cloud_top_pressure")),
             0, nlev - 3)
 
         if self.bsort:
