@@ -126,7 +126,7 @@ def entrainment_rate(buoyancy: jnp.ndarray,
                      kew: jnp.ndarray,
                      bdzsum: jnp.ndarray,
                      pressure: jnp.ndarray,
-                     iplume: int = 2):
+                     iplume: jnp.ndarray = 2):
     """Entrainment and detrainment rates [1/m] -- ModelE's energy closure.
 
     The rate is *not* proportional to buoyancy over ``w^2``. It is chosen so that
@@ -146,7 +146,8 @@ def entrainment_rate(buoyancy: jnp.ndarray,
             increment.
         bdzsum: Running discounted integral, likewise after this level.
         pressure: Level pressure [**Pa**] (ModelE tests ``pl(l)`` in mb).
-        iplume: Which plume this is (1 = less entraining, 2 = more entraining).
+        iplume: Which plume this is (1 = less entraining, 2 = more
+            entraining). Traced, so it may differ per column.
             Static configuration, so it branches in Python.
 
     Returns:
@@ -175,12 +176,18 @@ def entrainment_rate(buoyancy: jnp.ndarray,
 
     # Floors, only where the plume is buoyant. For the less-entraining plume
     # ModelE applies the floor only below 700 mb; for the other, always.
-    if iplume == 1:
-        floor_applies = (buoyancy > 0.0) & (pressure > _ENT_FLOOR_PRESSURE)
-        floor_value = _ENT_FLOOR_LESS_ENTRAINING
-    else:
-        floor_applies = buoyancy > 0.0
-        floor_value = _ENT_FLOOR_MORE_ENTRAINING
+    #
+    # `iplume` is traced rather than static because a `closure2` plume runs as
+    # plume 1 (`iplume_pass = 1`, MSTCNV.F90:1719) and whether a column takes
+    # that branch is a property of the column, not of the configuration. A
+    # Python `if` here would bake one answer into the trace for every column.
+    less_entraining = jnp.asarray(iplume) == 1
+    floor_applies = jnp.where(
+        less_entraining,
+        (buoyancy > 0.0) & (pressure > _ENT_FLOOR_PRESSURE),
+        buoyancy > 0.0)
+    floor_value = jnp.where(less_entraining, _ENT_FLOOR_LESS_ENTRAINING,
+                            _ENT_FLOOR_MORE_ENTRAINING)
     ent = jnp.where(floor_applies, jnp.maximum(ent, floor_value), ent)
 
     ent = jnp.minimum(ent, _ENT_MAX)
@@ -614,7 +621,7 @@ def plume_ascent(cloud_base: jnp.ndarray,
                  cloud_base_velocity: jnp.ndarray = 0.5,
                  droplet_number: jnp.ndarray = 60.0e6,
                  droplet_radius: jnp.ndarray = 10.0e-6,
-                 iplume: int = 2,
+                 iplume: jnp.ndarray = 2,
                  phase: str = "water") -> PlumeAscent:
     """Run one buoyancy-sorting plume from cloud base to termination.
 
@@ -665,7 +672,7 @@ def plume_ascent(cloud_base: jnp.ndarray,
         droplet_number: ``CDNC`` [m^-3] for the precipitation partition. ModelE
             forms this as a land/ocean blend; 60e6 is its ocean value.
         droplet_radius: Assumed cloud droplet volume radius [m].
-        iplume: Plume index (static).
+        iplume: Plume index; traced, so it may differ per column.
         phase: ``"water"`` or ``"ice"`` (static).
 
     Returns:
