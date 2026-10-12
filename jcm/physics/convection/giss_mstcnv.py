@@ -93,6 +93,7 @@ from jcm.physics.convection.giss_mass_flux import (
 from jcm.physics.convection.giss_plume import plume_ascent_column
 from jcm.physics.convection.giss_plume_driver import (
     convective_column,
+    entrainment_efficiency,
     displacement_top,
     enhanced_source,
     source_bottom,
@@ -361,13 +362,13 @@ class GissConvection(PhysicsTerm):
         nlev = shape[0]
         nodal_shape = shape[1:]
 
-        cloud_base, fmp2, closure_base, boundary_layer_top = self._diagnose(
-            state, diagnostics, nlev, nodal_shape)
+        (cloud_base, fmp2, closure_base, boundary_layer_top,
+         second_closure) = self._diagnose(state, diagnostics, nlev, nodal_shape)
 
         if self.allow_mc and self.bsort:
             dtemp_dt, dq_dt, dth_mc, dq_mc = self._bsort_tendencies(
                 state, diagnostics, closure_base, fmp2, boundary_layer_top,
-                nlev, nodal_shape, dtsrc)
+                nlev, nodal_shape, dtsrc, second_closure)
         elif self.allow_mc:
             dtemp_dt, dq_dt, dth_mc, dq_mc = self._convective_tendencies(
                 state, diagnostics, cloud_base, fmp2, nlev, nodal_shape, dtsrc)
@@ -387,7 +388,8 @@ class GissConvection(PhysicsTerm):
         return tendency, {**diagnostics, "convection": convection}
 
     def _bsort_tendencies(self, state, diagnostics, closure_base, fmp2,
-                          boundary_layer_top, nlev, nodal_shape, dtsrc):  # noqa: D401
+                          boundary_layer_top, nlev, nodal_shape, dtsrc,
+                          second_closure=False):  # noqa: D401
         """Convective tendencies from the buoyancy-sorting port.
 
         Hands the column to
@@ -482,6 +484,17 @@ class GissConvection(PhysicsTerm):
             environment_condensate=environment_condensate,
             source_dtheta=source_dtheta,
             source_dq=source_dq,
+            # A `closure2` plume runs as the *less*-entraining plume with an
+            # efficiency set by its cloud-base pressure and the cold-pool
+            # fraction, not by the `bsort_enteff(2)` constant. On BOMEX and
+            # RICO `closure2` never fires, so both of these reduce to the
+            # constants the port used before and those cases are untouched.
+            entrainment_efficiency=entrainment_efficiency(
+                base_pressure=jnp.sum(
+                    jnp.where(levels == base, p, 0.0), axis=0),
+                cold_pool_fraction=diagnostics.get("cold_pool_fraction", 0.0),
+                second_closure=second_closure),
+            iplume=jnp.where(second_closure, 1, 2),
             max_plumes=1)
 
         dth_mc = safe_divide(column.heat, layer_mass) * _MODELE_THETA_SCALE
@@ -596,7 +609,7 @@ class GissConvection(PhysicsTerm):
         pressure_full = diagnostics.get("pressure_full")
         if pressure_full is None:
             sentinel = jnp.full(nodal_shape, nlev, dtype=int)
-            return sentinel, jnp.zeros(nodal_shape), sentinel, None
+            return sentinel, jnp.zeros(nodal_shape), sentinel, None, False
 
         # Surface-first profiles (JCM state is top-first); humidity g/kg -> kg/kg.
         p_sf = jnp.flip(pressure_full, axis=0)
@@ -608,7 +621,7 @@ class GissConvection(PhysicsTerm):
         thickness = diagnostics.get("layer_thickness")
         density = diagnostics.get("air_density")
         if thickness is None or density is None:
-            return cloud_base, jnp.zeros(nodal_shape), cloud_base, None
+            return cloud_base, jnp.zeros(nodal_shape), cloud_base, None, False
 
         air_mass = jnp.flip(density, axis=0) * jnp.flip(thickness, axis=0)
         blt, dtheta, dq = self._source_parcel_inputs(
@@ -686,7 +699,7 @@ class GissConvection(PhysicsTerm):
             _, fmp2 = cloud_base_closure_mass_flux(
                 t_sf, q_sf, p_sf, air_mass, closure_base,
                 boundary_layer_top=blt, source_dtheta=dtheta, source_dq=dq)
-        return cloud_base, fmp2, closure_base, blt
+        return cloud_base, fmp2, closure_base, blt, second_closure
 
     def _plume_seed(self, diagnostics, theta_env, q_sf, air_mass, nlev):
         """Source parcel and updraft seed for the plume ascent.

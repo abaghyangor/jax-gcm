@@ -55,6 +55,72 @@ from jcm.physics.convection.giss_thermodynamics import (
 # `lessent_scheme = 2`, so its 0.1 counterpart is not needed here.
 _ENTRAINMENT_EFFICIENCY = 0.67
 
+# `bsort_enteff(1)`, the *less*-entraining plume's efficiency. A `closure2`
+# plume is run as plume 1 (`iplume_pass = 1`, MSTCNV.F90:1719), so this is the
+# value its pressure ramp interpolates from.
+_ENTRAINMENT_EFFICIENCY_1 = 0.1
+
+# The `closure2` entrainment-efficiency ramp (`MSTCNV.F90:1720-1727`). The
+# pressure terms are in hPa in ModelE; the port works in Pa.
+_ENTEFF_RAMP_PRESSURE = 900.0e2
+_ENTEFF_RAMP_WIDTH = 200.0e2
+_ENTEFF_RAMP_FLOOR = 0.5
+_ENTEFF_COLD_POOL = 0.1
+_ENTEFF_COLD_POOL_GAIN = 6.75
+
+
+def entrainment_efficiency(base_pressure: jnp.ndarray = None,
+                           cold_pool_fraction: jnp.ndarray = 0.0,
+                           second_closure: jnp.ndarray = False
+                           ) -> jnp.ndarray:
+    """``enteff``, the entrainment efficiency, per plume.
+
+    ``MSTCNV.F90:1718-1736``::
+
+        if(closure2) then
+          wtent  = min(1, max(0, (900 - pl(lmin))/200))
+          enteff = wtent*bsort_enteff(1) + (1-wtent)*0.5
+          wtent  = fcp*(1-fcp)*(1-fcp)*6.75
+          enteff = wtent*0.1 + (1-wtent)*enteff
+        else
+          enteff = bsort_enteff(iplume)
+        endif
+
+    The ``else`` branch is a constant, and it is the only branch BOMEX and RICO
+    ever take -- ``closure2`` fires on **none** of their plumes, so ``enteff``
+    is 0.67 on all 1608 and 1350 of their plume levels respectively. That is why
+    a hardcoded constant was correct for this port until a deep case appeared.
+
+    On TWP-ICE ``closure2`` fires on 20% of plumes and the efficiency falls to a
+    median of 0.2635, bottoming at 0.1. It divides into ``bdzsum``, so running
+    those plumes at 0.67 left ``bdzsum`` a quarter of its value, pinned the
+    entrainment rate at its 0.004 cap, and stripped 68-96% of the plume mass per
+    level instead of ModelE's 7-16%.
+
+    Args:
+        base_pressure: ``pl(lmin)`` [Pa], the cloud-base pressure. Required for
+            the ``closure2`` branch; without it the constant is returned.
+        cold_pool_fraction: ``fcp``. Zero without a cold-pool scheme, which is
+            the right answer for 85% of TWP-ICE's ``closure2`` plumes and wrong
+            for the remaining 15%, where it reaches 0.93.
+        second_closure: whether this plume is rooted at the second displacement
+            top.
+
+    Returns:
+        ``enteff`` [-].
+    """
+    constant = jnp.asarray(_ENTRAINMENT_EFFICIENCY)
+    if base_pressure is None:
+        return constant
+    ramp = jnp.clip(
+        (_ENTEFF_RAMP_PRESSURE - base_pressure) / _ENTEFF_RAMP_WIDTH, 0.0, 1.0)
+    ramped = (ramp * _ENTRAINMENT_EFFICIENCY_1
+              + (1.0 - ramp) * _ENTEFF_RAMP_FLOOR)
+    fcp = jnp.asarray(cold_pool_fraction)
+    weight = fcp * (1.0 - fcp) * (1.0 - fcp) * _ENTEFF_COLD_POOL_GAIN
+    ramped = weight * _ENTEFF_COLD_POOL + (1.0 - weight) * ramped
+    return jnp.where(second_closure, ramped, constant)
+
 # `wbases(2) = max(0.5, wturb)` (MSTCNV.F90:2838). Measured at exactly 0.5 in
 # all 52 BOMEX plumes, where `max(wturb)` peaks at 0.372.
 _CLOUD_BASE_VELOCITY = 0.5
@@ -309,6 +375,7 @@ def run_plume(cloud_base: jnp.ndarray,
               environment_condensate: jnp.ndarray = None,
               cloud_base_velocity: jnp.ndarray = _CLOUD_BASE_VELOCITY,
               entrainment_efficiency: jnp.ndarray = _ENTRAINMENT_EFFICIENCY,
+              iplume: jnp.ndarray = 2,
               source_dtheta: jnp.ndarray = 0.0,
               source_dq: jnp.ndarray = 0.0,
               phase: str = "water") -> PlumeCycle:
@@ -406,6 +473,7 @@ def run_plume(cloud_base: jnp.ndarray,
         exner=exner,
         pressure=pressure,
         entrainment_efficiency=entrainment_efficiency,
+        iplume=iplume,
         cloud_base_velocity=cloud_base_velocity,
         phase=phase)
 
@@ -696,6 +764,7 @@ def convective_column(potential_temperature: jnp.ndarray,
                       cloud_base_velocity: jnp.ndarray = _CLOUD_BASE_VELOCITY,
                       entrainment_efficiency: jnp.ndarray = (
                           _ENTRAINMENT_EFFICIENCY),
+                      iplume: jnp.ndarray = 2,
                       source_dtheta: jnp.ndarray = 0.0,
                       source_dq: jnp.ndarray = 0.0,
                       max_plumes: int = None,
@@ -793,6 +862,7 @@ def convective_column(potential_temperature: jnp.ndarray,
             environment_condensate=environment_condensate,
             cloud_base_velocity=cloud_base_velocity,
             entrainment_efficiency=entrainment_efficiency,
+            iplume=iplume,
             source_dtheta=source_dtheta,
             source_dq=source_dq,
             phase=phase)
