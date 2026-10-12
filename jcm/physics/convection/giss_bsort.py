@@ -575,6 +575,16 @@ class PlumeAscent(NamedTuple):
     blend_theta_raw: jnp.ndarray     # smix before evaporation
     blend_humidity_raw: jnp.ndarray  # qmix before evaporation
     blend_evaporated: jnp.ndarray    # dqevp
+    # The two running integrals the entrainment closure divides. Exposed so
+    # `ent = min(.95, sqrt(kew/(bdzsum*mplume)) - 1)/delz` can be compared term
+    # by term against `mass_budget.txt`, which dumps ModelE's own `kew` and
+    # `bdzsum`. The rate alone says the port over-entrains -- 1.7x to 4.3x on
+    # the TWP-ICE periods where the plume collapses -- without saying which
+    # side of the ratio is responsible, and the two have different causes:
+    # `kew` is the buoyancy work, so it indicts the blend thermodynamics, while
+    # `bdzsum` is geometric.
+    entrainment_kew: jnp.ndarray
+    entrainment_bdzsum: jnp.ndarray
     active: jnp.ndarray              # bool: this level was processed
 
 
@@ -863,6 +873,8 @@ def plume_ascent(cloud_base: jnp.ndarray,
                    keep(sorted_blends.blend_theta_raw),
                    keep(sorted_blends.blend_humidity_raw),
                    keep(sorted_blends.blend_evaporated),
+                   keep(kew_here),
+                   keep(bdzsum_here),
                    survives)
         return carry, outputs
 
