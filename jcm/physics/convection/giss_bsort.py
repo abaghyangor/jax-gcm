@@ -333,6 +333,12 @@ class SortedBlends(NamedTuple):
     # outputs (the mass budget is satisfied for any split), and the sorting
     # cannot be compared against ModelE's per-blend `blend_diag.txt` record.
     blend_mass_total: jnp.ndarray
+    # `frem = updairm/mplume` (`MSTCNV.F90:3774`), the share of the plume taken
+    # out to build the blends before the fates decide what comes back. ModelE
+    # dumps it per level, so exporting it makes the removal directly
+    # comparable; `blend_mass_total` cannot stand in for it because that also
+    # carries the entrained environment air.
+    removed_fraction: jnp.ndarray
 
 
 def sort_blends(plume_mass: jnp.ndarray,
@@ -465,6 +471,7 @@ def sort_blends(plume_mass: jnp.ndarray,
         downdraft_condensate=_gather(to_downdraft, blend_condensate),
         mixture_buoyancy=mixture_buoyancy,
         blend_mass_total=jnp.sum(blend_mass, axis=0),
+        removed_fraction=removed_fraction,
         blend_mass=blend_mass,
         blend_condensate_after_evaporation=test_condensate,
         blend_theta_raw=blend_t,
@@ -585,6 +592,7 @@ class PlumeAscent(NamedTuple):
     # `bdzsum` is geometric.
     entrainment_kew: jnp.ndarray
     entrainment_bdzsum: jnp.ndarray
+    removed_fraction: jnp.ndarray    # frem
     active: jnp.ndarray              # bool: this level was processed
 
 
@@ -875,6 +883,7 @@ def plume_ascent(cloud_base: jnp.ndarray,
                    keep(sorted_blends.blend_evaporated),
                    keep(kew_here),
                    keep(bdzsum_here),
+                   keep(sorted_blends.removed_fraction),
                    survives)
         return carry, outputs
 
