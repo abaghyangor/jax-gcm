@@ -604,7 +604,8 @@ def displacement_top(layer_mass: jnp.ndarray,
                      highest_base: jnp.ndarray,
                      cold_pool_mass: jnp.ndarray = 0.0,
                      melting_pressure: jnp.ndarray = None,
-                     cloud_top_pressure: jnp.ndarray = None) -> jnp.ndarray:
+                     cloud_top_pressure: jnp.ndarray = None,
+                     return_second_closure: bool = False):
     """``lmax_disp``: the highest cloud base a boundary-layer parcel reaches.
 
     ModelE displaces a boundary-layer parcel upward by
@@ -653,6 +654,7 @@ def displacement_top(layer_mass: jnp.ndarray,
         _DISPLACEMENT_FRACTION * GRAV
         * jnp.maximum(boundary_layer_mass, cold_pool_mass),
         _DISPLACEMENT_MAX)
+    first = displacement
     displacement = jnp.maximum(
         displacement,
         second_displacement(melting_pressure, cloud_top_pressure))
@@ -662,10 +664,22 @@ def displacement_top(layer_mass: jnp.ndarray,
     # ModelE tests `pl(dcl) - pl(lmax_disp+1)`, the pressure at the top edge of
     # the candidate layer.
     above = jnp.concatenate([pressure[1:], pressure[-1:]], axis=0)
-    clears = ((base_pressure - above) > displacement) & \
-             (level >= boundary_layer_top) & (level <= highest_base)
-    return jnp.where(jnp.any(clears, axis=0), jnp.argmax(clears, axis=0),
-                     highest_base + 1)
+    def walk(dp):
+        clears = ((base_pressure - above) > dp) & \
+                 (level >= boundary_layer_top) & (level <= highest_base)
+        return jnp.where(jnp.any(clears, axis=0), jnp.argmax(clears, axis=0),
+                         highest_base + 1)
+
+    top = walk(displacement)
+    if not return_second_closure:
+        return top
+    # ModelE's `closure2 = lmin .eq. lmax_disp2 .and. lmax_disp2 .gt.
+    # lmax_disp1` (`MSTCNV.F90:1491`). We always convert at the higher of the
+    # two tops, so the first clause holds by construction and what remains is
+    # whether the second displacement actually moved the base. That flag is not
+    # cosmetic: it selects `tadjmc(2)` over `tadjmc(1)` for the closure's
+    # relaxation, which is a factor of two in the cloud-base mass flux.
+    return top, top > walk(first)
 
 
 def convective_column(potential_temperature: jnp.ndarray,

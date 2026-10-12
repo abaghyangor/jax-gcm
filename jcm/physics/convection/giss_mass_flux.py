@@ -59,6 +59,16 @@ _TEENY = 1.0e-20     # guards divisions at masked (zero-mass) levels
 # so a half-hour physics step applies half the neutralising mass flux.
 _TADJ_SECONDS = 3600.0
 
+# `tadjmc(2)`, the relaxation the closure uses for a **closure2** plume -- one
+# rooted at the second displacement top (`MSTCNV.F90:1494`). The preset_t
+# defaults are tadjmc = (1, 2, 1) hours (`:286-288`), and the closure applies
+# `fmp2 *= min(1, dtsrc/tadj)`, so at the 1800 s SCM timestep this is the
+# difference between keeping half the mass flux and keeping a quarter of it.
+# Running every plume at `tadjmc(1)` gave exactly twice ModelE's cloud-base
+# mass on the TWP-ICE periods where closure2 fires -- 30.502 against 15.218 on
+# period 126 -- which is where that case's plume collapse begins.
+_TADJ_CLOSURE2_SECONDS = 7200.0
+
 # `MINFRAC`, the smallest plume ModelE will accept (MSTCNV.F90:1226). It is
 # .0005 whenever `cold_pool_on` is true, which is its default.
 _MIN_PLUME_FRACTION = 5.0e-4

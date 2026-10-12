@@ -85,6 +85,8 @@ from jcm.physics.modele.params import GissConvectionParameters
 from jcm.physics.modele.physics_data import GissConvectionData
 from jcm.physics.convection.giss_cloud_base import lifting_condensation_level
 from jcm.physics.convection.giss_mass_flux import (
+    _TADJ_CLOSURE2_SECONDS,
+    _TADJ_SECONDS,
     cloud_base_closure,
     cloud_base_mass_flux_column,
 )
@@ -641,14 +643,17 @@ class GissConvection(PhysicsTerm):
         # running cloud top with a two-hour constant -- and without them the
         # second displacement is zero, which is the right answer for a column
         # whose cloud top sits below the threshold (every BOMEX step).
-        closure_base = cloud_base if blt is None else jnp.clip(
-            displacement_top(air_mass, p_sf, blt,
-                             jnp.asarray(nlev - 3, dtype=int),
-                             melting_pressure=diagnostics.get(
-                                 "melting_pressure"),
-                             cloud_top_pressure=diagnostics.get(
-                                 "convective_cloud_top_pressure")),
-            0, nlev - 3)
+        second_closure = False
+        if blt is None:
+            closure_base = cloud_base
+        else:
+            top, second_closure = displacement_top(
+                air_mass, p_sf, blt, jnp.asarray(nlev - 3, dtype=int),
+                melting_pressure=diagnostics.get("melting_pressure"),
+                cloud_top_pressure=diagnostics.get(
+                    "convective_cloud_top_pressure"),
+                return_second_closure=True)
+            closure_base = jnp.clip(top, 0, nlev - 3)
 
         if self.bsort:
             # `MASS_FLUX2` blends the source over `lmin0..lmin` rather than
@@ -665,9 +670,16 @@ class GissConvection(PhysicsTerm):
             # boosted source rather than the raw column.
             theta_src, q_src = enhanced_source(
                 theta_modele, q_sf, plk, bl_top, dtheta, dq)
+            # A closure2 plume relaxes over `tadjmc(2)` rather than
+            # `tadjmc(1)`; the two differ by a factor of two in the resulting
+            # mass flux at this timestep, so the base and its timescale have to
+            # be chosen together.
+            tadj = jnp.where(second_closure, _TADJ_CLOSURE2_SECONDS,
+                             _TADJ_SECONDS)
             _, fmp2, _ = cloud_base_closure(
                 theta_src, q_src, air_mass, plk, p_sf, lmin0, closure_base,
-                fpi, timestep=self.params.get_value().dtsrc)
+                fpi, timestep=self.params.get_value().dtsrc,
+                adjustment_time=tadj)
             has_cloud = cloud_base < nlev
             fmp2 = jnp.where(has_cloud, fmp2, 0.0)
         else:
