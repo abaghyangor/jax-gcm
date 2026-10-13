@@ -40,6 +40,7 @@ Broadcasting-native: vertical on axis 0, trailing axes horizontal.
 
 from typing import NamedTuple
 
+import jax
 import jax.numpy as jnp
 from jax import lax
 
@@ -48,7 +49,7 @@ from jcm.physics.convection import giss_downdraft as downdraft
 from jcm.physics.convection import giss_microphysics as microphysics
 from jcm.physics.convection import giss_tendencies as tendencies
 from jcm.physics.convection.giss_thermodynamics import (
-    DELTX, GRAV, RGAS, safe_divide)
+    DELTX, GRAV, RGAS, safe_divide, saturation_specific_humidity)
 
 # `bsort_enteff(2)`, the entraining plume's entrainment efficiency
 # (MSTCNV.F90:282). The less-entraining plume never fires under
@@ -425,37 +426,19 @@ def run_plume(cloud_base: jnp.ndarray,
 
     exner_base = at_base(exner)
     pressure_base = at_base(pressure)
-    seed_heat, seed_water, seed_condensate = bsort.resaturate_plume(
-        cloud_base_mass, parcel_heat, parcel_water, parcel_condensate,
-        exner_base, pressure_base, phase)
+    # The parcel condenses and rains at every level from its own `lcl` up to and
+    # including the cloud base, not only at the base. With `lcl == cloud_base`
+    # this reduces to the single arrival step the port did before, which is the
+    # shallow case; on a deep column it is nine extra levels of rain-out.
+    condensation_level = parcel_condensation_level(
+        parcel_heat, parcel_water, cloud_base_mass, exner, pressure,
+        source_bottom, cloud_base, phase)
+    seed_heat, seed_water, seed_condensate, lift_rain = sub_cloud_lift(
+        parcel_heat, parcel_water, parcel_condensate, cloud_base_mass,
+        condensation_level, cloud_base, exner, pressure, layer_mass,
+        geometry.density, geometry.temperature, cloud_base_velocity, phase)
 
-    # ModelE runs the microphysics at the cloud-base level like any other
-    # (`MSTCNV.F90:1877`), and its first call there passes `wcupass = wbases`
-    # exactly -- visible in `microphys_diag.txt` as `WCU = 0.5` on the first row
-    # of every plume. Skipping it leaves the parcel with about 0.21% too much
-    # water, which lands almost entirely in the condensate: at cloud base the
-    # condensate is only 2.4% of the total water, so the same absolute excess
-    # shows up there as nearly 9%.
     base_density = at_base(geometry.density)
-    base_temperature = at_base(geometry.temperature)
-    seed_water_content = safe_divide(seed_condensate,
-                                     cloud_base_mass) * base_density
-    # `TPSAV` is formed before this level's condensation (MSTCNV.F90:1690), so
-    # the microphysics sees the parcel's pre-condensation temperature.
-    seed_parcel_temperature = safe_divide(parcel_heat,
-                                          cloud_base_mass) * exner_base
-    base_rained = microphysics.precipitate(
-        seed_water_content, cloud_base_velocity, pressure_base,
-        seed_parcel_temperature,
-        microphysics.scaled_droplet_number(_DROPLET_NUMBER, pressure_base,
-                                           base_temperature),
-        _DROPLET_RADIUS).precipitated
-    base_rained = base_rained * microphysics.finite_ascent_fraction(
-        at_base(layer_mass))
-    base_rained_mass = jnp.minimum(
-        safe_divide(base_rained * cloud_base_mass, base_density),
-        seed_condensate)
-    seed_condensate = jnp.maximum(seed_condensate - base_rained_mass, 0.0)
 
     ascent = bsort.plume_ascent(
         cloud_base=cloud_base,
@@ -480,10 +463,11 @@ def run_plume(cloud_base: jnp.ndarray,
     nlev = layer_mass.shape[0]
     level = jnp.arange(nlev).reshape((nlev,) + (1,) * (layer_mass.ndim - 1))
 
-    # The rain the seed shed at cloud base is precipitation like any other: it
-    # has to reach the falling flux and the diagnostics, or that water simply
-    # disappears from the column.
-    base_rain = jnp.where(level == cloud_base, base_rained_mass, 0.0)
+    # The rain the parcel shed on its way to cloud base is precipitation like
+    # any other: it has to reach the falling flux and the diagnostics, or that
+    # water simply disappears from the column. On a deep column most of it falls
+    # from levels below the base, so this is a profile rather than one level.
+    base_rain = lift_rain
 
     # `detrain_cloud_mode_only` (MSTCNV.F90:2096-2121, on by default): detrained
     # condensate represents the cloud mode alone, so it is capped at
@@ -748,6 +732,134 @@ def displacement_top(layer_mass: jnp.ndarray,
     # cosmetic: it selects `tadjmc(2)` over `tadjmc(1)` for the closure's
     # relaxation, which is a factor of two in the cloud-base mass flux.
     return top, top > walk(first)
+
+
+def parcel_condensation_level(parcel_heat: jnp.ndarray,
+                              parcel_water: jnp.ndarray,
+                              parcel_mass: jnp.ndarray,
+                              exner: jnp.ndarray,
+                              pressure: jnp.ndarray,
+                              source_bottom: jnp.ndarray,
+                              cloud_base: jnp.ndarray,
+                              phase: str = "water") -> jnp.ndarray:
+    """``lcl``: where the lifted source parcel first saturates.
+
+    ``MSTCNV.F90:1678-1686``::
+
+        if(lmin0 .eq. lmin) then
+          lcl = lmin+1
+        else
+          do lcl = lmin0+1,lmin+1
+            if(qparcel .gt. qsat(sparcel*plk(lcl),lhe,pres(lcl))) exit
+          enddo
+          lcl = min(lcl, lmin+1)
+        endif
+
+    The parcel is lifted with its source ``s`` and ``q`` unchanged until it
+    reaches this level; the ascent loop then runs from here, not from the cloud
+    base. Returning ``cloud_base + 1`` means it never saturates below the base,
+    which switches the sub-cloud lift off.
+
+    Args:
+        parcel_heat, parcel_water: the source parcel's extensive heat and
+            vapour, before any condensation.
+        parcel_mass: the plume mass, constant through the sub-cloud lift.
+        exner: ``plk``, ModelE's ``(p in mb)**kappa``.
+        pressure: [Pa].
+        source_bottom: ``lmin0``, the bottom of the source block. ModelE
+            searches ``lmin0+1 .. lmin+1``, so this is the level *below* the
+            first candidate -- not ``lmin``, which is the other end.
+        cloud_base: ``lmin``.
+
+    Returns:
+        The level index, ``cloud_base + 1`` where the parcel never saturates.
+    """
+    nlev = pressure.shape[0]
+    level = jnp.arange(nlev).reshape((nlev,) + (1,) * (pressure.ndim - 1))
+    s_parcel = safe_divide(parcel_heat, parcel_mass)
+    q_parcel = safe_divide(parcel_water, parcel_mass)
+    q_saturation = saturation_specific_humidity(
+        s_parcel * exner, pressure, phase)
+    searched = (level > source_bottom) & (level <= cloud_base)
+    saturated = searched & (q_parcel > q_saturation)
+    return jnp.where(jnp.any(saturated, axis=0),
+                     jnp.argmax(saturated, axis=0), cloud_base + 1)
+
+
+def sub_cloud_lift(parcel_heat: jnp.ndarray,
+                   parcel_water: jnp.ndarray,
+                   parcel_condensate: jnp.ndarray,
+                   parcel_mass: jnp.ndarray,
+                   condensation_level: jnp.ndarray,
+                   cloud_base: jnp.ndarray,
+                   exner: jnp.ndarray,
+                   pressure: jnp.ndarray,
+                   layer_mass: jnp.ndarray,
+                   density: jnp.ndarray,
+                   temperature: jnp.ndarray,
+                   cloud_base_velocity: jnp.ndarray,
+                   phase: str = "water"):
+    """ModelE's **first stage**: condense and rain the parcel on the way up.
+
+    ``first_stage = l .le. lmin`` (``MSTCNV.F90:1769``) guards the entrainment,
+    detrainment and buoyancy sorting out of the ascent at and below the cloud
+    base, so between ``lcl`` and ``lmin`` the parcel only condenses and runs the
+    microphysics, at **fixed mass** -- which is what ``microphys_diag.txt``
+    shows, ``mplume`` constant across every sub-base row. The updraft speed
+    there is ``wbases(iplume)`` at every level (``:1692``), not an evolving one.
+
+    The port used to do this once, at the cloud base. On a deep column ModelE
+    does it at nine levels below the base, raining out 0.002089 kg/kg of the
+    parcel's water on the way up and arriving with 0.001373 of condensate
+    against the port's 0.003408. Since the vapour is pinned at ``qsat`` either
+    way, everything not rained out stays suspended, and the condensate loads the
+    buoyancy directly -- halving the first ``kew`` increment and costing about
+    10% of the plume mass up the column.
+
+    Invisible on BOMEX, where the source sits directly under a shallow base and
+    there are few or no intervening levels to rain through.
+
+    Returns:
+        ``(heat, water, condensate, rained)`` -- the parcel entering the cloud
+        base, and the mass rained out at each level on the way.
+    """
+    nlev = pressure.shape[0]
+
+    def one_level(carry, level_inputs):
+        heat, water, condensate = carry
+        index, exner_l, pressure_l, layer_mass_l, density_l, temperature_l = (
+            level_inputs)
+        active = (index >= condensation_level) & (index <= cloud_base)
+        new_heat, new_water, new_condensate = bsort.resaturate_plume(
+            parcel_mass, heat, water, condensate, exner_l, pressure_l, phase)
+        # The microphysics sees the parcel's *pre-condensation* temperature,
+        # as `TPSAV` is formed before this level's condensation (`:1690`).
+        parcel_temperature = safe_divide(heat, parcel_mass) * exner_l
+        water_content = safe_divide(new_condensate, parcel_mass) * density_l
+        rained = microphysics.precipitate(
+            water_content, cloud_base_velocity, pressure_l,
+            parcel_temperature,
+            microphysics.scaled_droplet_number(_DROPLET_NUMBER, pressure_l,
+                                               temperature_l),
+            _DROPLET_RADIUS).precipitated
+        rained = rained * microphysics.finite_ascent_fraction(layer_mass_l)
+        rained_mass = jnp.minimum(
+            safe_divide(rained * parcel_mass, density_l), new_condensate)
+        new_condensate = jnp.maximum(new_condensate - rained_mass, 0.0)
+        keep = lambda old, new: jnp.where(active, new, old)
+        return (keep(heat, new_heat), keep(water, new_water),
+                keep(condensate, new_condensate)), jnp.where(
+                    active, rained_mass, 0.0)
+
+    level = jnp.arange(nlev).reshape((nlev,) + (1,) * (pressure.ndim - 1))
+    carry, rained = jax.lax.scan(
+        one_level, (parcel_heat, parcel_water, parcel_condensate),
+        (level, exner, pressure, layer_mass, density, temperature))
+    # The rain shed on the way up is precipitation like any other and has to
+    # reach the falling flux, or the water disappears from the column. It is
+    # returned per level because it falls from where it formed, which on a deep
+    # column is well below the cloud base.
+    return carry + (rained,)
 
 
 def convective_column(potential_temperature: jnp.ndarray,
