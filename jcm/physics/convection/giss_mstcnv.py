@@ -74,6 +74,7 @@ from __future__ import annotations
 
 from typing import ClassVar
 
+import jax
 import jax.numpy as jnp
 from flax import nnx
 
@@ -117,6 +118,25 @@ _P_REF = 100000.0
 # so that `th*plk` is the temperature. This converts its potential temperature
 # back to the conventional one the rest of jcm uses.
 _MODELE_THETA_SCALE = 1000.0 ** KAPA
+
+# How many candidate cloud bases the sweep evaluates, counting down from the
+# displacement top. Static, because it is a trace length.
+#
+# **Held at 1 deliberately.** ModelE converts at a median of two bases per
+# TWP-ICE step and the port at one, which costs about 15% of the peak heating
+# there (section 89). The machinery to sweep wider is in place and the plumes
+# now sum rather than compound, as ModelE's do. What is not ready is the
+# closure: run at every candidate it converts at bases ModelE vetoes, and on
+# period 126 -- where ModelE converts at exactly one base -- a 24-wide sweep
+# overshoots the peak heating by 3.35x.
+#
+# That is not a wiring fault. The four closure vetoes were only ever exercised
+# at the one base the displacement selected, and DYCOMS tested only that a
+# column can decline altogether. Whether they reproduce ModelE's accept/reject
+# decision *per base* is unmeasured, and `sweep_diag.txt` already records that
+# decision for every candidate of every step. Widening this before that
+# comparison would trade a known 15% deficit for an unknown overshoot.
+_MAX_PLUME_CANDIDATES = 1
 
 # ModelE's `tfmc`, the parcel temperature below which condensate forms as ice
 # (`tf - 15d0` in the preset this port targets, MSTCNV.F90:301). Recorded, not
@@ -362,13 +382,13 @@ class GissConvection(PhysicsTerm):
         nlev = shape[0]
         nodal_shape = shape[1:]
 
-        (cloud_base, fmp2, closure_base, boundary_layer_top,
-         second_closure) = self._diagnose(state, diagnostics, nlev, nodal_shape)
+        (cloud_base, fmp2, closure_base, boundary_layer_top, second_closure,
+         base_profile) = self._diagnose(state, diagnostics, nlev, nodal_shape)
 
         if self.allow_mc and self.bsort:
             dtemp_dt, dq_dt, dth_mc, dq_mc = self._bsort_tendencies(
                 state, diagnostics, closure_base, fmp2, boundary_layer_top,
-                nlev, nodal_shape, dtsrc, second_closure)
+                nlev, nodal_shape, dtsrc, second_closure, base_profile)
         elif self.allow_mc:
             dtemp_dt, dq_dt, dth_mc, dq_mc = self._convective_tendencies(
                 state, diagnostics, cloud_base, fmp2, nlev, nodal_shape, dtsrc)
@@ -389,7 +409,7 @@ class GissConvection(PhysicsTerm):
 
     def _bsort_tendencies(self, state, diagnostics, closure_base, fmp2,
                           boundary_layer_top, nlev, nodal_shape, dtsrc,
-                          second_closure=False):  # noqa: D401
+                          second_closure=False, base_profile=None):  # noqa: D401
         """Convective tendencies from the buoyancy-sorting port.
 
         Hands the column to
@@ -443,7 +463,12 @@ class GissConvection(PhysicsTerm):
 
         levels = jnp.arange(nlev).reshape((nlev,) + (1,) * len(nodal_shape))
         base = jnp.clip(closure_base, 1, nlev - 3)
-        cloud_base_mass = jnp.where(levels == base, fmp2, 0.0)
+        # The sweep's cloud-base masses: the closure run at every candidate
+        # from the displacement top down, not only at the one base the port
+        # used to model. Falls back to the single base where the profile is not
+        # available (the scaffold paths).
+        cloud_base_mass = (jnp.where(levels == base, fmp2, 0.0)
+                           if base_profile is None else base_profile)
         # `dcl` comes from the turbulence scheme in ModelE (`smixlev`); with no
         # such diagnostic the layer below the plume's root is the best stand-in,
         # and it is what bounds both the source draw and the downdraft.
@@ -495,7 +520,7 @@ class GissConvection(PhysicsTerm):
                 cold_pool_fraction=diagnostics.get("cold_pool_fraction", 0.0),
                 second_closure=second_closure),
             iplume=jnp.where(second_closure, 1, 2),
-            max_plumes=1)
+            max_plumes=_MAX_PLUME_CANDIDATES)
 
         dth_mc = safe_divide(column.heat, layer_mass) * _MODELE_THETA_SCALE
         dq_mc = safe_divide(column.water, layer_mass)
@@ -609,7 +634,8 @@ class GissConvection(PhysicsTerm):
         pressure_full = diagnostics.get("pressure_full")
         if pressure_full is None:
             sentinel = jnp.full(nodal_shape, nlev, dtype=int)
-            return sentinel, jnp.zeros(nodal_shape), sentinel, None, False
+            return (sentinel, jnp.zeros(nodal_shape), sentinel, None,
+                    False, None)
 
         # Surface-first profiles (JCM state is top-first); humidity g/kg -> kg/kg.
         p_sf = jnp.flip(pressure_full, axis=0)
@@ -621,7 +647,8 @@ class GissConvection(PhysicsTerm):
         thickness = diagnostics.get("layer_thickness")
         density = diagnostics.get("air_density")
         if thickness is None or density is None:
-            return cloud_base, jnp.zeros(nodal_shape), cloud_base, None, False
+            return (cloud_base, jnp.zeros(nodal_shape), cloud_base, None,
+                    False, None)
 
         air_mass = jnp.flip(density, axis=0) * jnp.flip(thickness, axis=0)
         blt, dtheta, dq = self._source_parcel_inputs(
@@ -695,11 +722,69 @@ class GissConvection(PhysicsTerm):
                 adjustment_time=tadj)
             has_cloud = cloud_base < nlev
             fmp2 = jnp.where(has_cloud, fmp2, 0.0)
+
+            # ModelE's sweep does not stop at its first success: a base that
+            # yields nothing is skipped (`cycle cloud_base`) and the descent
+            # continues, so several bases can convert in one timestep -- a
+            # median of 2 on TWP-ICE against 1.08 on BOMEX. Where ModelE
+            # converts at one base the port already matches peak heating to
+            # 1.003; where it converts at two the port's own plume is right and
+            # the heating is low by 15% because the second plume is missing.
+            #
+            # So the closure runs at every candidate from `closure_base` down to
+            # the boundary-layer top, and the result is a *profile* of
+            # cloud-base masses rather than one value. Only the base ModelE
+            # reached through the second displacement carries `tadjmc(2)`; the
+            # rest relax over `tadjmc(1)`.
+            boundary_layer_floor = (jnp.asarray(0) if blt is None
+                                    else jnp.asarray(blt))
+
+            def candidate_mass(_, offset):
+                candidate = closure_base - offset
+                inside = (candidate > boundary_layer_floor) & (candidate
+                                                               <= closure_base)
+                # A candidate outside the sweep is still *evaluated* -- the trip
+                # count is static and `jnp.where` takes both branches -- so it
+                # has to be evaluated somewhere valid. Sending it to
+                # `closure_base` keeps the geometry well formed; the result is
+                # masked out below. Pointing it at a degenerate base instead
+                # leaves NaNs that are invisible in the forward value and fatal
+                # to the gradient.
+                safe = jnp.where(inside, jnp.clip(candidate, 1, nlev - 3),
+                                 closure_base)
+                low = source_bottom(p_sf, safe)
+                top = safe - 1 if blt is None else jnp.minimum(blt, safe - 1)
+                weights = source_weights(air_mass, low, safe, top)
+                src_theta, src_q = enhanced_source(
+                    theta_modele, q_sf, plk, top, dtheta, dq)
+                this_tadj = jnp.where(
+                    (safe == closure_base) & second_closure,
+                    _TADJ_CLOSURE2_SECONDS, _TADJ_SECONDS)
+                _, mass, _ = cloud_base_closure(
+                    src_theta, src_q, air_mass, plk, p_sf, low, safe, weights,
+                    timestep=self.params.get_value().dtsrc,
+                    adjustment_time=this_tadj)
+                return None, jnp.where(inside & has_cloud, mass, 0.0)
+
+            _, candidate_masses = jax.lax.scan(
+                candidate_mass, None, jnp.arange(_MAX_PLUME_CANDIDATES))
+            # Back onto the column: candidate `offset` sat at
+            # `closure_base - offset`.
+            # Back onto the column: candidate `offset` sat at
+            # `closure_base - offset`. The trip count is static, so this is a
+            # Python loop over a traced scatter rather than a traced loop.
+            base_level = jnp.arange(nlev).reshape(
+                (nlev,) + (1,) * len(nodal_shape))
+            base_profile = sum(
+                jnp.where(base_level == closure_base - offset,
+                          candidate_masses[offset], 0.0)
+                for offset in range(_MAX_PLUME_CANDIDATES))
         else:
             _, fmp2 = cloud_base_closure_mass_flux(
                 t_sf, q_sf, p_sf, air_mass, closure_base,
                 boundary_layer_top=blt, source_dtheta=dtheta, source_dq=dq)
-        return cloud_base, fmp2, closure_base, blt, second_closure
+        return (cloud_base, fmp2, closure_base, blt, second_closure,
+                base_profile)
 
     def _plume_seed(self, diagnostics, theta_env, q_sf, air_mass, nlev):
         """Source parcel and updraft seed for the plume ascent.

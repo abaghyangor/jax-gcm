@@ -942,15 +942,22 @@ def convective_column(potential_temperature: jnp.ndarray,
     environment_condensate = environment_condensate.astype(dtype)
 
     def one_candidate(carry, offset):
-        theta, q, mass_flux, precipitation, count, top = carry
-        base = highest_base - offset
+        dtheta, dq, mass_flux, precipitation, count, top = carry
+        candidate = highest_base - offset
         plume_mass = jnp.sum(
-            jnp.where(level == base, cloud_base_mass, 0.0), axis=0)
+            jnp.where(level == candidate, cloud_base_mass, 0.0), axis=0)
         # A candidate outside the sweep, or one the closure gave no mass, does
         # nothing. The scan still runs it -- the trip count has to be static --
         # so its result is masked out rather than skipped.
-        convects = ((base >= boundary_layer_top) & (base <= highest_base)
-                    & (plume_mass > 0.0))
+        convects = ((candidate >= boundary_layer_top)
+                    & (candidate <= highest_base) & (plume_mass > 0.0))
+        # The base index itself must stay on the column. With a wide sweep the
+        # low candidates run off the bottom, and a negative base silently
+        # selects nothing -- every `at_base` gather returns zero, and the
+        # divisions that follow produce NaNs that survive the mask in reverse
+        # mode. Non-convecting candidates are evaluated at `highest_base`
+        # instead and discarded.
+        base = jnp.where(convects, candidate, highest_base)
         # A candidate that does not convect is still traced, so it must be
         # given a well-posed plume rather than a zero-mass one: a zero-mass
         # parcel has no temperature, the saturation adjustment divides by it,
@@ -964,8 +971,8 @@ def convective_column(potential_temperature: jnp.ndarray,
             source_top=base,
             boundary_layer_top=boundary_layer_top,
             cloud_base_mass=plume_mass,
-            potential_temperature=theta,
-            specific_humidity=q,
+            potential_temperature=potential_temperature,
+            specific_humidity=specific_humidity,
             layer_mass=layer_mass,
             exner=exner,
             pressure=pressure,
@@ -982,11 +989,21 @@ def convective_column(potential_temperature: jnp.ndarray,
         def keep(value):
             return jnp.where(convects, value, 0.0)
 
-        # `ma` is unchanged by construction, so the intensive update is just the
-        # extensive tendency divided by it.
-        theta = theta + keep(safe_divide(cycle.tendency.heat, layer_mass))
-        q = q + keep(safe_divide(cycle.tendency.water, layer_mass))
-        return (theta, q,
+        # Every plume of one sweep reads the **same**, unmodified environment.
+        # ModelE's ascent takes it straight from the state --
+        # `SUP = SM(L)*BYMA(L)` (MSTCNV.F90:1782), with no `dsm` term -- and
+        # accumulates the tendencies in `dsm`/`dqm`/`dmr`/`dm`, which are
+        # applied once after the sweep closes (`:5199-5206`). So the plumes do
+        # not see each other within a timestep.
+        #
+        # This scan used to add each plume's tendency into the carried `theta`
+        # and `q`, which coupled them more tightly than ModelE does. That was
+        # invisible while `max_plumes` was 1 -- the body runs once and the
+        # carry is never read again -- and would have become a silent divergence
+        # the moment the sweep was widened.
+        dtheta = dtheta + keep(safe_divide(cycle.tendency.heat, layer_mass))
+        dq = dq + keep(safe_divide(cycle.tendency.water, layer_mass))
+        return (dtheta, dq,
                 mass_flux + keep(cycle.tendency.interface_flux),
                 precipitation + keep(cycle.ascent.precipitation),
                 count + convects.astype(count.dtype),
@@ -994,17 +1011,19 @@ def convective_column(potential_temperature: jnp.ndarray,
 
     zeros = jnp.zeros_like(layer_mass)
     scalar = jnp.zeros(horiz)
-    (theta, q, mass_flux, precipitation, count, top), _ = lax.scan(
+    (dtheta, dq, mass_flux, precipitation, count, top), _ = lax.scan(
         one_candidate,
-        (potential_temperature, specific_humidity, zeros, zeros,
+        # The carry starts at zero because it now accumulates *tendencies*,
+        # not an evolving environment.
+        (zeros, zeros, zeros, zeros,
          scalar, jnp.zeros(horiz, dtype=level.dtype)),
         jnp.arange(max_plumes))
 
     return ColumnConvection(
-        potential_temperature=theta,
-        specific_humidity=q,
-        heat=(theta - potential_temperature) * layer_mass,
-        water=(q - specific_humidity) * layer_mass,
+        potential_temperature=potential_temperature + dtheta,
+        specific_humidity=specific_humidity + dq,
+        heat=dtheta * layer_mass,
+        water=dq * layer_mass,
         mass_flux=mass_flux,
         precipitation=precipitation,
         plume_count=count,
