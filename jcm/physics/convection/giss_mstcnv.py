@@ -126,19 +126,26 @@ _MODELE_THETA_SCALE = 1000.0 ** KAPA
 # TWP-ICE step and the port at one, which costs about 15% of the peak heating
 # there (section 89). The machinery to sweep wider is in place and the plumes
 # now sum rather than compound, as ModelE's do. What is not ready is the
-# closure: it is too permissive per base. On step 127, where ModelE converts at
-# base 15 alone, the port converts at 11, 12, 13, 14 and 15 -- reproduced both
-# through this term and through a standalone construction -- and the column
-# overshoots its peak heating by 3.35x.
+# closure: it is too permissive per base, and one missing rule has been found
+# and ported without fixing that.
 #
-# `sweep_diag.txt` records ModelE's accept/reject decision for all 34557
-# candidates, but turning that into an agreement rate has gone wrong three
-# times: sampling every tenth period, then two narrower restrictions, each
-# excluded the wide-span steps where the disagreement lives, and each reported
-# 94-100% agreement for a closure that is visibly wrong on step 127. The rate
-# is not the measurement to trust here; the per-step profiles are. Reopening
-# this needs a population built from the steps that actually have several
-# candidates between `dcl` and the displacement top.
+# `if(lmin.gt.lmax_disp1 .and. lmin.lt.lmax_disp2) cycle` (MSTCNV.F90:1489)
+# skips every base strictly between the two displacement tops -- ModelE's
+# candidate list for step 127 jumps straight from 2 to 15 -- and is implemented
+# below. It is right, and it is not enough. Opened to 24 candidates the port
+# still finds **2.00 bases per step on BOMEX against ModelE's 1.08**, matching
+# the base set on 4 steps of 48, and BOMEX's peak heating goes 1.010 to 1.392.
+#
+# TWP-ICE looked far better -- 86% of base sets identical -- but only because
+# its gap covers most of the span and leaves few candidates to get wrong. BOMEX,
+# where the two tops coincide and the gap is empty, is what exposes the
+# closure itself. Any future measurement of this has to include BOMEX for that
+# reason.
+#
+# What is still unported is the other branch of `:2687`: above `lmax_disp`
+# ModelE collapses the source to a single layer and applies a
+# TKE-against-stratification test, while the port uses the full boundary-layer
+# source at every candidate.
 _MAX_PLUME_CANDIDATES = 1
 
 # ModelE's `tfmc`, the parcel temperature below which condensate forms as ice
@@ -689,8 +696,11 @@ class GissConvection(PhysicsTerm):
         second_closure = False
         if blt is None:
             closure_base = cloud_base
+            # No displacement without a boundary-layer top, so the two tops
+            # coincide and the gap between them is empty.
+            first_top = closure_base
         else:
-            top, second_closure = displacement_top(
+            top, second_closure, first_top = displacement_top(
                 air_mass, p_sf, blt, jnp.asarray(nlev - 3, dtype=int),
                 melting_pressure=diagnostics.get("melting_pressure"),
                 cloud_top_pressure=diagnostics.get(
@@ -749,8 +759,16 @@ class GissConvection(PhysicsTerm):
                 # A strict `>` here drops the only candidate whenever the
                 # displacement top coincides with `dcl`, which silences the
                 # column entirely -- period 300 of TWP-ICE is one.
+                #
+                # And every base strictly between the two displacement tops is
+                # skipped outright: `if(lmin.gt.lmax_disp1 .and.
+                # lmin.lt.lmax_disp2) cycle` (MSTCNV.F90:1489). Without it the
+                # port converts at bases ModelE never even evaluates -- on step
+                # 127 at 11, 12, 13 and 14, where ModelE's own candidate list
+                # jumps straight from 2 to 15.
+                in_gap = (candidate > first_top) & (candidate < closure_base)
                 inside = ((candidate >= boundary_layer_floor)
-                          & (candidate <= closure_base))
+                          & (candidate <= closure_base) & ~in_gap)
                 # A candidate outside the sweep is still *evaluated* -- the trip
                 # count is static and `jnp.where` takes both branches -- so it
                 # has to be evaluated somewhere valid. Sending it to
