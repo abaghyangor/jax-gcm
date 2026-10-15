@@ -725,13 +725,20 @@ def displacement_top(layer_mass: jnp.ndarray,
     top = walk(displacement)
     if not return_second_closure:
         return top
+    first_top = walk(first)
     # ModelE's `closure2 = lmin .eq. lmax_disp2 .and. lmax_disp2 .gt.
     # lmax_disp1` (`MSTCNV.F90:1491`). We always convert at the higher of the
     # two tops, so the first clause holds by construction and what remains is
     # whether the second displacement actually moved the base. That flag is not
     # cosmetic: it selects `tadjmc(2)` over `tadjmc(1)` for the closure's
     # relaxation, which is a factor of two in the cloud-base mass flux.
-    return top, top > walk(first)
+    # `lmax_disp1` is returned alongside, because the sweep skips every base
+    # strictly between the two tops: `if(lmin.gt.lmax_disp1 .and.
+    # lmin.lt.lmax_disp2) cycle` (MSTCNV.F90:1489) -- "if closure2 occurred, no
+    # closure1 in between closure bases". That gap is not visible in
+    # `sweep_diag.txt`: the `cycle` fires before the dump, so of the case's
+    # 34557 recorded candidates **none** fall inside it.
+    return top, top > first_top, first_top
 
 
 def parcel_condensation_level(parcel_heat: jnp.ndarray,
