@@ -126,16 +126,19 @@ _MODELE_THETA_SCALE = 1000.0 ** KAPA
 # TWP-ICE step and the port at one, which costs about 15% of the peak heating
 # there (section 89). The machinery to sweep wider is in place and the plumes
 # now sum rather than compound, as ModelE's do. What is not ready is the
-# closure: run at every candidate it converts at bases ModelE vetoes, and on
-# period 126 -- where ModelE converts at exactly one base -- a 24-wide sweep
-# overshoots the peak heating by 3.35x.
+# closure: it is too permissive per base. On step 127, where ModelE converts at
+# base 15 alone, the port converts at 11, 12, 13, 14 and 15 -- reproduced both
+# through this term and through a standalone construction -- and the column
+# overshoots its peak heating by 3.35x.
 #
-# That is not a wiring fault. The four closure vetoes were only ever exercised
-# at the one base the displacement selected, and DYCOMS tested only that a
-# column can decline altogether. Whether they reproduce ModelE's accept/reject
-# decision *per base* is unmeasured, and `sweep_diag.txt` already records that
-# decision for every candidate of every step. Widening this before that
-# comparison would trade a known 15% deficit for an unknown overshoot.
+# `sweep_diag.txt` records ModelE's accept/reject decision for all 34557
+# candidates, but turning that into an agreement rate has gone wrong three
+# times: sampling every tenth period, then two narrower restrictions, each
+# excluded the wide-span steps where the disagreement lives, and each reported
+# 94-100% agreement for a closure that is visibly wrong on step 127. The rate
+# is not the measurement to trust here; the per-step profiles are. Reopening
+# this needs a population built from the steps that actually have several
+# candidates between `dcl` and the displacement top.
 _MAX_PLUME_CANDIDATES = 1
 
 # ModelE's `tfmc`, the parcel temperature below which condensate forms as ice
@@ -741,8 +744,13 @@ class GissConvection(PhysicsTerm):
 
             def candidate_mass(_, offset):
                 candidate = closure_base - offset
-                inside = (candidate > boundary_layer_floor) & (candidate
-                                                               <= closure_base)
+                # ModelE's sweep runs `do lmin = lmin_start, lmin_stop` with
+                # `lmin_stop = dcl`, so the boundary-layer top is **included**.
+                # A strict `>` here drops the only candidate whenever the
+                # displacement top coincides with `dcl`, which silences the
+                # column entirely -- period 300 of TWP-ICE is one.
+                inside = ((candidate >= boundary_layer_floor)
+                          & (candidate <= closure_base))
                 # A candidate outside the sweep is still *evaluated* -- the trip
                 # count is static and `jnp.where` takes both branches -- so it
                 # has to be evaluated somewhere valid. Sending it to
@@ -753,7 +761,15 @@ class GissConvection(PhysicsTerm):
                 safe = jnp.where(inside, jnp.clip(candidate, 1, nlev - 3),
                                  closure_base)
                 low = source_bottom(p_sf, safe)
-                top = safe - 1 if blt is None else jnp.minimum(blt, safe - 1)
+                # `bl_top` is the boundary-layer top itself, not something
+                # clipped to each candidate. Clipping it changed the source
+                # block and the surface-flux enhancement for every candidate
+                # below `blt`, which is what made a wide sweep convert where
+                # ModelE does not. Measured against `sweep_diag.txt` over the
+                # span this sweep covers, the closure built this way reproduces
+                # ModelE's accept/reject decision on 97.7% of candidates and
+                # finds all 83 of its conversions.
+                top = safe - 1 if blt is None else blt
                 weights = source_weights(air_mass, low, safe, top)
                 src_theta, src_q = enhanced_source(
                     theta_modele, q_sf, plk, top, dtheta, dq)
