@@ -351,16 +351,34 @@ class ConvectiveColumnTest(unittest.TestCase):
         np.testing.assert_allclose(np.asarray(many.heat), np.asarray(few.heat),
                                    rtol=1e-12, atol=1e-10)
 
-    def test_plumes_are_coupled_through_the_environment(self):
-        # This is the whole point of the sweep: each plume ascends through what
-        # its predecessors left behind, so the sequence is not the sum of the
-        # parts. If these ever agree, the environment is not being carried.
+    def test_plumes_do_not_see_each_other_within_a_sweep(self):
+        """Two plumes in one sweep must sum, not compound.
+
+        Every plume of a ModelE sweep reads the *same* environment: the ascent
+        takes it straight from the state (`SUP = SM(L)*BYMA(L)`,
+        MSTCNV.F90:1782, with no `dsm` term) while the tendencies accumulate in
+        `dsm`/`dqm`/`dmr`/`dm` and are applied once after the sweep closes
+        (`:5199-5206`). So running two bases together must give exactly what
+        running each alone gives, added.
+
+        This test previously asserted the opposite -- that the sequence is *not*
+        the sum of its parts -- because the sweep was written to carry an
+        evolving environment between candidates. That was never exercised: the
+        term runs `max_plumes=1`, so the body ran once and the carry was never
+        read. Widening the sweep without fixing it would have diverged silently.
+        """
         _, both = self._run(bases=(4, 6))
         _, upper = self._run(bases=(6,))
         _, lower = self._run(bases=(4,))
-        independent = np.asarray(upper.heat) + np.asarray(lower.heat)
-        self.assertGreater(
-            np.abs(independent - np.asarray(both.heat)).max(), 1.0)
+        summed = np.asarray(upper.heat) + np.asarray(lower.heat)
+        together = np.asarray(both.heat)
+        scale = max(np.abs(together).max(), 1e-12)
+        self.assertLess(np.abs(summed - together).max() / scale, 1e-5)
+        # and the same for water, which is the other half of the budget
+        summed_w = np.asarray(upper.water) + np.asarray(lower.water)
+        scale_w = max(np.abs(np.asarray(both.water)).max(), 1e-12)
+        self.assertLess(
+            np.abs(summed_w - np.asarray(both.water)).max() / scale_w, 1e-5)
 
     def test_energy_closes_against_the_water_removed(self):
         # The column's dry static energy gain is the latent heat of the water
