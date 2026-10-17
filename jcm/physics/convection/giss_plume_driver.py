@@ -577,6 +577,21 @@ _MELTING_REFERENCE = 550.0e2             # the typical tropical melting level
 _MELTING_OFFSET_MAX = 100.0e2
 
 
+class CandidateSetup(NamedTuple):
+    """What ModelE settles for one candidate base before its plume runs.
+
+    `cloud_base` (MSTCNV.F90:1498-1583) decides three things per candidate, and
+    all three depend on *which* candidate it is: the mass the closure gives it,
+    and -- because only the base at the second displacement top is a `closure2`
+    plume -- that plume's entrainment efficiency and its index. A sweep that
+    settles them once from the highest base runs every lower candidate as the
+    less-entraining `closure2` plume, which it is not.
+    """
+    cloud_base_mass: jnp.ndarray         # mplume [kg/m^2]
+    entrainment_efficiency: jnp.ndarray  # enteff [-]
+    iplume: jnp.ndarray                  # 1 (less entraining) or 2
+
+
 class ColumnConvection(NamedTuple):
     """What the whole plume sequence does to one column."""
     potential_temperature: jnp.ndarray   # th after every plume
@@ -587,6 +602,7 @@ class ColumnConvection(NamedTuple):
     precipitation: jnp.ndarray           # condpr, summed over plumes [kg/m^2]
     plume_count: jnp.ndarray             # candidates that actually convected
     cloud_top: jnp.ndarray               # highest level any plume reached
+    base_mass: jnp.ndarray               # mplume per base level [kg/m^2]
 
 
 def source_bottom(pressure: jnp.ndarray,
@@ -914,14 +930,17 @@ def convective_column(potential_temperature: jnp.ndarray,
             ``highest_base``. Static, and the scan runs all of them whether or
             not they convect, so it sets the cost. Defaults to every level.
         cloud_base_closure_fn: ``(potential_temperature, specific_humidity,
-            candidate) -> mplume``, the cloud-base closure run against the
-            column *as the sweep has left it*. ModelE calls
-            ``cloud_base_closure`` from inside the base loop, after the
+            candidate) -> CandidateSetup``, run against the column *as the
+            sweep has left it*. ModelE settles the mass, the entrainment
+            efficiency and the plume index inside its base loop, after the
             previous plume's tendencies have been written back, so a candidate
-            is tested against air the plumes above it have already dried. Pass
-            this to reproduce that; without it every candidate is tested
-            against the incoming column via ``cloud_base_mass``, which makes
-            the lower candidates look far more unstable than they are.
+            is tested against air the plumes above it have already dried and
+            only the base at the second displacement top is a ``closure2``
+            plume. Pass this to reproduce that; without it every candidate is
+            tested against the incoming column via ``cloud_base_mass`` and
+            shares the ``entrainment_efficiency``/``iplume`` arguments, which
+            makes the lower candidates look both more unstable and less
+            entraining than they are.
         phase: ``"water"`` or ``"ice"``. Static.
 
     Returns:
@@ -960,13 +979,16 @@ def convective_column(potential_temperature: jnp.ndarray,
     environment_condensate = environment_condensate.astype(dtype)
 
     def one_candidate(carry, offset):
-        theta, q, mass_flux, precipitation, count, top = carry
+        theta, q, mass_flux, precipitation, count, top, base_mass = carry
         candidate = highest_base - offset
         if cloud_base_closure_fn is None:
             plume_mass = jnp.sum(
                 jnp.where(level == candidate, cloud_base_mass, 0.0), axis=0)
+            enteff, this_iplume = entrainment_efficiency, iplume
         else:
-            plume_mass = cloud_base_closure_fn(theta, q, candidate)
+            setup = cloud_base_closure_fn(theta, q, candidate)
+            plume_mass = setup.cloud_base_mass
+            enteff, this_iplume = (setup.entrainment_efficiency, setup.iplume)
         # A candidate outside the sweep, or one the closure gave no mass, does
         # nothing. The scan still runs it -- the trip count has to be static --
         # so its result is masked out rather than skipped.
@@ -1001,8 +1023,8 @@ def convective_column(potential_temperature: jnp.ndarray,
             timestep=timestep,
             environment_condensate=environment_condensate,
             cloud_base_velocity=cloud_base_velocity,
-            entrainment_efficiency=entrainment_efficiency,
-            iplume=iplume,
+            entrainment_efficiency=enteff,
+            iplume=this_iplume,
             source_dtheta=source_dtheta,
             source_dq=source_dq,
             phase=phase)
@@ -1032,15 +1054,18 @@ def convective_column(potential_temperature: jnp.ndarray,
                 mass_flux + keep(cycle.tendency.interface_flux),
                 precipitation + keep(cycle.ascent.precipitation),
                 count + convects.astype(count.dtype),
-                jnp.maximum(top, jnp.where(convects, cycle.cloud_top, 0))), None
+                jnp.maximum(top, jnp.where(convects, cycle.cloud_top, 0)),
+                base_mass + jnp.where(level == candidate,
+                                      keep(plume_mass), 0.0)), None
 
     zeros = jnp.zeros_like(layer_mass)
     scalar = jnp.zeros(horiz)
-    (theta, q, mass_flux, precipitation, count, top), _ = lax.scan(
+    (theta, q, mass_flux, precipitation, count, top,
+     base_mass), _ = lax.scan(
         one_candidate,
         # The carry *is* the environment, so it starts at the incoming column.
         (potential_temperature, specific_humidity, zeros, zeros,
-         scalar, jnp.zeros(horiz, dtype=level.dtype)),
+         scalar, jnp.zeros(horiz, dtype=level.dtype), zeros),
         jnp.arange(max_plumes))
 
     return ColumnConvection(
@@ -1051,4 +1076,5 @@ def convective_column(potential_temperature: jnp.ndarray,
         mass_flux=mass_flux,
         precipitation=precipitation,
         plume_count=count,
-        cloud_top=top)
+        cloud_top=top,
+        base_mass=base_mass)

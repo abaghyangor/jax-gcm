@@ -93,6 +93,7 @@ from jcm.physics.convection.giss_mass_flux import (
 from jcm.physics.convection.giss_plume import plume_ascent_column
 from jcm.physics.convection.giss_plume_driver import (
     convective_column,
+    CandidateSetup,
     entrainment_efficiency,
     displacement_top,
     enhanced_source,
@@ -766,6 +767,8 @@ class GissConvection(PhysicsTerm):
             # rest relax over `tadjmc(1)`.
             boundary_layer_floor = (jnp.asarray(0) if blt is None
                                     else jnp.asarray(blt))
+            level_index = jnp.arange(nlev).reshape(
+                (nlev,) + (1,) * len(nodal_shape))
 
             def candidate_closure(env_theta, env_q, candidate):
                 """``mplume`` at one candidate base, for a given environment.
@@ -814,14 +817,68 @@ class GissConvection(PhysicsTerm):
                 weights = source_weights(air_mass, low, safe, top)
                 src_theta, src_q = enhanced_source(
                     env_theta, env_q, plk, top, dtheta, dq)
-                this_tadj = jnp.where(
-                    (safe == closure_base) & second_closure,
-                    _TADJ_CLOSURE2_SECONDS, _TADJ_SECONDS)
+                # Only the base at the second displacement top is a
+                # `closure2` plume: `closure2 = lmin .eq. lmax_disp2 .and.
+                # lmax_disp2 .gt. lmax_disp1` (MSTCNV.F90:1509), re-evaluated
+                # at every candidate. Everything below it relaxes over
+                # `tadjmc(1)` and runs as the *more*-entraining plume at the
+                # `bsort_enteff(2)` constant.
+                is_closure2 = (safe == closure_base) & second_closure
+                this_tadj = jnp.where(is_closure2, _TADJ_CLOSURE2_SECONDS,
+                                      _TADJ_SECONDS)
                 _, mass, _ = cloud_base_closure(
                     src_theta, src_q, air_mass, plk, p_sf, low, safe, weights,
                     timestep=self.params.get_value().dtsrc,
                     adjustment_time=this_tadj)
-                return jnp.where(inside & has_cloud, mass, 0.0)
+                # Two limiters `MASS_FLUX2` leaves to its caller, applied
+                # in ModelE's order (MSTCNV.F90:2931-2937) right after the
+                # `dtsrc/tadj` factor the closure itself applies.
+                #
+                # The first is the `closure2` pair, `fmp2 = min(max(mwpen,
+                # fmp2), 100)`: a floor at the penetrative mass and a cap at
+                # 100. Verified against `fmp2_limiters_diag.txt` to the last
+                # bit on every BOMEX and TWP-ICE candidate.
+                #
+                # The floor binds on 125 of TWP-ICE's 265 closure2 bases and
+                # does nothing on the other 140, which is why the port's mass
+                # there was bimodal -- exactly 1.001 on half the bases and
+                # 0.202-0.998 on the rest -- rather than uniformly short.
+                #
+                # `mwpen` has to be supplied. It is `max(0, wenv(lmax_disp2))`
+                # clipped to the boundary-layer mass and zeroed below 0.01
+                # (`:1475-1477`), and `wenv` is *prognostic*: a running average
+                # of the plumes' own mass flux plus the resolved velocity with
+                # a two-hour time constant (`:2605-2612`). A single column
+                # cannot reconstruct it, so it is an input here and the term
+                # falls back to no floor without it -- the same treatment as
+                # `pmct` and `fcp`, and the same obstacle to running free.
+                penetrative_mass = diagnostics.get("penetrative_mass", 0.0)
+                mass = jnp.where(
+                    is_closure2,
+                    jnp.minimum(jnp.maximum(penetrative_mass, mass), 100.0),
+                    mass)
+                # The second caps the plume at half of each source layer's own
+                # air mass. ModelE walks the source block and rescales, so the
+                # binding layer is whichever gives the smallest `fmp2`; layers
+                # with zero weight (those above `dcl`, dropped by
+                # `source_weights`) cannot bind, and their division is skipped
+                # rather than producing an infinity.
+                drawn = weights > 0.0
+                layer_cap = jnp.min(
+                    jnp.where(drawn, 0.5 * air_mass / jnp.where(drawn, weights,
+                                                                1.0),
+                              jnp.inf), axis=0)
+                mass = jnp.minimum(mass, layer_cap)
+                base_pressure = jnp.sum(
+                    jnp.where(level_index == safe, p_sf, 0.0), axis=0)
+                return CandidateSetup(
+                    cloud_base_mass=jnp.where(inside & has_cloud, mass, 0.0),
+                    entrainment_efficiency=entrainment_efficiency(
+                        base_pressure=base_pressure,
+                        cold_pool_fraction=diagnostics.get(
+                            "cold_pool_fraction", 0.0),
+                        second_closure=is_closure2),
+                    iplume=jnp.where(is_closure2, 1, 2))
 
             # The profile the closure gives against the *incoming* column. It
             # is what the non-swept paths use and what the harness inspects;
@@ -835,8 +892,9 @@ class GissConvection(PhysicsTerm):
                 (nlev,) + (1,) * len(nodal_shape))
             base_profile = sum(
                 jnp.where(base_level == closure_base - offset,
-                          candidate_closure(theta_modele, q_sf,
-                                            closure_base - offset), 0.0)
+                          candidate_closure(
+                              theta_modele, q_sf,
+                              closure_base - offset).cloud_base_mass, 0.0)
                 for offset in range(_MAX_PLUME_CANDIDATES))
         else:
             candidate_closure = None
