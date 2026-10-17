@@ -351,34 +351,53 @@ class ConvectiveColumnTest(unittest.TestCase):
         np.testing.assert_allclose(np.asarray(many.heat), np.asarray(few.heat),
                                    rtol=1e-12, atol=1e-10)
 
-    def test_plumes_do_not_see_each_other_within_a_sweep(self):
-        """Two plumes in one sweep must sum, not compound.
+    def test_plumes_see_each_other_within_a_sweep(self):
+        """A plume that runs second does less, because the column is stabler.
 
-        Every plume of a ModelE sweep reads the *same* environment: the ascent
-        takes it straight from the state (`SUP = SM(L)*BYMA(L)`,
-        MSTCNV.F90:1782, with no `dsm` term) while the tendencies accumulate in
-        `dsm`/`dqm`/`dmr`/`dm` and are applied once after the sweep closes
-        (`:5199-5206`). So running two bases together must give exactly what
-        running each alone gives, added.
+        ModelE writes each plume's tendencies back into `SM`/`QM` before the
+        next candidate is tried: `apply_continuity_tendencies` (the
+        `SM = SM + DSMR + DSM` at MSTCNV.F90:5199-5206) is called at `:2454`,
+        **inside** both `plumes_per_base` (`:1583`) and `cloud_base` (`:1498`).
+        The ascent does read the environment directly -- `SUP = SM(L)*BYMA(L)`
+        (`:1782`), with no `dsm` term -- but by then `SM` already carries every
+        earlier plume of the step.
 
-        This test previously asserted the opposite -- that the sequence is *not*
-        the sum of its parts -- because the sweep was written to carry an
-        evolving environment between candidates. That was never exercised: the
-        term runs `max_plumes=1`, so the body ran once and the carry was never
-        read. Widening the sweep without fixing it would have diverged silently.
+        This is visible in the oracle: `closure_state_diag.txt` dumps the
+        untouched `sm`/`qm` once per closure call, and between the first and the
+        last candidate of a step the sub-cloud humidity falls by 0.18% at the
+        BOMEX median and 3.5% at its 5th percentile (0.31%/3.5% on TWP-ICE).
+
+        **This test has reversed once already, so it carries its evidence.** It
+        first asserted coupling, was changed to assert linear summation on the
+        reading above, and is now back -- because the earlier reading had the
+        write-back's line number right and its call site wrong, and because a
+        decoupled sweep converts at 2.00 bases per BOMEX step against ModelE's
+        1.08 and overshoots peak heating by 39%, while this one gives 1.31 and
+        1.4%. Do not relax it without re-measuring those two numbers.
         """
         _, both = self._run(bases=(4, 6))
         _, upper = self._run(bases=(6,))
         _, lower = self._run(bases=(4,))
+
+        # Coupled, so the sweep is *not* the sum of its parts.
         summed = np.asarray(upper.heat) + np.asarray(lower.heat)
         together = np.asarray(both.heat)
         scale = max(np.abs(together).max(), 1e-12)
-        self.assertLess(np.abs(summed - together).max() / scale, 1e-5)
-        # and the same for water, which is the other half of the budget
-        summed_w = np.asarray(upper.water) + np.asarray(lower.water)
-        scale_w = max(np.abs(np.asarray(both.water)).max(), 1e-12)
-        self.assertLess(
-            np.abs(summed_w - np.asarray(both.water)).max() / scale_w, 1e-5)
+        self.assertGreater(np.abs(summed - together).max() / scale, 1e-2)
+
+        # And in the stabilising direction: the lower plume's own contribution,
+        # taken out of the two-plume sweep, is smaller than the same plume run
+        # on the untouched column -- in heat and in water both.
+        second_heat = together - np.asarray(upper.heat)
+        second_water = np.asarray(both.water) - np.asarray(upper.water)
+        self.assertLess(np.abs(second_heat).sum(),
+                        np.abs(np.asarray(lower.heat)).sum())
+        self.assertLess(np.abs(second_water).sum(),
+                        np.abs(np.asarray(lower.water)).sum())
+        # The same statement about the column as a whole.
+        self.assertLess(float(both.precipitation.sum()),
+                        float(upper.precipitation.sum())
+                        + float(lower.precipitation.sum()))
 
     def test_energy_closes_against_the_water_removed(self):
         # The column's dry static energy gain is the latent heat of the water
