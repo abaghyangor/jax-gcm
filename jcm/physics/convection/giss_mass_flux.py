@@ -563,7 +563,7 @@ def cloud_base_closure(potential_temperature: jnp.ndarray,
 
     # 3. The trial fraction came out below `MINFRAC` (`MSTCNV.F90:2849`), and
     # 4. the resulting mass is below `MINFRAC` of the source layer -- ModelE's
-    #    own "belt and suspenders" pair (`MSTCNV.F90:2896-2898`).
+    #    own "belt and suspenders" pair (`MSTCNV.F90:3022-3024`).
     big_enough = fplume > _MIN_PLUME_FRACTION
 
     fmp2 = jnp.where(saturated & unstable & big_enough, fplume * mass_top, 0.0)

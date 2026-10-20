@@ -57,7 +57,7 @@ from jcm.physics.convection.giss_thermodynamics import (
 _ENTRAINMENT_EFFICIENCY = 0.67
 
 # `bsort_enteff(1)`, the *less*-entraining plume's efficiency. A `closure2`
-# plume is run as plume 1 (`iplume_pass = 1`, MSTCNV.F90:1719), so this is the
+# plume is run as plume 1 (`iplume_pass = 1`, MSTCNV.F90:1745), so this is the
 # value its pressure ramp interpolates from.
 _ENTRAINMENT_EFFICIENCY_1 = 0.1
 
@@ -824,7 +824,7 @@ def sub_cloud_lift(parcel_heat: jnp.ndarray,
                    phase: str = "water"):
     """ModelE's **first stage**: condense and rain the parcel on the way up.
 
-    ``first_stage = l .le. lmin`` (``MSTCNV.F90:1769``) guards the entrainment,
+    ``first_stage = l .le. lmin`` (``MSTCNV.F90:1793``) guards the entrainment,
     detrainment and buoyancy sorting out of the ascent at and below the cloud
     base, so between ``lcl`` and ``lmin`` the parcel only condenses and runs the
     microphysics, at **fixed mass** -- which is what ``microphys_diag.txt``
