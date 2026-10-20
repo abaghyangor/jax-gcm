@@ -178,7 +178,7 @@ def entrainment_rate(buoyancy: jnp.ndarray,
     # ModelE applies the floor only below 700 mb; for the other, always.
     #
     # `iplume` is traced rather than static because a `closure2` plume runs as
-    # plume 1 (`iplume_pass = 1`, MSTCNV.F90:1719) and whether a column takes
+    # plume 1 (`iplume_pass = 1`, MSTCNV.F90:1745) and whether a column takes
     # that branch is a property of the column, not of the configuration. A
     # Python `if` here would bake one answer into the trace for every column.
     less_entraining = jnp.asarray(iplume) == 1
@@ -340,7 +340,7 @@ class SortedBlends(NamedTuple):
     # outputs (the mass budget is satisfied for any split), and the sorting
     # cannot be compared against ModelE's per-blend `blend_diag.txt` record.
     blend_mass_total: jnp.ndarray
-    # `frem = updairm/mplume` (`MSTCNV.F90:3774`), the share of the plume taken
+    # `frem = updairm/mplume` (`MSTCNV.F90:3845`), the share of the plume taken
     # out to build the blends before the fates decide what comes back. ModelE
     # dumps it per level, so exporting it makes the removal directly
     # comparable; `blend_mass_total` cannot stand in for it because that also
