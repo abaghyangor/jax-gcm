@@ -517,7 +517,19 @@ def run_plume(cloud_base: jnp.ndarray,
         cloud_top=downdraft_top,
         # `max(lcl-1, dcl)`: the downdraft sheds itself once it is back in the
         # mixed layer, or below the cloud it came from, whichever is higher.
-        boundary_layer_top=jnp.maximum(cloud_base - 1, boundary_layer_top),
+        #
+        # `lcl` is the level where the *lifted source parcel* saturates, which
+        # `parcel_condensation_level` already gave us above -- not the plume's
+        # root. Those are not the same level: measured on BOMEX, `lcl - lmin`
+        # is -1 on 38 of 52 plumes and 0 on 12, so using `cloud_base - 1` put
+        # this bound one level too high on **50 of 52** plumes and forced the
+        # shaft to shed half its mass a level early. That displaced `dm` by one
+        # level, which showed up as an equal-and-opposite pair in the interface
+        # flux, left the post-plume environment wrong at exactly the levels the
+        # next candidate draws its source from, and is why the sweep's error
+        # grew with each base (1.001 -> 1.041 -> 1.431).
+        boundary_layer_top=jnp.maximum(condensation_level - 1,
+                                       boundary_layer_top),
         cloud_base=cloud_base,
         phase=phase)
 
