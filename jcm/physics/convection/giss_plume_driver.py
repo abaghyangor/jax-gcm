@@ -546,6 +546,7 @@ def run_plume(cloud_base: jnp.ndarray,
         environment_heat=potential_temperature,
         environment_water=specific_humidity,
         layer_mass=layer_mass,
+        pressure=pressure,
         evaporation_heat=descent.environment_heat,
         evaporation_water=descent.environment_water)
 
