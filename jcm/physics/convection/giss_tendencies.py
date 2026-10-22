@@ -3,11 +3,14 @@
 The convective plume's effect on the *environment* -- the ``dq_mc``/``dth_mc``
 tendencies -- comes from **compensating subsidence**: by mass continuity, the
 mass the plume carries up must sink in the surrounding environment, advecting the
-environmental profile and warming/drying it. ``MSTCNV`` implements this as an
-**upwind advection** of the mass-weighted environmental quantities by the
-convective mass flux (``apply_continuity_tendencies`` / the subsidence loop).
+environmental profile and warming/drying it.
 
-This module ports that upwind operator. It takes a convective mass flux at the
+``MSTCNV`` advects ``sm`` and ``qm`` for this with the **quadratic upstream
+scheme** (``adv1d``, QUSDEF.f), not with donor-cell upwind: upwind is what it
+uses for *momentum* in the same loop, which is an easy misreading to make. See
+:func:`quadratic_upstream`.
+
+This module ports that operator. It takes a convective mass flux at the
 interior interfaces and an environmental profile, and returns the per-layer
 tendency from compensating subsidence.
 
@@ -16,9 +19,7 @@ Scope / status
 This is the tendency *operator* (the mechanism). Producing the actual
 ``dq_mc``/``dth_mc`` still needs the convective mass-flux profile assembled from
 the plume(s) (cloud-base closure magnitude + entrainment/detrainment continuity)
-and the detrainment deposition added -- those are the remaining ports. The
-single-step upwind here omits ``MSTCNV``'s CFL substepping (valid while the mass
-flux is below the layer mass each step, as in shallow convection).
+and the detrainment deposition added -- those are the remaining ports.
 
 Sign convention follows ``MSTCNV``'s ``cmn``: a **positive** interface flux
 advects the layer *below* the interface upward; negative advects the layer above
@@ -43,16 +44,155 @@ from jcm.physics.convection.giss_thermodynamics import safe_divide as _safe_rati
 _MAX_SUBSTEPS = 20
 _COURANT_LIMIT = 0.999
 
+#: Gravity, for turning a layer air mass back into a pressure thickness when
+#: the layer edges are needed. `ma = dp/g` exactly in ModelE, so the edges
+#: follow from the mass profile without a second source of truth.
+_GRAV = 9.80665
+
+
+def vertical_moment(intensive: jnp.ndarray,
+                    pressure: jnp.ndarray,
+                    layer_mass: jnp.ndarray,
+                    positive: bool = False) -> jnp.ndarray:
+    """``THMOM(MZ)``: the vertical slope of a profile, ModelE's initialisation.
+
+    ``tq_zmom_init`` (ATM_COM.f:588-611) sets the first vertical moment from a
+    centred difference scaled by the layer's share of the span it is taken
+    over::
+
+        rdsig = (pmid(l) - pedn(l+1)) / (pmid(l-1) - pmid(l+1))
+        mom(l) = (th(l+1) - th(l-1)) * rdsig
+
+    with one-sided forms at the two ends. For humidity it is additionally
+    clipped so a layer's reconstructed profile cannot go negative
+    (``positive``).
+
+    Args:
+        intensive: The profile being advected, per unit mass, ``(nlev, *horiz)``
+            with the surface at index 0.
+        pressure: Layer-midpoint pressure [Pa].
+        layer_mass: ``ma = dp/g`` [kg/m^2], which fixes the layer edges.
+        positive: Clip so ``intensive + mom >= 0``, as ModelE does for ``qv``.
+
+    Returns:
+        The moment, per unit mass and in the same units as ``intensive``.
+    """
+    # Edges from the mass profile: `dp = ma*g`, walking up from the surface.
+    half = 0.5 * layer_mass[:1] * _GRAV
+    thickness = layer_mass * _GRAV
+    edges_above = pressure[:1] + half - jnp.cumsum(thickness, axis=0)
+
+    up = jnp.concatenate([intensive[1:], intensive[-1:]], axis=0)
+    down = jnp.concatenate([intensive[:1], intensive[:-1]], axis=0)
+    p_up = jnp.concatenate([pressure[1:], pressure[-1:]], axis=0)
+    p_down = jnp.concatenate([pressure[:1], pressure[:-1]], axis=0)
+
+    # The interior form; the ends reduce to it once the one-sided neighbour is
+    # the layer itself, because both the difference and the span collapse the
+    # same way.
+    rdsig = _safe_ratio(pressure - edges_above, p_down - p_up)
+    mom = (up - down) * rdsig
+    if positive:
+        mom = jnp.maximum(mom, -intensive)
+    return mom
+
+
+def quadratic_upstream(scalar: jnp.ndarray,
+                       moment: jnp.ndarray,
+                       curvature: jnp.ndarray,
+                       mass: jnp.ndarray,
+                       flux: jnp.ndarray):
+    """One ``adv1d`` pass along the vertical (QUSDEF.f:43-265).
+
+    ModelE subsides ``sm`` and ``qm`` with the quadratic upstream scheme, not
+    with donor-cell upwind: the flux across an interface reads a *parabola*
+    reconstructed inside the donor layer from its mean, slope and curvature,
+
+        fracm = dm/mass(donor);  frac1 = fracm -+ 1
+        f = fracm*(s - frac1*(mom - (frac1+fracm)*mom2))
+
+    and the moments are themselves advected so the reconstruction survives the
+    step. Donor-cell is the same expression with the moments dropped, which is
+    far more diffusive across a sharp inversion -- exactly where the
+    boundary-layer top sits.
+
+    All of ``scalar``, ``moment`` and ``curvature`` are **extensive** (mass
+    weighted), as ModelE's ``sm``/``smom`` are.
+
+    Args:
+        scalar: ``s`` ``(nlev, *horiz)``, surface at index 0.
+        moment: ``smom(mz)``, the first vertical moment.
+        curvature: ``smom(mzz)``, the second.
+        mass: ``ml`` [kg/m^2].
+        flux: ``dm`` at the top of each layer; ModelE's ``cmn`` sign, so
+            negative brings the layer above down. The top entry must be zero.
+
+    Returns:
+        ``(scalar, moment, curvature)`` after the pass. The mass update is the
+        caller's, since both scalars share it.
+
+    Not ported: the ``qlimit`` positivity limiter ``limitq``
+    (QUSDEF.f:683-802), which ModelE applies to ``qm`` but not to ``sm``, and
+    the ``qusout_2sides`` branch for a layer emptied from both sides. Whether
+    either binds is answered by comparing against the oracle rather than
+    assumed; `prather_limits` is 0 in this preset, so that block is inactive.
+    """
+    up = lambda a: jnp.concatenate([a[1:], a[-1:]], axis=0)
+    below = lambda a: jnp.concatenate(
+        [jnp.zeros((1,) + a.shape[1:], a.dtype), a[:-1]], axis=0)
+
+    from_above = flux < 0.0
+    pick = lambda a: jnp.where(from_above, up(a), a)
+    donor_mass = pick(mass)
+    # `fracm = dm/mass(donor)`, and zero where the donor holds nothing.
+    fracm = jnp.where(donor_mass > 0.0, _safe_ratio(flux, donor_mass), 0.0)
+    frac1 = fracm + jnp.where(from_above, 1.0, -1.0)
+
+    d_s, d_m, d_c = pick(scalar), pick(moment), pick(curvature)
+    f = fracm * (d_s - frac1 * (d_m - (frac1 + fracm) * d_c))
+    f_mom = flux * (fracm * fracm * (d_m - 3.0 * frac1 * d_c) - 3.0 * f)
+    f_curv = flux * (flux * fracm ** 3 * d_c
+                     - 5.0 * (flux * f + f_mom))
+
+    flux_below, f_below = below(flux), below(f)
+    f_mom_below, f_curv_below = below(f_mom), below(f_curv)
+    dm2 = flux_below + flux
+    mass_new = mass + flux_below - flux
+    alive = mass_new > 0.0
+    safe_new = jnp.where(alive, mass_new, 1.0)
+
+    s_new = scalar + f_below - f
+    # ModelE updates the mean first, then the slope from the *new* mean, then
+    # the curvature from the *new* slope. The order is load-bearing.
+    m_new = (moment * mass
+             - 3.0 * (-dm2 * s_new + mass * (f_below + f))
+             + (f_mom_below - f_mom)) / safe_new
+    c_new = (curvature * mass * mass
+             + 2.5 * s_new * (mass * mass - mass_new * mass_new
+                              - 3.0 * dm2 * dm2)
+             + 5.0 * (mass * (mass * (f_below - f) - f_mom_below - f_mom)
+                      + dm2 * m_new * mass_new)
+             + (f_curv_below - f_curv)) / (safe_new * safe_new)
+
+    zero = jnp.zeros_like(scalar)
+    return (jnp.where(alive, s_new, zero),
+            jnp.where(alive, m_new, zero),
+            jnp.where(alive, c_new, zero))
+
 
 def subsidence_tendency(interface_flux: jnp.ndarray,
                         prop: jnp.ndarray,
                         layer_mass: jnp.ndarray) -> jnp.ndarray:
-    """Per-layer tendency of ``prop`` from compensating-subsidence advection.
+    """Per-layer tendency of ``prop`` from donor-cell subsidence advection.
 
-    Faithful single-step port of the ``MSTCNV`` subsidence upwind flux: across
-    each interior interface the mass flux carries the *upwind* (donor) layer's
-    property; the per-layer change is the flux convergence, divided by the layer
-    mass to give an intensive tendency.
+    Across each interior interface the mass flux carries the *upwind* (donor)
+    layer's property; the per-layer change is the flux convergence, divided by
+    the layer mass to give an intensive tendency.
+
+    **This is not what ``MSTCNV`` does to ``sm``/``qm``.** It subsides those
+    with the quadratic upstream scheme (:func:`quadratic_upstream`); donor-cell
+    is its *momentum* scheme in the same loop. Kept as a tested building block
+    and for comparing the two, not used on the live path.
 
     Args:
         interface_flux: Convective mass flux [kg/m²] at the ``n-1`` interior
@@ -183,6 +323,7 @@ def bsort_environment_tendencies(
         environment_heat: jnp.ndarray,
         environment_water: jnp.ndarray,
         layer_mass: jnp.ndarray,
+        pressure: jnp.ndarray,
         evaporation_heat: jnp.ndarray = 0.0,
         evaporation_water: jnp.ndarray = 0.0) -> EnvironmentTendency:
     """Environmental tendency from one buoyancy-sorting plume and its downdraft.
@@ -289,8 +430,25 @@ def bsort_environment_tendencies(
             axis=0)
         return below - flux
 
+    # The quadratic upstream scheme reads a parabola inside the donor layer, so
+    # it needs that layer's slope and curvature as well as its mean. ModelE
+    # holds them in `smom`/`qmom`, initialised from the profile by
+    # `tq_zmom_init` each dynamics step and then advected by `adv1d` itself.
+    #
+    # The curvature starts at zero: `tq_zmom_init` sets only the first moment,
+    # and nothing else in the SCM writes the second until convection does. That
+    # makes it exact on a column whose last step did not convect and an
+    # approximation otherwise, since ModelE carries `THMOM(MZZ)` across steps.
+    # The slope is likewise re-derived per plume rather than carried across the
+    # sweep, where ModelE would hand plume n+1 the moments plume n left.
+    heat_moment = vertical_moment(
+        environment_heat, pressure, updated_mass) * updated_mass
+    water_moment = vertical_moment(
+        environment_water, pressure, updated_mass, positive=True) * updated_mass
+    zeros = jnp.zeros_like(heat)
+
     def substep(carry, _):
-        remaining, mass, heat, water = carry
+        remaining, mass, heat, water, h_mom, w_mom, h_curv, w_curv = carry
         mass_above = shift_down(mass, 1.0)
         # `cmn = cmneg` clipped so neither the donor layer nor the one above it
         # can give up more than 99.9% of what it holds. Once `remaining` reaches
@@ -300,21 +458,17 @@ def bsort_environment_tendencies(
                         _COURANT_LIMIT * mass)
         remaining = remaining - step
 
-        heat_above = shift_down(heat, 0.0)
-        water_above = shift_down(water, 0.0)
-        from_above = step <= 0.0
-        heat_flux = jnp.where(
-            from_above, _safe_ratio(step * heat_above, mass_above),
-            _safe_ratio(step * heat, mass))
-        water_flux = jnp.where(
-            from_above, _safe_ratio(step * water_above, mass_above),
-            _safe_ratio(step * water, mass))
-        return (remaining, mass + convergence(step),
-                heat + convergence(heat_flux),
-                water + convergence(water_flux)), None
+        heat, h_mom, h_curv = quadratic_upstream(heat, h_mom, h_curv, mass,
+                                                 step)
+        water, w_mom, w_curv = quadratic_upstream(water, w_mom, w_curv, mass,
+                                                  step)
+        return (remaining, mass + convergence(step), heat, water,
+                h_mom, w_mom, h_curv, w_curv), None
 
-    (_, subsided_mass, subsided_heat, subsided_water), _ = lax.scan(
-        substep, (down_flux, updated_mass, heat, water), None,
+    (_, subsided_mass, subsided_heat, subsided_water,
+     _, _, _, _), _ = lax.scan(
+        substep, (down_flux, updated_mass, heat, water,
+                  heat_moment, water_moment, zeros, zeros), None,
         length=_MAX_SUBSTEPS)
 
     return EnvironmentTendency(

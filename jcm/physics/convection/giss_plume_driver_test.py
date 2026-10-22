@@ -394,10 +394,14 @@ class ConvectiveColumnTest(unittest.TestCase):
                         np.abs(np.asarray(lower.heat)).sum())
         self.assertLess(np.abs(second_water).sum(),
                         np.abs(np.asarray(lower.water)).sum())
-        # The same statement about the column as a whole.
-        self.assertLess(float(both.precipitation.sum()),
-                        float(upper.precipitation.sum())
-                        + float(lower.precipitation.sum()))
+        # This deliberately does *not* assert that the coupled column
+        # precipitates less than the two plumes separately. That reads like a
+        # corollary but is not entailed: under the quadratic upstream
+        # subsidence the environment is less diffused, so the boundary layer
+        # the second plume draws from stays moister and it rains *more* (0.673
+        # against 0.572 on this fixture) while still doing less heating and
+        # drying. The two claims above are the coupling; this one was an
+        # over-reach that the transport port exposed.
 
     def test_energy_closes_against_the_water_removed(self):
         # The column's dry static energy gain is the latent heat of the water
