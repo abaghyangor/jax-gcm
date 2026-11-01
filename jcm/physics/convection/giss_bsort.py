@@ -710,15 +710,26 @@ def plume_ascent(cloud_base: jnp.ndarray,
         # *before* this level's condensation, so the latent heat just released
         # is not in it. Using the post-condensation temperature makes the parcel
         # 0.22% too warm.
-        risen_temperature = safe_divide(heat, arrival_mass) * exner_l
+        # At the seed level the plume's state is the seed, not the carry: `mass`
+        # is still zero on the way in and is only replaced with
+        # `cloud_base_mass` further down, after this point (which is why
+        # `survives` below sees a sensible mass and this does not). The seed is
+        # the right state to offer the microphysics here -- ModelE's own
+        # `CONDMU` at this level is nonzero, and the port's sub-cloud lift
+        # reproduces it to 0.2% -- so use it rather than the empty carry.
+        offered_mass = jnp.where(at_base, cloud_base_mass, arrival_mass)
+        offered_condensate = jnp.where(at_base, cloud_base_condensate,
+                                       risen_condensate)
+        offered_heat = jnp.where(at_base, cloud_base_heat, heat)
+        risen_temperature = safe_divide(offered_heat, offered_mass) * exner_l
         # ModelE forms the volumetric condensate as `CONDMU = (wmp/mplume)*rho0`
         # (MSTCNV.F90:1772) -- `rho0` being the layer's reference air density,
         # not one derived from the plume's own temperature. Using `ma/delz`
         # reproduces the dumped `CONDMU` exactly (ratio 1.00000 over 484
         # levels); a plume-temperature density is 0.08% off.
         air_density = safe_divide(ma, delz)
-        water_content = safe_divide(risen_condensate,
-                                    arrival_mass) * air_density
+        water_content = safe_divide(offered_condensate,
+                                    offered_mass) * air_density
         # ModelE hands the microphysics `wcupass`, an extrapolation of the two
         # levels below rather than the level below alone (MSTCNV.F90:1874) --
         # `wcu(l)` is not known until after this level's sorting. Recovering
@@ -738,7 +749,13 @@ def plume_ascent(cloud_base: jnp.ndarray,
         # there -- its saturation fits and drop-size powers go non-finite under
         # `grad` even though `rose` discards the value afterwards -- so those
         # levels are handed the environment's own temperature and no water.
-        present = mass > 0.0
+        # The seed level counts as present: its mass arrives in
+        # `cloud_base_mass`, not in the carry. Excluding it zeroes
+        # `water_content` and with it `cloud_mode_ratio`, which is the cap on
+        # how much condensate the sort may detrain -- and a zero cap sends the
+        # seed level's whole detrained condensate to precipitation instead,
+        # which measured 3.3x ModelE's rain at that level.
+        present = (mass > 0.0) | at_base
         risen_temperature = jnp.where(present, risen_temperature,
                                       environment_temperature)
         water_content = jnp.where(present, water_content, 0.0)
