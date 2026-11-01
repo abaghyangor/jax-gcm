@@ -194,11 +194,34 @@ class ConvectiveFractionTest(unittest.TestCase):
         args.update(over)
         return np.asarray(drv.convective_fraction(**args))
 
-    def test_below_cloud_base_holds_the_cloud_base_value(self):
-        # Virga: the fraction does not fall to zero under the cloud.
+    def test_virga_holds_the_source_level_value(self):
+        """The virga fill starts below ``lmin``, not below ``cloud_base``.
+
+        ModelE computes ``mcfrac`` for every ``l >= lmin`` -- the plume's
+        source level -- and only copies downward strictly below it
+        (``MSTCNV.F90:5331-5337``). ``cloud_base`` is the first level the plume
+        ascends *into*, so the source is ``cloud_base - 1`` and that level
+        holds a value of its own, distinct from ``cloud_base``'s.
+
+        This test previously asserted the fill held ``f[cloud_base]``, which
+        put the boundary one level too high. Against ModelE's dumped
+        ``mcfrac`` that was 28% low at ``lmin`` on every BOMEX period, and the
+        wrong value then propagated through the whole sub-cloud layer; the
+        corrected form matches the oracle there to 0.1-0.3% on all 16 periods
+        sampled.
+        """
         f = self._fraction()
-        self.assertGreater(f[6], 0.0)
-        np.testing.assert_allclose(f[:6], f[6], rtol=1e-12)
+        source = 5           # cloud_base - 1
+        self.assertGreater(f[source], 0.0)
+        # Everything strictly below the source holds the source's value.
+        np.testing.assert_allclose(f[:source], f[source], rtol=1e-12)
+        # The source level is NOT a copy of cloud_base: the ascent carries no
+        # velocity there, so it is evaluated at the cloud-base updraft speed
+        # (0.5 m/s) against the mass entering cloud_base.
+        self.assertNotAlmostEqual(float(f[source]), float(f[6]), places=6)
+        np.testing.assert_allclose(
+            f[source], 40.0 / (1.1 * drv._CLOUD_BASE_VELOCITY * 1800.0),
+            rtol=1e-12)
 
     def test_zero_above_cloud_top(self):
         f = self._fraction()

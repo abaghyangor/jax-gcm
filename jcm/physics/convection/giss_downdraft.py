@@ -108,6 +108,8 @@ class DowndraftDescent(NamedTuple):
     specific_humidity: jnp.ndarray       # qldn
     environment_heat: jnp.ndarray        # dsm_evp: cooling by evaporating rain
     environment_water: jnp.ndarray       # dqm_evp: the vapour it adds
+    environment_air: jnp.ndarray         # menv: layer mass the clear-air rain
+                                         # evaporates into, fevap(l)*ma(l)
 
 
 def downdraft_descent(source_mass: jnp.ndarray,
@@ -319,6 +321,11 @@ def downdraft_descent(source_mass: jnp.ndarray,
         # the precipitation-weighted excess of convective fraction accumulated
         # from cloud top: layers that see proportionally more rain than their
         # own cloud cover get more of it evaporating into the clear air.
+        # Gating this on `mcfc > 0` is equivalent to ModelE's `l >= lcl`
+        # (`MSTCNV.F90:4388-4396`): `edge_fraction` is masked to zero below
+        # cloud base, and the only levels at or above it with `mcfc == 0` sit
+        # above the plume top, where `produced` is zero and so contributes
+        # nothing to either sum. Verified equivalent numerically on BOMEX.
         precip_total = precip_total + jnp.where(mcfc > 0.0, produced, 0.0)
         precip_weighted = precip_weighted + jnp.where(mcfc > 0.0,
                                                       produced * mcfc, 0.0)
@@ -350,7 +357,7 @@ def downdraft_descent(source_mass: jnp.ndarray,
         outputs = (mass_in, detrained, detrained_heat, detrained_water,
                    entrained, evaporated, theta, humidity,
                    -slh * environment_evaporated / plk,
-                   environment_evaporated)
+                   environment_evaporated, environment_air)
         return carry, outputs
 
     initial = (zeros, zeros, zeros, zeros, zeros, zeros, zeros, zeros)

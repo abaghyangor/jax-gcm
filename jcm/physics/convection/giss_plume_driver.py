@@ -336,29 +336,47 @@ def convective_fraction(plume_mass: jnp.ndarray,
                         cloud_base: jnp.ndarray,
                         cloud_top: jnp.ndarray,
                         timestep: jnp.ndarray,
-                        ccmul: jnp.ndarray = _CCMUL) -> jnp.ndarray:
+                        ccmul: jnp.ndarray = _CCMUL,
+                        source_velocity: jnp.ndarray = _CLOUD_BASE_VELOCITY
+                        ) -> jnp.ndarray:
     """``mcfrac``: the convective area fraction at each layer edge.
 
     The ratio of the mass entering a layer to how fast the updraft is carrying
     it (``MSTCNV.F90:5136-5146``). ``ccm(l)``, the mass flux at the edge *below*
     level ``l+1``, is the plume mass entering that level (``MSTCNV.F90:1749``),
     which is what :class:`~jcm.physics.convection.giss_bsort.PlumeAscent` calls
-    ``plume_mass``. Below cloud base ModelE holds the cloud-base value rather
-    than letting it fall to zero, representing virga.
+    ``plume_mass``.
+
+    The profile starts at ModelE's ``lmin`` -- the plume's *source* level --
+    not at the first level it ascends into (``MSTCNV.F90:5331-5337`` gates on
+    ``l >= lmin`` and fills virga only strictly below it). ``cloud_base`` here
+    names the first ascended level, so the source is ``cloud_base - 1``, and
+    that one level matters out of proportion to its number: whatever value it
+    takes is copied down through the whole sub-cloud layer as virga, and
+    ``fevap`` in the downdraft's clear-air evaporation is the *difference*
+    between a precipitation-weighted mean of ``mcfc`` and the local value, so a
+    source level that is too low stops ``fevap`` clamping to zero at and just
+    above cloud base -- where ModelE does no clear-air evaporation at all.
+
+    ``PlumeAscent`` carries no velocity at the source level (the ascent starts
+    above it), so ``wcu(lmin)`` is the cloud-base updraft speed. Checked
+    against the oracle rather than assumed: the velocity ModelE's dumped
+    ``mcfrac(lmin)`` implies is 0.4991-0.5013 across the BOMEX periods, i.e.
+    ``_CLOUD_BASE_VELOCITY``.
     """
     nlev = plume_mass.shape[0]
     level = jnp.arange(nlev).reshape((nlev,) + (1,) * (plume_mass.ndim - 1))
     mass_flux = jnp.concatenate(
         [plume_mass[1:], jnp.zeros((1,) + plume_mass.shape[1:])], axis=0)
+    source = cloud_base - 1
+    velocity = jnp.where(level == source, source_velocity, vertical_velocity)
     fraction = jnp.minimum(
-        1.0, safe_divide(ccmul * mass_flux,
-                         density * vertical_velocity * timestep))
-    fraction = jnp.where((level >= cloud_base) & (level < cloud_top),
-                         fraction, 0.0)
-    # Virga: every level below cloud base takes the cloud-base value, which the
+        1.0, safe_divide(ccmul * mass_flux, density * velocity * timestep))
+    fraction = jnp.where((level >= source) & (level < cloud_top), fraction, 0.0)
+    # Virga: every level below the source takes the source value, which the
     # Fortran reaches by copying downward one layer at a time.
-    at_base = jnp.sum(jnp.where(level == cloud_base, fraction, 0.0), axis=0)
-    return jnp.where(level < cloud_base, at_base, fraction)
+    at_source = jnp.sum(jnp.where(level == source, fraction, 0.0), axis=0)
+    return jnp.where(level < source, at_source, fraction)
 
 
 def run_plume(cloud_base: jnp.ndarray,
@@ -530,7 +548,17 @@ def run_plume(cloud_base: jnp.ndarray,
         # grew with each base (1.001 -> 1.041 -> 1.431).
         boundary_layer_top=jnp.maximum(condensation_level - 1,
                                        boundary_layer_top),
-        cloud_base=cloud_base,
+        # ModelE gates both the clear-air evaporation geometry
+        # (`MSTCNV.F90:4388`) and the injection of this level's new condensate
+        # into the falling flux (`MSTCNV.F90:4940`) on `l >= lcl` -- the
+        # *condensation* level, as the note above says, not the plume's root.
+        # `cloud_base` is `lmin + 1`, one to two levels higher, and passing it
+        # here zeroed `mcfc` on the levels in `[lcl, lmin]`. That does not
+        # suppress the evaporation there, it inverts it: `fevap` is
+        # `max(0, <mcfc>_above - mcfc)`, so a zeroed `mcfc` hands those levels
+        # the whole precipitation-weighted mean instead of clamping them to
+        # zero, which is where ModelE evaporates nothing at all.
+        cloud_base=condensation_level,
         phase=phase)
 
     tendency = tendencies.bsort_environment_tendencies(
