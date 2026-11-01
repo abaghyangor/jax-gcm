@@ -325,7 +325,9 @@ def bsort_environment_tendencies(
         layer_mass: jnp.ndarray,
         pressure: jnp.ndarray,
         evaporation_heat: jnp.ndarray = 0.0,
-        evaporation_water: jnp.ndarray = 0.0) -> EnvironmentTendency:
+        evaporation_water: jnp.ndarray = 0.0,
+        source_enhancement_heat: jnp.ndarray = 0.0,
+        source_enhancement_water: jnp.ndarray = 0.0) -> EnvironmentTendency:
     """Environmental tendency from one buoyancy-sorting plume and its downdraft.
 
     The plume and the downdraft both act on the same four ``MSTCNV`` arrays.
@@ -365,6 +367,20 @@ def bsort_environment_tendencies(
             (``MSTCNV.F90:4743``), so it is folded into the state the subsidence
             then advects rather than treated as a deposition.
         evaporation_water: ``dqm_evp``, the vapour that evaporation adds.
+        source_enhancement_heat: The ``tstar`` surface-flux boost the source
+            parcel is launched with, per unit mass, over the source levels
+            (zero elsewhere).
+        source_enhancement_water: The matching ``qstar`` boost.
+
+            The environment is debited for these, not just the plume credited
+            with them. ModelE removes the source draw at the *enhanced* source
+            copy, ``dqmr = dmrbyam*qmo1`` with the unenhanced ``qmold`` form
+            sitting commented out directly above it
+            (``MSTCNV.F90:1672-1679``). Crediting the parcel without debiting
+            the environment creates water out of nothing -- a leak worth only
+            about 0.5% of the plume's throughput, but ``W`` is a small residual
+            of far larger opposing terms, so it came to 28% of the net vapour
+            removed and was the whole of the port's ``W/H`` gap.
 
     Returns:
         An :class:`EnvironmentTendency`.
@@ -386,8 +402,12 @@ def bsort_environment_tendencies(
     # source draw and the entrainment are both removals at the environment's own
     # properties, so they combine.
     removed_air = source_removal + entrained_air + downdraft_entrained_air
-    removed_heat = removed_air * environment_heat
-    removed_water = removed_air * environment_water
+    # The enhancement rides only on the source draw, so it is charged against
+    # `source_removal` alone and not against either entrainment.
+    removed_heat = (removed_air * environment_heat
+                    + source_removal * source_enhancement_heat)
+    removed_water = (removed_air * environment_water
+                     + source_removal * source_enhancement_water)
     exchange_mass = deposited_mass - removed_air
     exchange_heat = deposited_heat - removed_heat
     exchange_water = deposited_water - removed_water

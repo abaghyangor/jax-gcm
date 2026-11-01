@@ -319,8 +319,12 @@ def source_parcel(potential_temperature: jnp.ndarray,
     fpi = source_weights(layer_mass, source_bottom, source_top,
                          boundary_layer_top)
     source_removal = plume_mass * fpi
-    # The parcel is drawn from the *enhanced* source, but the mass comes out of
-    # the untouched environment, so only the properties are boosted.
+    # The parcel is drawn from the *enhanced* source. The environment is
+    # debited at those same enhanced properties, not at its own: ModelE's
+    # removal is `dqmr = dmrbyam*qmo1`, the enhanced copy, with the unenhanced
+    # `qmold` form commented out above it (`MSTCNV.F90:1672-1679`). The caller
+    # passes the enhancement on to the tendency so the two sides agree;
+    # boosting only the parcel creates water.
     if exner is not None:
         potential_temperature, specific_humidity = enhanced_source(
             potential_temperature, specific_humidity, exner,
@@ -561,7 +565,15 @@ def run_plume(cloud_base: jnp.ndarray,
         cloud_base=condensation_level,
         phase=phase)
 
+    # The same boost the parcel was launched with, as a per-level delta, so the
+    # environment can be debited for it (`MSTCNV.F90:1678`).
+    _enhanced_theta, _enhanced_q = enhanced_source(
+        potential_temperature, specific_humidity, exner, boundary_layer_top,
+        source_dtheta, source_dq)
+
     tendency = tendencies.bsort_environment_tendencies(
+        source_enhancement_heat=_enhanced_theta - potential_temperature,
+        source_enhancement_water=_enhanced_q - specific_humidity,
         source_removal=removal,
         entrained_air=ascent.entrained_air,
         detrained_mass=ascent.detrained_mass,
