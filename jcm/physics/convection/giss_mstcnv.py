@@ -112,6 +112,10 @@ from jcm.physics.convection.giss_thermodynamics import (
 # Reference pressure for the Exner function. The closure recovers temperature as
 # ``theta*exner``, so the reference cancels and its specific value is arbitrary;
 # 1000 hPa is the conventional choice and matches the BOMEX validation.
+# `fmp2 = min(max(mwpen, fmp2), 100d0)` (`MSTCNV.F90:2957`) -- the ceiling
+# the closure's caller puts on the cloud-base mass, in kg/m^2.
+_CLOSURE_MASS_CAP = 100.0
+
 _P_REF = 100000.0
 
 # `MSTCNV` works in `th = theta/1000**kappa` against `plk = (p in mb)**kappa`,
@@ -752,6 +756,40 @@ class GissConvection(PhysicsTerm):
             has_cloud = cloud_base < nlev
             fmp2 = jnp.where(has_cloud, fmp2, 0.0)
 
+            # The two limiters `MASS_FLUX2` leaves to its caller
+            # (`MSTCNV.F90:2956-2964`) apply to *this* `fmp2` as well, not only
+            # to the swept candidates below. `candidate_closure` applies them
+            # to the mass it hands each candidate, but the value returned from
+            # here -- which is what `_bsort_tendencies` and
+            # `_convective_tendencies` actually run the plume on -- came
+            # straight from the closure with only the `dtsrc/tadj` factor on
+            # it, so on a `closure2` base the `mwpen` floor never reached the
+            # plume. Measured on TWP-ICE: the floored value reproduces ModelE's
+            # dumped `fmp2` exactly where it binds (100.0000, 96.8196, 90.2650
+            # against 38.98, 27.15, 38.96 unfloored), and the heating was short
+            # by a matching factor, so the term was genuinely running on the
+            # unlimited mass rather than merely reporting it.
+            #
+            # `closure_base` is the second displacement top wherever one
+            # exists -- checked against `sweep_diag.txt`'s `lmax_disp2` on
+            # every TWP-ICE period sampled -- so `second_closure` is already
+            # ModelE's `lmin .eq. lmax_disp2 .and. lmax_disp2 .gt. lmax_disp1`
+            # for this base and no separate level test is needed here.
+            penetrative = diagnostics.get("penetrative_mass", 0.0)
+            fmp2 = jnp.where(
+                second_closure,
+                jnp.minimum(jnp.maximum(penetrative, fmp2), _CLOSURE_MASS_CAP),
+                fmp2)
+            # Half of each drawn source layer's own air mass. Layers with zero
+            # weight cannot bind and their division is skipped rather than
+            # producing an infinity.
+            drawn_main = fpi > 0.0
+            fmp2 = jnp.minimum(fmp2, jnp.min(
+                jnp.where(drawn_main,
+                          0.5 * air_mass / jnp.where(drawn_main, fpi, 1.0),
+                          jnp.inf), axis=0))
+            fmp2 = jnp.where(has_cloud, fmp2, 0.0)
+
             # ModelE's sweep does not stop at its first success: a base that
             # yields nothing is skipped (`cycle cloud_base`) and the descent
             # continues, so several bases can convert in one timestep -- a
@@ -855,7 +893,8 @@ class GissConvection(PhysicsTerm):
                 penetrative_mass = diagnostics.get("penetrative_mass", 0.0)
                 mass = jnp.where(
                     is_closure2,
-                    jnp.minimum(jnp.maximum(penetrative_mass, mass), 100.0),
+                    jnp.minimum(jnp.maximum(penetrative_mass, mass),
+                                _CLOSURE_MASS_CAP),
                     mass)
                 # The second caps the plume at half of each source layer's own
                 # air mass. ModelE walks the source block and rescales, so the
