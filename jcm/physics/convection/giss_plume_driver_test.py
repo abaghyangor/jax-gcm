@@ -14,7 +14,22 @@ import numpy as np
 from jcm.physics.convection import giss_plume_driver as drv
 from jcm.physics.convection.giss_thermodynamics import DELTX, LHE, RGAS, SHA
 
-jax.config.update("jax_enable_x64", True)
+# The driver's oracle comparisons are to ModelE's float64 output and are tight
+# enough that float32 rounding breaks nine of them, so these tests need x64 on.
+# The flag is JAX-global, and the rest of the suite asserts the model's float32
+# default, so it is turned on for this module only and put back afterwards --
+# flipping it at import leaks it to every test collected alongside this one.
+_x64_before_module = None
+
+
+def setUpModule():
+    global _x64_before_module
+    _x64_before_module = jax.config.read("jax_enable_x64")
+    jax.config.update("jax_enable_x64", True)
+
+
+def tearDownModule():
+    jax.config.update("jax_enable_x64", _x64_before_module)
 
 
 def _column(nlev=20, horiz=()):
