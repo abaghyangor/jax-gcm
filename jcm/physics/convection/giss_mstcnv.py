@@ -410,13 +410,16 @@ class GissConvection(PhysicsTerm):
              state, diagnostics, nlev, nodal_shape)
 
         if self.allow_mc and self.bsort:
-            dtemp_dt, dq_dt, dth_mc, dq_mc = self._bsort_tendencies(
+            dtemp_dt, dq_dt, dth_mc, dq_mc, mcp = self._bsort_tendencies(
                 state, diagnostics, closure_base, fmp2, boundary_layer_top,
                 nlev, nodal_shape, dtsrc, second_closure, base_profile,
                 candidate_closure)
         elif self.allow_mc:
             dtemp_dt, dq_dt, dth_mc, dq_mc = self._convective_tendencies(
                 state, diagnostics, cloud_base, fmp2, nlev, nodal_shape, dtsrc)
+            # The single-plume fallback has no microphysics of its own to
+            # account the rain with, so it reports no precipitation.
+            mcp = jnp.zeros(nodal_shape)
         else:
             # Convection off: zero tendencies. Multiplying by dtsrc*0 keeps the
             # parameter in the trace so nnx.grad has a defined gradient path.
@@ -424,12 +427,13 @@ class GissConvection(PhysicsTerm):
             dq_dt = jnp.zeros(shape)
             dth_mc = jnp.zeros((nlev,) + nodal_shape)
             dq_mc = jnp.zeros((nlev,) + nodal_shape)
+            mcp = jnp.zeros(nodal_shape)
 
         tendency = PhysicsTendency.zeros(shape).copy(
             temperature=dtemp_dt, specific_humidity=dq_dt)
         convection = GissConvectionData.zeros(nodal_shape, nlev).copy(
             cloud_base=cloud_base, cloud_base_mass_flux=fmp2,
-            dth_mc=dth_mc, dq_mc=dq_mc)
+            dth_mc=dth_mc, dq_mc=dq_mc, mcp=mcp)
         return tendency, {**diagnostics, "convection": convection}
 
     def _bsort_tendencies(self, state, diagnostics, closure_base, fmp2,
@@ -460,10 +464,11 @@ class GissConvection(PhysicsTerm):
         them returns zeros.
 
         Returns:
-            ``(dT/dt [K/s], dq/dt [g/kg/s])`` top-first, and
-            ``(dth_mc, dq_mc)`` surface-first per-step diagnostics, in the
+            ``(dT/dt [K/s], dq/dt [g/kg/s])`` top-first, the
+            ``(dth_mc, dq_mc)`` surface-first per-step diagnostics in the
             conventional potential temperature and kg/kg the rest of the term
-            reports.
+            reports, and ``mcp``, the surface convective precipitation rate
+            [mm/day] the plume sequence produced.
         """
         shape = state.temperature.shape
         pressure_full = diagnostics.get("pressure_full")
@@ -472,7 +477,7 @@ class GissConvection(PhysicsTerm):
         if pressure_full is None or thickness is None or density is None:
             zero2d = jnp.zeros(shape)
             zero3d = jnp.zeros((nlev,) + nodal_shape)
-            return zero2d, zero2d, zero3d, zero3d
+            return zero2d, zero2d, zero3d, zero3d, jnp.zeros(nodal_shape)
 
         p = jnp.flip(pressure_full, axis=0)
         t = jnp.flip(state.temperature, axis=0)
@@ -557,7 +562,41 @@ class GissConvection(PhysicsTerm):
         exner = (p / _P_REF) ** KAPA
         dtemp_dt = jnp.flip(dth_mc * exner / dtsrc, axis=0)
         dq_dt = jnp.flip(dq_mc * 1000.0 / dtsrc, axis=0)
-        return dtemp_dt, dq_dt, dth_mc, dq_mc
+        # `condpr` is the rain each *level* shed, summed over the sweep's
+        # plumes, so the column's surface flux is the sum over levels
+        # [kg/m^2 per step]. The oracle's `mcp` is a rate in mm/day and
+        # 1 kg/m^2 of water is 1 mm, so the step accumulation becomes a rate
+        # by dividing out `dtsrc` and scaling to a day.
+        #
+        # `condpr` is rain *produced*; what ModelE reports as `mcp` is what
+        # survives the fall, so the rain the clear air evaporates back into the
+        # environment has to come off. The driver accounts it per plume as
+        # `dqm_evp` and `convective_column` sums it over the sweep. Clamped at
+        # zero because the two are accumulated independently and nothing
+        # guarantees the difference stays positive in a column that produced
+        # almost no rain.
+        #
+        # Only the *clear-air* evaporation belongs here. `descent.evaporated`,
+        # the rain that evaporates into the downdraft itself, acts on the
+        # downdraft's own condensate allocation rather than on this falling
+        # flux and is accounted for with it; netting that as well takes BOMEX
+        # to 0.29x ModelE's `mcp`.
+        #
+        # What this fixes, against the oracle, is the typical period: the
+        # median port/ModelE `mcp` moves from 1.120/1.294/1.516 to
+        # 0.964/1.015/1.432 on BOMEX/RICO/TWP-ICE. What it does not fix is a
+        # heavy upper tail -- the means stay 1.21-1.46 with p90 3.27 (BOMEX)
+        # and 7.04 (TWP-ICE), so a few periods still rain far too much. That
+        # residue is *not* the rain/cloud split: the condensate the port
+        # detrains as cloud is 0.97-0.98 of ModelE's, its microphysics
+        # partition matches the dumped `condp_raw` exactly (1.0000, corr
+        # +1.0000 over 1035 level-calls), and the overflow fires on 48-57% of
+        # live levels as ModelE's does. BOMEX's period-to-period correlation
+        # also stays ~0 (+0.002) even with the level now right.
+        surface_rain = jnp.maximum(
+            jnp.sum(column.precipitation - column.evaporation, axis=0), 0.0)
+        mcp = surface_rain / dtsrc * 86400.0
+        return dtemp_dt, dq_dt, dth_mc, dq_mc, mcp
 
     def _convective_tendencies(self, state, diagnostics, cloud_base, fmp2,
                                nlev, nodal_shape, dtsrc):

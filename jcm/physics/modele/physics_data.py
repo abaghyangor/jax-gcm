@@ -25,7 +25,10 @@ class GissConvectionData:
             (oracle diagnostic ``dq_mc``).
         dth_mc: Moist-convective potential-temperature tendency, ``(nlev, ncols)``
             (oracle diagnostic ``dth_mc``).
-        mcp: Moist-convective precipitation, ``(ncols,)`` (oracle ``mcp``).
+        mcp: Moist-convective surface precipitation rate [mm/day],
+            ``(ncols,)`` (oracle ``mcp``, same units). Non-zero only on
+            the buoyancy-sorting ``allow_mc`` path, which is the only one
+            that accounts the plumes' rain.
         cloud_base: Convective cloud-base level index per column, ``(ncols,)``,
             in **surface-first** (ModelE) order -- index 0 is the surface, and the
             sentinel value ``nlev`` means the surface parcel never saturates (no
