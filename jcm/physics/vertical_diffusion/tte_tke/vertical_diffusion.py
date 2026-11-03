@@ -42,7 +42,8 @@ from .vertical_diffusion_types import (
 )
 from .moist_buoyancy import interior_buoyancy_and_shear, richardson_number
 from .closure import interior_closure, surface_tke_boundary
-from .turbulence_coefficients import compute_turbulence_diagnostics, tile_effective_wind
+from .turbulence_coefficients import (
+    compute_turbulence_diagnostics, mixed_layer_level, tile_effective_wind)
 from .matrix_solver import _surface_air_density, vertical_diffusion_step
 
 
@@ -671,7 +672,17 @@ class TteTkeVerticalDiffusion(PhysicsTerm):
         "height_full", "height_half",
         "surface", "clouds",
     )
-    provides: ClassVar[tuple[str, ...]] = ("vertical_diffusion", "surface")
+    # ``boundary_layer_height`` and ``mixed_layer_top`` are published as plain
+    # top-level keys, not only inside the ``vertical_diffusion`` struct.
+    # Convection schemes need the depth the turbulence mixes through to pick a
+    # source parcel -- ModelE's ``MSTCNV`` takes ``smixlev``/``dcl`` from its own
+    # turbulence scheme the same way -- and a term cannot reach inside another
+    # term's diagnostic struct. Without it the GISS scheme blends its source
+    # parcel over most of the troposphere and convects on 0.1% of columns
+    # instead of 27%.
+    provides: ClassVar[tuple[str, ...]] = (
+        "vertical_diffusion", "surface", "boundary_layer_height",
+        "mixed_layer_top")
     # The structural shape comes from the declarative slot; TKE and the
     # variance stay zero (a cold start), and :meth:`initial_carry_state` below
     # seeds ``thv_sigma`` and the water tile's friction velocity.
@@ -1502,7 +1513,12 @@ class TteTkeVerticalDiffusion(PhysicsTerm):
             **balance,
         )
 
-        return tendency, {**out, "surface": surface_out}
+        # `kh` here is (nlev, ncol) after the transpose above; the
+        # level helper wants (ncol, nlev) like the rest of the
+        # turbulence routines.
+        return tendency, {**out, "surface": surface_out,
+                          "boundary_layer_height": pbl_height,
+                          "mixed_layer_top": mixed_layer_level(kh.T)}
 
 
 def check_ocean_current_consumers(physics, forcing) -> None:
