@@ -24,6 +24,7 @@ from .turbulence_coefficients import (
     compute_exchange_coefficients,
     compute_surface_exchange_coefficients,
     compute_boundary_layer_height,
+    mixed_layer_level,
     compute_friction_velocity,
     compute_turbulence_diagnostics
 )
@@ -62,6 +63,7 @@ __all__ = [
     "compute_surface_exchange_coefficients",
     "compute_surface_exchange_coefficients_echam_louis",
     "compute_boundary_layer_height",
+    "mixed_layer_level",
     "compute_friction_velocity",
     "compute_turbulence_diagnostics",
 

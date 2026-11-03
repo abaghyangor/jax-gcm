@@ -357,6 +357,37 @@ def compute_boundary_layer_height(
     return pbl_height
 
 
+def mixed_layer_level(
+    exchange_coeff_heat: jnp.ndarray,
+    threshold: float = 1.0
+) -> jnp.ndarray:
+    """Level index, counted up from the surface, that turbulence mixes to.
+
+    The same criterion :func:`compute_boundary_layer_height` applies -- the first
+    level above the surface where the heat exchange coefficient falls below
+    ``threshold`` -- but returned as the **level index** rather than converted to
+    a height. ModelE's ``MSTCNV`` takes exactly this (``smixlev``/``dcl``) from
+    its own turbulence scheme to bound the parcel its convective closure lifts,
+    and a convection scheme given only the height cannot recover it: counting
+    levels beneath the PBL height and subtracting one reproduces ``dcl`` on the
+    shallow oracle cases but gives ``dcl - 1`` on the deep one, and no fixed
+    offset satisfies both.
+
+    Args:
+        exchange_coeff_heat: Heat exchange coefficient [m^2/s] ``(ncol, nlev)``,
+            ordered top-first like the rest of the state.
+        threshold: Value below which mixing is taken to have stopped [m^2/s].
+
+    Returns:
+        Surface-first level index ``(ncol,)``, zero where the surface layer
+        itself is already below the threshold.
+    """
+    below_threshold = exchange_coeff_heat < threshold
+    # Reverse to count from the surface, matching the height routine above.
+    pbl_mask = jnp.cumsum(below_threshold[:, ::-1], axis=1)
+    return jnp.argmax(pbl_mask > 0, axis=1)
+
+
 @jax.jit
 def compute_friction_velocity(
     momentum_flux_u: jnp.ndarray,

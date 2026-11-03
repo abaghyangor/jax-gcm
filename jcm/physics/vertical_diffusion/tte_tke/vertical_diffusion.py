@@ -14,7 +14,7 @@ from .vertical_diffusion_types import (
 )
 from .turbulence_coefficients import (
     compute_richardson_number, compute_mixing_length, compute_exchange_coefficients,
-    compute_turbulence_diagnostics
+    compute_turbulence_diagnostics, mixed_layer_level
 )
 from .matrix_solver import vertical_diffusion_step
 from .tke_budget import (
@@ -429,7 +429,15 @@ class TteTkeVerticalDiffusion(PhysicsTerm):
         "height_full", "height_half",
         "surface",
     )
-    provides: ClassVar[tuple[str, ...]] = ("vertical_diffusion",)
+    # ``boundary_layer_height`` is also published as a plain top-level key, not
+    # only inside the ``vertical_diffusion`` struct. Convection schemes need the
+    # depth the turbulence mixes through to pick a source parcel -- ModelE's
+    # ``MSTCNV`` takes ``smixlev``/``dcl`` from its own turbulence scheme the same
+    # way -- and a term cannot reach inside another term's diagnostic struct.
+    # Without it the GISS scheme blends its source parcel over most of the
+    # troposphere and convects on 0.1% of columns instead of 27%.
+    provides: ClassVar[tuple[str, ...]] = (
+        "vertical_diffusion", "boundary_layer_height", "mixed_layer_top")
     # The structural shape comes from the declarative slot; the TKE
     # field gets a non-zero seed in :meth:`initial_carry_state` below.
     carry_slots: ClassVar[dict[str, type]] = {
@@ -621,4 +629,9 @@ class TteTkeVerticalDiffusion(PhysicsTerm):
             surface_friction_velocity=u_star,
         )
 
-        return tendency, {**diagnostics, "vertical_diffusion": vdiff_out}
+        # `kh` here is (nlev, ncol) after the transpose above; the level helper
+        # wants (ncol, nlev) like the rest of the turbulence routines.
+        return tendency, {**diagnostics,
+                          "vertical_diffusion": vdiff_out,
+                          "boundary_layer_height": pbl_height,
+                          "mixed_layer_top": mixed_layer_level(kh.T)}
