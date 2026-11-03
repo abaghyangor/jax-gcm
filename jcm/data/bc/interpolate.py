@@ -130,6 +130,50 @@ def upsample_terrain_ds(ds: xr.Dataset, grid: HorizontalGridTypes) -> xr.Dataset
     # not clamping orog to avoid erasing real areas below sea level, but this might allow bad extrapolated values at the extreme latitudes
     return ds_interp
 
+def upsample_sso_ds(ds: xr.Dataset, grid: HorizontalGridTypes) -> xr.Dataset:
+    f"""Upsample SSO descriptor fields to target resolution with physical constraints.
+
+    Five of the six Lott-Miller descriptors interpolate like any other field.
+    The exception is ``orothe``, the orientation of the principal axis: it is
+    an axial direction in (-90, 90] degrees, so interpolating it directly
+    averages across the +/-90 wrap (a ridge just east of north and one just
+    west of north would average to a ridge pointing east). Its double-angle
+    vector (cos 2*theta, sin 2*theta) is interpolated instead and the angle
+    recovered from that.
+
+    Args:
+        ds: Dataset holding some or all of orostd, orosig, orogam, orothe,
+            oropic and oroval on 'lat'/'lon' dimensions.
+        grid: Target horizontal grid.
+
+    Returns:
+        Upsampled dataset with the standard deviation and slope clipped at
+        zero and the anisotropy ratio to [0, 1]. The peak and valley
+        elevations are left unclipped, as orog is, so that real sub-sea-level
+        values survive.
+
+    """
+    ds = ds.copy()
+    has_orothe = 'orothe' in ds
+    if has_orothe:
+        double_angle = np.deg2rad(2.0 * ds['orothe'])
+        ds['_orothe_cos'] = np.cos(double_angle)
+        ds['_orothe_sin'] = np.sin(double_angle)
+        ds = ds.drop_vars('orothe')
+
+    ds_interp = _upsample_ds(ds, grid)
+
+    if has_orothe:
+        ds_interp['orothe'] = np.degrees(0.5 * np.arctan2(
+            ds_interp['_orothe_sin'], ds_interp['_orothe_cos']))
+        ds_interp = ds_interp.drop_vars(['_orothe_cos', '_orothe_sin'])
+    for v in ['orostd', 'orosig']:
+        if v in ds_interp:
+            ds_interp[v] = ds_interp[v].clip(min=0.)
+    if 'orogam' in ds_interp:
+        ds_interp['orogam'] = ds_interp['orogam'].clip(0.0, 1.0)
+    return ds_interp
+
 def interpolate(grid, output_dir=None):
     f"""Interpolate T30 forcing and terrain data to target resolution (defined by grid) and save to output directory.
 

@@ -4,13 +4,22 @@ Tests for TerrainData struct and get_terrain function.
 """
 
 import unittest
+from pathlib import Path
+
+import jax
 import jax.numpy as jnp
+import pytest
 from jcm.terrain import (
-    TerrainData, derive_sso_descriptors, get_simplified_sso_descriptors,
-    get_terrain,
+    TerrainData, _SSO_NAMES, _descriptors_to_tensor, _tensor_to_descriptors,
+    aggregate_sso_descriptors, derive_sso_descriptors,
+    get_simplified_sso_descriptors, get_terrain,
 )
 from jcm.constants import grav
+from jcm.physics.echam.echam_levels import get_echam_levels
 from jcm.physics.speedy.speedy_coords import get_speedy_coords
+from jcm.utils import get_coords
+
+_T63_TERRAIN = Path("jcm/data/bc/t63/terrain.nc")
 
 
 class TestSimplifiedSSODescriptors(unittest.TestCase):
@@ -108,6 +117,157 @@ class TestDeriveSSODescriptorsFromHighRes(unittest.TestCase):
                 gam = float(sso["orogam"][i, j])
                 self.assertGreaterEqual(gam, 0.0)
                 self.assertLessEqual(gam, 1.0)
+
+
+class TestGradientTensorRoundTrip(unittest.TestCase):
+    """orosig/orogam/orothe and the gradient tensor are interconvertible.
+
+    Aggregating descriptors onto a coarser grid depends on it: the tensors
+    average, the descriptors do not.
+    """
+
+    def _psd_tensor(self, seed):
+        """A tensor built as a mean of outer products, so positive
+        semi-definite, like a real gradient tensor.
+        """
+        import numpy as np
+        rng = np.random.default_rng(seed)
+        gx = rng.normal(size=200)
+        gy = 0.4 * gx + rng.normal(size=200)
+        return (float(np.mean(gx * gx)), float(np.mean(gy * gy)),
+                float(np.mean(gx * gy)))
+
+    def test_tensor_to_descriptors_and_back(self):
+        import numpy as np
+        for seed in range(5):
+            K, L, M = self._psd_tensor(seed)
+            orosig, orogam, orothe = _tensor_to_descriptors(K, L, M)
+            K2, L2, M2 = _descriptors_to_tensor(orosig, orogam, orothe)
+            np.testing.assert_allclose([K2, L2, M2], [K, L, M], rtol=1e-6,
+                                       atol=1e-12)
+
+    def test_descriptors_to_tensor_and_back(self):
+        import numpy as np
+        for seed in range(5):
+            K, L, M = self._psd_tensor(seed)
+            descriptors = _tensor_to_descriptors(K, L, M)
+            round_tripped = _tensor_to_descriptors(
+                *_descriptors_to_tensor(*descriptors))
+            np.testing.assert_allclose(round_tripped, descriptors, rtol=1e-6,
+                                       atol=1e-12)
+
+    def test_isotropic_tensor_has_unit_anisotropy(self):
+        orosig, orogam, orothe = _tensor_to_descriptors(0.01, 0.01, 0.0)
+        self.assertAlmostEqual(float(orogam), 1.0, places=6)
+        self.assertAlmostEqual(float(orosig), (0.02) ** 0.5, places=6)
+
+    def test_zero_tensor_is_inert(self):
+        orosig, orogam, orothe = _tensor_to_descriptors(0.0, 0.0, 0.0)
+        self.assertEqual(float(orosig), 0.0)
+        self.assertEqual(float(orogam), 0.0)
+        K, L, M = _descriptors_to_tensor(0.0, 0.0, 0.0)
+        self.assertEqual((float(K), float(L), float(M)), (0.0, 0.0, 0.0))
+
+
+class TestAggregateSSODescriptors(unittest.TestCase):
+    """Tests for :func:`aggregate_sso_descriptors`."""
+
+    def _source(self):
+        """A N-S ridge on a fine grid, with sub-cell statistics of its own."""
+        import numpy as np
+        nx_hr, ny_hr = 64, 32
+        hr_lat = np.linspace(-10.0, 10.0, ny_hr)
+        hr_lon = np.linspace(-10.0, 10.0, nx_hr)
+        orog = (1500.0 * np.exp(-(hr_lon[:, None] / 3.0) ** 2)
+                * np.ones((nx_hr, ny_hr)))
+        shape = (nx_hr, ny_hr)
+        sso = dict(
+            orostd=np.full(shape, 120.0),
+            orosig=np.full(shape, 0.05),
+            orogam=np.full(shape, 0.3),
+            orothe=np.full(shape, 20.0),
+            oropic=orog + 300.0,
+            oroval=orog - 200.0,
+        )
+        tg_lat = np.array([-7.5, -2.5, 2.5, 7.5])
+        tg_lon = np.array([-7.5, -2.5, 2.5, 7.5])
+        return sso, orog, hr_lat, hr_lon, tg_lat, tg_lon
+
+    def test_output_lands_on_target_grid(self):
+        sso, orog, hr_lat, hr_lon, tg_lat, tg_lon = self._source()
+        out = aggregate_sso_descriptors(sso, orog, hr_lat, hr_lon,
+                                        tg_lat, tg_lon)
+        for name in _SSO_NAMES:
+            self.assertEqual(out[name].shape, (4, 4))
+
+    def test_keeps_the_sources_sub_cell_statistics(self):
+        """Aggregated values exceed what the source orography alone gives.
+
+        The point of aggregating: re-deriving from the source orography
+        sees only the variation between its cells, while the source's own
+        orostd/orosig describe what happens inside them.
+        """
+        import numpy as np
+        sso, orog, hr_lat, hr_lon, tg_lat, tg_lon = self._source()
+        aggregated = aggregate_sso_descriptors(sso, orog, hr_lat, hr_lon,
+                                               tg_lat, tg_lon)
+        derived = derive_sso_descriptors(orog, hr_lat, hr_lon,
+                                         tg_lat, tg_lon)
+
+        self.assertTrue(jnp.all(aggregated["orostd"] >= derived["orostd"]))
+        self.assertTrue(jnp.all(aggregated["orosig"] >= derived["orosig"]))
+        # The source's orostd is a uniform 120 m here, so the law of total
+        # variance pins the result: the derived variance (between the
+        # source cells) plus 120^2 (within them).
+        np.testing.assert_allclose(
+            np.asarray(aggregated["orostd"]),
+            np.sqrt(120.0 ** 2 + np.asarray(derived["orostd"]) ** 2),
+            rtol=1e-5, atol=1e-3,
+        )
+
+    def test_peak_and_valley_bound_the_sources(self):
+        sso, orog, hr_lat, hr_lon, tg_lat, tg_lon = self._source()
+        out = aggregate_sso_descriptors(sso, orog, hr_lat, hr_lon,
+                                        tg_lat, tg_lon)
+        # Tolerance for the float32 round trip through the returned arrays.
+        self.assertLessEqual(float(out["oropic"].max()),
+                             float(sso["oropic"].max()) + 1e-2)
+        self.assertGreaterEqual(float(out["oroval"].min()),
+                                float(sso["oroval"].min()) - 1e-2)
+        self.assertTrue(jnp.all(out["oropic"] >= out["oroval"]))
+
+    def test_zero_source_statistics_reproduce_the_derivation(self):
+        """With no sub-cell statistics to keep, aggregating == deriving.
+
+        The law-of-total-variance and tensor decompositions both reduce to
+        the Baines-Palmer statistics of the source orography when the
+        source's own descriptors are zero, which pins the two paths
+        together.
+        """
+        import numpy as np
+        sso, orog, hr_lat, hr_lon, tg_lat, tg_lon = self._source()
+        zeroed = {name: np.zeros_like(sso[name]) for name in _SSO_NAMES}
+
+        aggregated = aggregate_sso_descriptors(zeroed, orog, hr_lat, hr_lon,
+                                               tg_lat, tg_lon)
+        derived = derive_sso_descriptors(orog, hr_lat, hr_lon,
+                                         tg_lat, tg_lon)
+        for name in ("orostd", "orosig", "orogam", "orothe"):
+            np.testing.assert_allclose(
+                np.asarray(aggregated[name]), np.asarray(derived[name]),
+                rtol=1e-5, atol=1e-7,
+                err_msg=f"{name} diverges from the derived statistics",
+            )
+
+    def test_ranges_stay_physical(self):
+        sso, orog, hr_lat, hr_lon, tg_lat, tg_lon = self._source()
+        out = aggregate_sso_descriptors(sso, orog, hr_lat, hr_lon,
+                                        tg_lat, tg_lon)
+        self.assertTrue(jnp.all(out["orostd"] >= 0.0))
+        self.assertTrue(jnp.all(out["orosig"] >= 0.0))
+        self.assertTrue(jnp.all(out["orogam"] >= 0.0))
+        self.assertTrue(jnp.all(out["orogam"] <= 1.0))
+        self.assertTrue(jnp.all(jnp.abs(out["orothe"]) <= 90.0))
 
 
 class TestGetTerrain(unittest.TestCase):
@@ -480,6 +640,138 @@ class TestTerrainDataFromFile(unittest.TestCase):
         self.assertTrue(jnp.all(terrain.orog >= -500.))
         self.assertTrue(jnp.all(terrain.fmask >= 0.0))
         self.assertTrue(jnp.all(terrain.fmask <= 1.0))
+
+
+class TestTerrainDataFromFileGridConsistency(unittest.TestCase):
+    """Every array field of a from_file TerrainData must share the target grid.
+
+    The T63 boundary file carries its own six SSO descriptors on its native
+    (192, 96) grid. Passing those through unchanged used to leave orog,
+    phis0 and fmask regridded to the target shape while the descriptors
+    stayed at the file's — an object that constructs happily and only fails
+    on the first physics step, inside the vmapped Lott-Miller SSO term.
+
+    """
+
+    def setUp(self):
+        if not _T63_TERRAIN.exists():
+            pytest.skip(
+                f"{_T63_TERRAIN} missing; run utils/convert_echam_bc.py "
+                f"to generate it"
+            )
+
+    def test_t63_file_on_t31_coords_is_shape_consistent(self):
+        """All array fields share the target nodal shape when coarsening."""
+        coords = get_coords(get_echam_levels(47), spectral_truncation=31)
+        terrain = TerrainData.from_file(_T63_TERRAIN, coords=coords)
+
+        expected_shape = coords.horizontal.nodal_shape
+        self.assertEqual((96, 48), expected_shape)
+        leaves = jax.tree.leaves(terrain)
+        shapes = {leaf.shape for leaf in leaves if leaf.ndim > 0}
+        self.assertEqual({expected_shape}, shapes)
+
+    def test_t63_file_on_t63_coords_keeps_the_files_descriptors(self):
+        """On the file's own grid the preprocessed fields are used verbatim."""
+        import xarray as xr
+
+        coords = get_coords(get_echam_levels(47), spectral_truncation=63)
+        terrain = TerrainData.from_file(_T63_TERRAIN, coords=coords)
+
+        self.assertEqual((192, 96), coords.horizontal.nodal_shape)
+        with xr.open_dataset(_T63_TERRAIN) as ds:
+            for name in ("orostd", "orosig", "orogam",
+                         "orothe", "oropic", "oroval"):
+                self.assertTrue(
+                    jnp.allclose(getattr(terrain, name),
+                                 jnp.asarray(ds[name].values)),
+                    msg=f"{name} differs from the file's own field",
+                )
+
+    def test_coarsened_descriptors_are_physically_valid(self):
+        """Descriptors re-derived onto a coarser grid stay in range."""
+        coords = get_coords(get_echam_levels(47), spectral_truncation=31)
+        terrain = TerrainData.from_file(_T63_TERRAIN, coords=coords)
+
+        self.assertTrue(jnp.all(terrain.orostd >= 0.0))
+        self.assertTrue(jnp.all(terrain.orosig >= 0.0))
+        self.assertTrue(jnp.all(terrain.orogam >= 0.0))
+        self.assertTrue(jnp.all(terrain.orogam <= 1.0))
+        self.assertTrue(jnp.all(jnp.abs(terrain.orothe) <= 90.0))
+        self.assertTrue(jnp.all(terrain.oropic >= terrain.oroval))
+        # A coarse cell holds the finer cells' peaks and valleys.
+        self.assertTrue(jnp.all(terrain.oropic <= 9000.0))
+        self.assertTrue(jnp.all(terrain.oroval >= -500.0))
+
+    def test_coarsening_aggregates_rather_than_rederives(self):
+        """The file's own descriptors feed the T31 values, not just its orography.
+
+        Both paths put the right shape on the object, so shape alone does
+        not say which ran. The file's statistics have to be in there: its
+        orosig reaches 0.027, and re-deriving from its orography alone
+        tops out near 0.016.
+        """
+        import xarray as xr
+
+        coords = get_coords(get_echam_levels(47), spectral_truncation=31)
+        terrain = TerrainData.from_file(_T63_TERRAIN, coords=coords)
+
+        grid = coords.horizontal
+        target_lat = grid.latitudes * 180.0 / jnp.pi
+        target_lon = grid.longitudes * 180.0 / jnp.pi
+        with xr.open_dataset(_T63_TERRAIN) as ds:
+            src_orog = jnp.asarray(ds["orog"].values)
+            src_lat = jnp.asarray(ds["lat"].values)
+            src_lon = jnp.asarray(ds["lon"].values)
+            src_sso = {name: jnp.asarray(ds[name].values)
+                       for name in _SSO_NAMES}
+
+        aggregated = aggregate_sso_descriptors(
+            src_sso, src_orog, src_lat, src_lon, target_lat, target_lon)
+        derived = derive_sso_descriptors(
+            src_orog, src_lat, src_lon, target_lat, target_lon)
+
+        for name in _SSO_NAMES:
+            self.assertTrue(
+                jnp.allclose(getattr(terrain, name), aggregated[name]),
+                msg=f"{name} is not the aggregated field",
+            )
+        # The two paths really do differ on this file.
+        self.assertGreater(float(aggregated["orosig"].max()),
+                           float(derived["orosig"].max()))
+
+    def test_t63_file_on_t85_coords_is_shape_consistent(self):
+        """All array fields share the target nodal shape when refining.
+
+        The file is coarser than the target here, so its descriptors are
+        interpolated up rather than re-derived.
+        """
+        coords = get_coords(get_echam_levels(47), spectral_truncation=85)
+        terrain = TerrainData.from_file(_T63_TERRAIN, coords=coords)
+
+        expected_shape = coords.horizontal.nodal_shape
+        self.assertEqual((256, 128), expected_shape)
+        leaves = jax.tree.leaves(terrain)
+        shapes = {leaf.shape for leaf in leaves if leaf.ndim > 0}
+        self.assertEqual({expected_shape}, shapes)
+        self.assertTrue(jnp.all(terrain.orogam <= 1.0))
+        self.assertTrue(jnp.all(jnp.abs(terrain.orothe) <= 90.0))
+
+
+class TestTerrainDataShapeValidation(unittest.TestCase):
+    """The constructors name mis-shaped fields instead of passing them on."""
+
+    def test_from_coords_rejects_mismatched_sso_field(self):
+        coords = get_speedy_coords(layers=8, spectral_truncation=31)
+        wrong = jnp.zeros((192, 96))
+
+        with self.assertRaises(ValueError) as cm:
+            TerrainData.from_coords(coords, orostd=wrong)
+
+        message = str(cm.exception)
+        self.assertIn("orostd", message)
+        self.assertIn("(192, 96)", message)
+        self.assertIn("(96, 48)", message)
 
 
 class TestTerrainDataTreeMath(unittest.TestCase):
