@@ -11,6 +11,7 @@ Mirrors ``mo_hammoz_sedimentation`` / ``mo_ham_sedimentation``.
 
 from __future__ import annotations
 
+import math
 from typing import ClassVar
 
 import jax
@@ -18,14 +19,19 @@ import jax.numpy as jnp
 import tree_math
 from flax import nnx
 
-from jcm.constants import grav as _G
-from jcm.constants import m_air as _MA
-from jcm.constants import r_universal as _RGAS
 from jcm.physics.aerosol.jam.microphysics.mam4_data import MAM4_SPEC
 from jcm.physics.aerosol.jam.population import ModalAerosolSpec
+from jcm.physics.aerosol.jam.removal_split import split_view
 from jcm.physics.aerosol.jam.tracer_layout import mass_name, number_name
 from jcm.physics.physics_term import PhysicsTerm
 from jcm.physics_interface import PhysicsTendency
+
+# Constants are read through the module alias and never bound with
+# ``from jcm.constants import grav``: a from-import captures the float at
+# import time, so a later ``set_constants`` override (another planet, a
+# sensitivity study, gradient calibration) would silently never reach this
+# scheme while the dynamics used the new value (#772).
+import jcm.constants as c
 
 
 @tree_math.struct
@@ -44,23 +50,89 @@ def air_viscosity(temperature: jnp.ndarray) -> jnp.ndarray:
     return 1.458e-6 * temperature ** 1.5 / (temperature + 110.4)
 
 
+# Upper bound on the settling radius [m]. HAMMOZ ``mo_ham_sedimentation``
+# (lines 178–191) caps the count/mass median *diameter* at 50 µm before the
+# Stokes velocity so a runaway κ-Köhler wet-growth tail (sea salt at high RH)
+# can't drive an unphysically large fall speed. 50 µm diameter → 25 µm radius.
+_R_WET_MAX = 25.0e-6
+
+
+def moment_radius(
+    r_wet: jnp.ndarray, *, geom_std_dev: float, moment: int
+) -> jnp.ndarray:
+    """Radius representing ``moment`` of a lognormal mode [m].
+
+    Every size-dependent removal process — settling, Brownian diffusion,
+    impaction — has to be evaluated at the radius carrying the moment being
+    removed, or the mass moment inherits the number moment's rate. CAM
+    computes this once per moment and uses it throughout
+    (``aero_model.F90:1577``, ``radius_moment``).
+
+    ``r_wet`` is the number-median radius, so ``moment=0`` returns it
+    unchanged and ``moment=3`` returns the volume/mass-median radius. The
+    cap is applied first, matching CAM's ``min(50e-6, radius_part)``.
+    """
+    return jnp.minimum(r_wet, _R_WET_MAX) * math.exp(
+        moment * math.log(geom_std_dev) ** 2)
+
+
 def stokes_velocity(
     r_wet: jnp.ndarray,
     rho_p: jnp.ndarray,
     temperature: jnp.ndarray,
     pressure: jnp.ndarray,
+    *,
+    geom_std_dev: float,
+    moment: int,
+    aspherical: bool = False,
 ) -> jnp.ndarray:
-    """Stokes settling velocity [m/s] with Cunningham slip correction.
+    """Bulk Stokes settling velocity [m/s] of one lognormal mode.
 
-    ``v = (2 g ρ_p r² C_c) / (9 μ)``. Inputs broadcast against each other;
-    ``r_wet``/``rho_p`` may carry a leading mode axis.
+    ``v = (2 g ρ_p r² C_c) / (9 μ)`` is the single-particle velocity. A mode
+    is a distribution, not a particle, so the velocity that transports a
+    given moment of it is the velocity at that moment's median radius:
+    ``moment=0`` for the number mixing ratio, ``moment=3`` for mass. Since
+    ``v ∝ r²`` the two differ by ``exp(6 ln²σ)`` — a factor of 8 at σ = 1.8 —
+    so settling mass at the count-median velocity leaves the sink an order of
+    magnitude too weak. The shortfall also grows as particles grow, which
+    suppresses the ``r²`` feedback that should arrest their growth.
+
+    Mirrors CAM's ``modal_aero_depvel_part`` (``aero_model.F90:1577-1596``):
+    the moment-median radius, plus ``dispersion`` — the moment-independent
+    broadening of the bulk velocity over the distribution's width. jcm's
+    ``r_wet`` is the number-median radius where CAM passes the volume-mean
+    one, so CAM's ``exp((moment-1.5)·ln²σ)`` becomes ``exp(moment·ln²σ)``.
+
+    Args:
+        r_wet: Wet number-median radius [m], optionally with a leading mode
+            axis. Capped at :data:`_R_WET_MAX` before the moment scaling.
+        rho_p: Wet particle density [kg/m³].
+        temperature: Air temperature [K].
+        pressure: Air pressure [Pa].
+        geom_std_dev: Geometric standard deviation of the mode.
+        moment: Moment the velocity transports — 0 for number, 3 for mass.
+        aspherical: CAM's coarse-mode drag correction (0.8), based on
+            Huang et al. (2020), doi:10.1029/2019GL086592. Both moments
+            retain their lognormal weighting; the radius is unchanged.
+
+    Returns:
+        Settling velocity [m/s], positive downward.
+
     """
+    ln_sigma = math.log(geom_std_dev)
+    r = moment_radius(r_wet, geom_std_dev=geom_std_dev, moment=moment)
     mu = air_viscosity(temperature)
-    # Mean free path λ = (μ/p)·√(π R T / (2 M_a)).
-    mfp = (mu / pressure) * jnp.sqrt(jnp.pi * _RGAS * temperature / (2.0 * _MA))
-    kn = mfp / jnp.maximum(r_wet, 1.0e-10)
+    # Mean free path λ = (μ/p)·√(π R* T / (2 M_a)), R* the universal constant.
+    mfp = (mu / pressure) * jnp.sqrt(
+        jnp.pi * c.r_universal * temperature / (2.0 * c.m_air)
+    )
+    kn = mfp / jnp.maximum(r, 1.0e-10)
     cunningham = 1.0 + kn * (1.257 + 0.4 * jnp.exp(-1.1 / jnp.maximum(kn, 1e-12)))
-    return (2.0 * _G * rho_p * r_wet ** 2 * cunningham) / (9.0 * mu)
+    # CAM aero_model.F90 modal_aero_depvel_part applies this to its
+    # internally mixed coarse mode, including dust and sea spray.
+    shape_drag = 0.8 if aspherical else 1.0
+    return ((2.0 * c.grav * rho_p * r ** 2 * cunningham) / (9.0 * mu)
+            * math.exp(2.0 * ln_sigma ** 2) * shape_drag)
 
 
 def sediment_column(
@@ -111,6 +183,9 @@ class StokesSedimentation(PhysicsTerm):
         dz = diagnostics["layer_thickness"]
         pressure = diagnostics["pressure_full"]
         temperature = state.temperature
+        # Model timestep for the CFL velocity cap below (injected by
+        # ComposablePhysics; default mirrors the SPEEDY fallback elsewhere).
+        dt = diagnostics.get("_dt_seconds", 1800.0)
 
         # Gather every interstitial tracer to settle and the (per-mode)
         # settling velocity that transports it, then run the donor-cell
@@ -119,20 +194,49 @@ class StokesSedimentation(PhysicsTerm):
         # during ``Model.get_empty_data``'s structural probe, so fall back to
         # zeros there (real runs have every declared tracer seeded).
         zeros = jnp.zeros_like(state.temperature)
+        # Operator splitting: settle what the terms already run this step
+        # left behind (see ``removal_split``).
+        view = split_view(self._spec, state, diagnostics)
         names: list[str] = []
         q_list: list[jnp.ndarray] = []
         v_list: list[jnp.ndarray] = []
         for i, mode in enumerate(self._spec.modes):
             if not mode.sediments:
                 continue
-            v = params.velocity_scale * stokes_velocity(
-                aer.r_wet[i], aer.rho[i], temperature, pressure,
-            )
-            for nm in [number_name(mode.short)] + [
-                mass_name(sp, mode.short) for sp in mode.species
-            ]:
+            # Number and mass ride different moments of the same mode, so
+            # they settle at different speeds (see stokes_velocity).
+            v_by_moment = {
+                moment: params.velocity_scale * stokes_velocity(
+                    aer.r_wet[i], aer.rho[i], temperature, pressure,
+                    geom_std_dev=mode.geom_std_dev, moment=moment,
+                    aspherical=mode.short == "cor",
+                )
+                for moment in (0, 3)
+            }
+            # CFL cap: an explicit donor-cell step is only stable for a Courant
+            # number ≤ 1, i.e. a particle may fall at most one layer per step.
+            # Without this, coarse-mode sea salt at high near-surface RH (large
+            # wet radius → large Stokes velocity, worst over the high-wind
+            # Southern Ocean) drives the Courant number past 1 and the explicit
+            # scheme explodes in a single step (33 orders of magnitude),
+            # poisoning the aerosol → activation → cloud → dynamics chain.
+            # Mirrors HAMMOZ ``mo_ham_sedimentation`` L228:
+            # ``zvsedi = MIN(zvsedi, pdz/time_step_len)``. With Courant ≤ 1 the
+            # donor-cell flux out of a layer cannot exceed its content, so the
+            # tracers also stay non-negative (HAMMOZ's L235 flux limiter). The
+            # mass velocity is the larger of the two, so it is the one that
+            # reaches the cap first — for the coarse mode, routinely.
+            v_by_moment = {m: jnp.minimum(v, dz / dt) for m, v in v_by_moment.items()}
+            for moment, nm in (
+                [(0, number_name(mode.short))]
+                + [(3, mass_name(sp, mode.short)) for sp in mode.species]
+            ):
                 names.append(nm)
-                q_list.append(state.tracers.get(nm, zeros))
+                v = v_by_moment[moment]
+                # Floored at 0: donor-cell settling of a negative
+                # (ringing) value transports negative mass downward and
+                # deposits it (see the wetdep note).
+                q_list.append(jnp.maximum(view.get(nm, zeros), 0.0))
                 v_list.append(v)
 
         q_stack = jnp.stack(q_list)            # (K, nlev, ncols)
@@ -149,4 +253,19 @@ class StokesSedimentation(PhysicsTerm):
             specific_humidity=jnp.zeros_like(state.specific_humidity),
             tracers=tracer_tends,
         )
+        # AeroCom deposition fluxes (jax-gcm#581): this term's removal,
+        # column-integrated, accumulated onto the per-step-reset keys.
+        from jcm.physics.aerosol.jam.emissions.flux_diagnostic import (
+            accumulate_deposition_fluxes)
+        diagnostics = accumulate_deposition_fluxes(
+            diagnostics, tracer_tends,
+            diagnostics["air_density"], diagnostics["layer_thickness"],
+            kind="dry")
+        # Separate the dust dry sinks so lifetime changes can be attributed
+        # to settling versus surface collection rather than to their sum.
+        diagnostics = {**diagnostics, "sed_du": -sum([
+            jnp.sum(tend * air_density * dz, axis=0)
+            for name, tend in tracer_tends.items()
+            if name.startswith(("m_du_", "mc_du_"))
+        ], jnp.zeros_like(air_density[0]))}
         return tendency, diagnostics

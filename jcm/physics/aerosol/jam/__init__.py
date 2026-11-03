@@ -9,10 +9,15 @@ later phases; Phase 0 exposes the population contract and the placeholder
 core.
 """
 
+from jcm.physics.aerosol.jam.cloud_borne import (
+    CloudBorneExchange,
+    CloudBorneExchangeParameters,
+)
 from jcm.physics.aerosol.jam.jam_state import JamAerosolState
 from jcm.physics.aerosol.jam.jam_terms import jam_aerosol_physics
 from jcm.physics.aerosol.jam.microphysics import (
     MAM4_SPEC,
+    M7_SPEC,
     ModalMicrophysicsTerm,
     PlaceholderMicrophysics,
 )
@@ -31,11 +36,14 @@ __all__ = [
     "AerosolMode",
     "AerosolSpecies",
     "ModalAerosolSpec",
+    "CloudBorneExchange",
+    "CloudBorneExchangeParameters",
     "JamAerosolState",
     "jam_aerosol_physics",
     "ModalMicrophysicsTerm",
     "PlaceholderMicrophysics",
     "MAM4_SPEC",
+    "M7_SPEC",
     "mass_name",
     "number_name",
     "tracer_specs",

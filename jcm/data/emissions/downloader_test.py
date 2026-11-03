@@ -24,15 +24,11 @@ class DownloaderTest(unittest.TestCase):
             cwd = os.getcwd()
             try:
                 os.chdir(d)
-                # Compared through realpath because what is under test is that
-                # a relative path comes back absolute, not which of several
-                # names for the same file it uses: on macOS the temporary
-                # directory is reached as /var/folders/... while chdir'ing into
-                # it leaves the cwd as the resolved /private/var/folders/...,
-                # so abspath on either side alone gives two different strings
-                # for the one file.
-                self.assertEqual(os.path.realpath(fetch("rel.nc")),
-                                 os.path.realpath(p))
+                resolved = fetch("rel.nc")
+                self.assertTrue(os.path.isabs(resolved))
+                # macOS may spell the same temporary file through either the
+                # /var or /private/var alias, so compare filesystem identity.
+                self.assertTrue(os.path.samefile(resolved, p))
             finally:
                 os.chdir(cwd)
 

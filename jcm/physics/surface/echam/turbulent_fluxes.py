@@ -9,6 +9,7 @@ import jax.numpy as jnp
 from typing import Tuple
 
 import jcm.constants as c
+from jcm.physics.convection.saturation import dewpoint_temperature
 from .surface_types import (
     SurfaceParameters, SurfaceState, AtmosphericForcing,
     SurfaceFluxes, SurfaceResistances, SurfaceDiagnostics
@@ -196,122 +197,11 @@ def compute_surface_humidity(
 
 
 @jax.jit
-def compute_turbulent_fluxes(
-    atmospheric_state: AtmosphericForcing,
-    surface_state: SurfaceState,
-    exchange_coeffs_momentum: jnp.ndarray,
-    exchange_coeffs_heat: jnp.ndarray,
-    exchange_coeffs_moisture: jnp.ndarray,
-    params: SurfaceParameters = SurfaceParameters.default()
-) -> SurfaceFluxes:
-    """Compute turbulent surface fluxes using bulk aerodynamic formulas.
-    
-    Args:
-        atmospheric_state: Atmospheric forcing
-        surface_state: Surface state
-        exchange_coeffs_momentum: Momentum exchange coefficients [m/s]
-        exchange_coeffs_heat: Heat exchange coefficients [m/s]
-        exchange_coeffs_moisture: Moisture exchange coefficients [m/s]
-        params: Surface parameters
-        
-    Returns:
-        Surface fluxes
-
-    """
-    ncol = atmospheric_state.temperature.shape[0]
-    nsfc_type = surface_state.temperature.shape[1]
-    
-    # Air density
-    air_density = (atmospheric_state.pressure /
-                  (c.rd * atmospheric_state.temperature))
-
-    # Surface saturation humidity
-    q_surface = compute_surface_humidity(
-        surface_state.temperature, atmospheric_state.pressure
-    )
-    
-    # Wind speed
-    wind_speed = jnp.sqrt(atmospheric_state.u_wind**2 + atmospheric_state.v_wind**2)
-    wind_speed = jnp.maximum(wind_speed, params.min_wind_speed)
-    
-    # Temperature and humidity differences
-    delta_temp = (atmospheric_state.temperature[:, None] - 
-                 surface_state.temperature)
-    delta_humidity = (atmospheric_state.humidity[:, None] - q_surface)
-    
-    # Sensible heat flux [W/m²]
-    sensible_heat = (air_density[:, None] * c.cpd *
-                    exchange_coeffs_heat * delta_temp)
-    
-    # Latent heat flux [W/m²]
-    # Use appropriate latent heat (condensation vs sublimation)
-    latent_heat_coeff = jnp.where(
-        surface_state.temperature > c.tmelt,
-        c.alhc,  # Condensation
-        c.alhs   # Sublimation
-    )
-    latent_heat = (air_density[:, None] * latent_heat_coeff * 
-                  exchange_coeffs_moisture * delta_humidity)
-    
-    # Momentum fluxes [N/m²]
-    momentum_u = (air_density[:, None] * exchange_coeffs_momentum * 
-                 atmospheric_state.u_wind[:, None])
-    momentum_v = (air_density[:, None] * exchange_coeffs_momentum * 
-                 atmospheric_state.v_wind[:, None])
-    
-    # Evaporation rate [kg/m²/s]
-    evaporation = air_density[:, None] * exchange_coeffs_moisture * delta_humidity
-    transpiration = jnp.zeros_like(evaporation)  # Will be computed by land model
-    
-    # Net radiation fluxes [W/m²]
-    # Shortwave
-    shortwave_net = atmospheric_state.sw_downward[:, None] * (
-        1.0 - (surface_state.albedo_visible_direct + 
-               surface_state.albedo_visible_diffuse + 
-               surface_state.albedo_nir_direct + 
-               surface_state.albedo_nir_diffuse) / 4.0
-    )
-    
-    # Longwave
-    lw_upward = (params.emissivity * params.stefan_boltzmann * 
-                surface_state.temperature**4)
-    longwave_net = atmospheric_state.lw_downward[:, None] - lw_upward
-    
-    # Ground heat flux (placeholder - needs soil model)
-    ground_heat = jnp.zeros((ncol, nsfc_type))
-    
-    # Compute grid-box means
-    fractions = surface_state.fraction
-    sensible_mean = jnp.sum(fractions * sensible_heat, axis=1)
-    latent_mean = jnp.sum(fractions * latent_heat, axis=1)
-    momentum_u_mean = jnp.sum(fractions * momentum_u, axis=1)
-    momentum_v_mean = jnp.sum(fractions * momentum_v, axis=1)
-    evaporation_mean = jnp.sum(fractions * evaporation, axis=1)
-    
-    return SurfaceFluxes(
-        sensible_heat=sensible_heat,
-        latent_heat=latent_heat,
-        longwave_net=longwave_net,
-        shortwave_net=shortwave_net,
-        ground_heat=ground_heat,
-        momentum_u=momentum_u,
-        momentum_v=momentum_v,
-        evaporation=evaporation,
-        transpiration=transpiration,
-        sensible_heat_mean=sensible_mean,
-        latent_heat_mean=latent_mean,
-        momentum_u_mean=momentum_u_mean,
-        momentum_v_mean=momentum_v_mean,
-        evaporation_mean=evaporation_mean
-    )
-
-
-@jax.jit
 def compute_surface_resistances(
     atmospheric_state: AtmosphericForcing,
     surface_state: SurfaceState,
     richardson_number: jnp.ndarray,
-    params: SurfaceParameters = SurfaceParameters.default()
+    params: SurfaceParameters | None = None
 ) -> SurfaceResistances:
     """Compute surface resistances for heat, moisture, and momentum transfer.
     
@@ -325,10 +215,12 @@ def compute_surface_resistances(
         Surface resistances
 
     """
+    if params is None:  # not a def default: it would build jax arrays at import (#859)
+        params = SurfaceParameters.default()
     ncol, nsfc_type = surface_state.temperature.shape
     
     # Wind speed
-    wind_speed = jnp.sqrt(atmospheric_state.u_wind**2 + atmospheric_state.v_wind**2)
+    wind_speed = jnp.sqrt(jnp.maximum(atmospheric_state.u_wind**2 + atmospheric_state.v_wind**2, 1.0e-30))
     wind_speed = jnp.maximum(wind_speed, params.min_wind_speed)
     
     # Stability functions
@@ -374,95 +266,184 @@ def compute_surface_diagnostics(
     surface_state: SurfaceState,
     surface_fluxes: SurfaceFluxes,
     resistances: SurfaceResistances,
-    params: SurfaceParameters = SurfaceParameters.default()
+    surface_humidity_tile: jnp.ndarray,
+    params: SurfaceParameters | None = None,
 ) -> SurfaceDiagnostics:
-    """Compute standard surface diagnostics (2m temperature, 10m wind, etc.).
-    
+    """Compute standard surface diagnostics (2m temperature, u*, etc.).
+
+    The 10 m wind is not among them: the ECHAM family has one 10 m wind,
+    diagnosed by the vertical-diffusion term from the per-tile
+    surface-layer reduction (``vertical_diffusion.wind_10m*``, ECHAM
+    ``nsurf_diag``), which the surface-exchange contract publishes and the
+    AeroCom ``uas``/``vas`` apply to the post-physics wind.
+
+    ``surface_humidity_tile`` is this function's ONLY surface-humidity
+    input: it no longer derives its own per-tile anchor from
+    ``surface_state.temperature``. Three separate Codex review rounds
+    (jax-gcm#1140/#1151) each caught a different defect in a previous,
+    locally re-derived copy of this quantity — saturation taken at the
+    fraction-weighted MEAN tile temperature instead of per-tile, the land
+    tile anchored at saturation instead of JSBACH's boundary, and that
+    boundary evaluated at the lowest model level's pressure instead of the
+    surface's — which is the signature of a quantity with more than one
+    definition, not three unrelated bugs. The fix is structural: this
+    function now CONSUMES the per-tile anchor its caller
+    (:func:`~jcm.physics.surface.echam.surface_physics.surface_physics_step`)
+    builds from :func:`~jcm.physics.thermodynamics.
+    jsbach_surface_humidity_boundary` — the SAME function the live TTE-TKE
+    surface exchange's own Richardson number calls
+    (:func:`~jcm.physics.vertical_diffusion.tte_tke.surface_layer.
+    surface_bulk_richardson`'s ``qts``) — at the surface (lowest interface)
+    pressure, with the land tile's JSBACH ``cair``/``csat`` already
+    applied, so there is exactly one place this boundary value is defined.
+
     Args:
         atmospheric_state: Atmospheric forcing
         surface_state: Surface state
         surface_fluxes: Surface fluxes
         resistances: Surface resistances
+        surface_humidity_tile: Per-tile surface-layer humidity anchor
+            [kg/kg] (ncol, nsfc_type) — Sonntag saturation over water/ice,
+            the JSBACH boundary ``csat·qs + (1−cair)·q_air`` over land, at
+            ``atmospheric_state.surface_pressure`` (NOT the lowest model
+            level's ``pressure``). Built by the caller via
+            :func:`~jcm.physics.thermodynamics.
+            jsbach_surface_humidity_boundary`; see
+            :func:`~jcm.physics.surface.echam.surface_physics.
+            surface_physics_step` for how it assembles the per-tile
+            ``cair``/``csat`` this expects water/ice to carry as ``1.0``.
         params: Surface parameters
-        
+
     Returns:
         Surface diagnostics
 
     """
-    ncol, nsfc_type = surface_state.temperature.shape
-    
-    # Reference heights
-    z_2m = 2.0    # 2m for temperature/humidity
-    z_10m = 10.0  # 10m for wind
-    
+    if params is None:  # not a def default: it would build jax arrays at import (#859)
+        params = SurfaceParameters.default()
+    ncol = surface_state.temperature.shape[0]
+
+    # Reference heights. ``z_ref`` is the ACTUAL height of
+    # ``atmospheric_state``'s temperature/humidity/wind above the surface —
+    # the model's lowest full level (tens to hundreds of metres, not
+    # literally 10 m; a review on #1140 caught this call reading the
+    # default ``reference_height=10.0`` while the field it was applied to
+    # was the lowest MODEL level). ``AtmosphericForcing.reference_height``
+    # carries the real value from the caller (``EchamSurface.__call__``);
+    # it defaults to 10.0 only for callers/tests that genuinely hand this
+    # function a 10 m input.
+    z_2m = 2.0                                   # 2m for temperature/humidity
+    z_ref = atmospheric_state.reference_height   # height of the atmospheric_state level
+
     # Grid-box mean surface temperature
     temp_surface_mean = jnp.sum(surface_state.fraction * surface_state.temperature, axis=1)
-    
+
     # Simple linear interpolation for 2m temperature
     # T_2m = T_surface + (T_air - T_surface) * (z_2m / z_ref)
-    temp_2m = temp_surface_mean + (atmospheric_state.temperature - temp_surface_mean) * (z_2m / z_10m)
-    
-    # 2m humidity (similar approach)
-    q_surface_mean = compute_surface_humidity(
-        temp_surface_mean[:, None], atmospheric_state.pressure
-    )[:, 0]
-    humidity_2m = q_surface_mean + (atmospheric_state.humidity - q_surface_mean) * (z_2m / z_10m)
-    
-    # 2m dew point (simplified)
-    dewpoint_2m = temp_2m - 20.0 * (1.0 - atmospheric_state.humidity / 0.01)
-    
-    # 10m wind (use atmospheric wind as approximation)
-    wind_speed_10m = jnp.sqrt(atmospheric_state.u_wind**2 + atmospheric_state.v_wind**2)
-    u_wind_10m = atmospheric_state.u_wind
-    v_wind_10m = atmospheric_state.v_wind
-    
+    temp_2m = temp_surface_mean + (atmospheric_state.temperature - temp_surface_mean) * (z_2m / z_ref)
+
+    # Tile-specific 2 m diagnostics (moved up from below #1140-review: the
+    # grid-mean humidity_2m immediately below is now formed FROM these, not
+    # independently). ``z_ref`` may be a bare scalar (callers/tests with no
+    # opinion on height) or an ``(ncol,)`` per-column array (what
+    # ``EchamSurface.__call__`` hands it, see the Richardson number below
+    # for the same shape note); ``jnp.atleast_1d(...)[:, None]`` makes
+    # either one broadcast safely against the ``(ncol, nsfc_type)`` tile
+    # arrays here, instead of colliding ``ncol`` against ``nsfc_type``.
+    z_ref_tile = jnp.atleast_1d(z_ref)[:, None]
+    temp_2m_tile = (
+        surface_state.temperature
+        + (atmospheric_state.temperature[:, None] - surface_state.temperature)
+        * (z_2m / z_ref_tile))
+    humidity_2m_tile = (
+        surface_humidity_tile
+        + (atmospheric_state.humidity[:, None] - surface_humidity_tile) * (z_2m / z_ref_tile))
+
+    # Grid-mean 2 m humidity: fraction-weight the PER-TILE 2 m humidities
+    # above, rather than interpolating from a fraction-weighted mean
+    # surface humidity as the grid-mean temperature does. Saturation (and
+    # the JSBACH boundary, which is itself nonlinear through q_sat) is
+    # nonlinear in temperature, so averaging tile temperatures before
+    # taking the surface humidity does NOT equal averaging the tile
+    # surface humidities — a #1140 review reproduced this directly in a
+    # warm-water/cold-ice cell, where the two differed materially and the
+    # old grid mean disagreed with the published per-tile
+    # ``humidity_2m_tile``. ``temperature_2m`` needs no such fix: it is a
+    # LINEAR blend of a linear per-tile blend, so fraction-weighting
+    # commutes and the mean-first form above already equals the
+    # per-tile-then-weighted one exactly.
+    humidity_2m = jnp.sum(surface_state.fraction * humidity_2m_tile, axis=1)
+
+    # 2m dew point: the exact analytic inverse of the Tetens saturation law
+    # jcm's shared ``saturation`` helper uses (jax-gcm#1140), applied to the
+    # 2 m humidity just formed above. Evaluated at
+    # ``atmospheric_state.surface_pressure`` — the near-surface pressure
+    # ``humidity_2m`` and ``surface_humidity_tile`` are themselves anchored
+    # at (the 2 m level sits a few metres above the surface, not partway to
+    # the lowest model level tens to hundreds of metres up) — NOT the
+    # lowest-model-level ``pressure`` a previous version of this line used,
+    # which a #1151 review caught compounding that same pressure mismatch
+    # into the dew point on top of the surface-humidity anchor itself.
+    # Replaces a placeholder linear-in-humidity formula with no
+    # saturation-physics basis (``temp_2m - 20*(1 - q/0.01)``, dimensionally
+    # wrong — it compared a specific humidity in kg/kg against a bare
+    # 0.01 constant). See :func:`jcm.physics.convection.saturation.
+    # dewpoint_temperature` for why this is the exact inverse of jcm's own
+    # law rather than a transcription of ECHAM's ``zdew2w``/``zdewl``/
+    # ``zdewi`` line.
+    #
+    # ``temp_2m`` and ``humidity_2m`` are still two INDEPENDENT quantities
+    # (one a linear blend of tile temperatures, the other a fraction-
+    # weighted blend of each tile's own, separately-anchored 2 m
+    # humidity), so nothing stops the pair from implying a dew point above
+    # the 2 m temperature it was derived alongside — a physically
+    # impossible output a review on #1140 reproduced directly (a cold
+    # surface under warmer near-saturated air). This remains true after
+    # the per-tile humidity fix above: fixing HOW humidity_2m is averaged
+    # does not create a saturation constraint between it and temp_2m: the
+    # cap below is still required. ECHAM's own
+    # ``postproc_ocean``/``_land``/``_ice`` guard against exactly this:
+    # ``zdew2w = MIN(zt2w, ...)`` caps the dew point at the 2 m temperature
+    # unconditionally. Applied here for the same reason.
+    dewpoint_2m = jnp.minimum(
+        dewpoint_temperature(humidity_2m, atmospheric_state.surface_pressure),
+        temp_2m)
+
+    wind_speed_atm = jnp.sqrt(jnp.maximum(
+        atmospheric_state.u_wind**2 + atmospheric_state.v_wind**2, 1.0e-30))
+
     # Friction velocity
-    momentum_flux_magnitude = jnp.sqrt(
-        surface_fluxes.momentum_u_mean**2 + surface_fluxes.momentum_v_mean**2
-    )
+    momentum_flux_magnitude = jnp.sqrt(jnp.maximum(
+        surface_fluxes.momentum_u_mean**2 + surface_fluxes.momentum_v_mean**2, 1.0e-30
+    ))
     air_density = atmospheric_state.pressure / (c.rd * atmospheric_state.temperature)
-    friction_velocity = jnp.sqrt(momentum_flux_magnitude / air_density)
-    
-    # Richardson number (grid-box mean)
+    friction_velocity = jnp.sqrt(jnp.maximum(momentum_flux_magnitude / air_density, 1.0e-30))
+
+    # Richardson number (grid-box mean). Same ``z_ref``/``z_ref_tile`` and
+    # per-tile surface-humidity anchor (``surface_humidity_tile``, Sonntag
+    # over water/ice, the JSBACH boundary over land, at the surface
+    # pressure) as the 2 m blend above — the SAME anchor, passed in once
+    # and consumed here and there, not two independent copies. The per-tile
+    # Richardson numbers are fraction-weighted AFTER the (nonlinear)
+    # per-tile computation, exactly as the tile-then-weight ordering the
+    # 2 m humidity needed above.
     ri_mean = jnp.sum(surface_state.fraction * compute_bulk_richardson_number(
         atmospheric_state.temperature, surface_state.temperature,
-        atmospheric_state.humidity, 
-        compute_surface_humidity(surface_state.temperature, atmospheric_state.pressure),
-        wind_speed_10m
+        atmospheric_state.humidity,
+        surface_humidity_tile,
+        wind_speed_atm, reference_height=z_ref_tile,
     ), axis=1)
-    
+
     # Energy balance
     net_radiation = surface_fluxes.shortwave_net + surface_fluxes.longwave_net
     net_radiation_mean = jnp.sum(surface_state.fraction * net_radiation, axis=1)
-    
-    energy_balance_residual = (net_radiation_mean - surface_fluxes.sensible_heat_mean - 
+
+    energy_balance_residual = (net_radiation_mean - surface_fluxes.sensible_heat_mean -
                               surface_fluxes.latent_heat_mean)
-    
-    # Tile-specific diagnostics
-    temp_2m_tile = jnp.zeros((ncol, nsfc_type))
-    humidity_2m_tile = jnp.zeros((ncol, nsfc_type))
-    wind_speed_10m_tile = jnp.zeros((ncol, nsfc_type))
-    
-    for isfc in range(nsfc_type):
-        temp_2m_tile = temp_2m_tile.at[:, isfc].set(
-            surface_state.temperature[:, isfc] + 
-            (atmospheric_state.temperature - surface_state.temperature[:, isfc]) * (z_2m / z_10m)
-        )
-        q_sfc = compute_surface_humidity(
-            surface_state.temperature[:, isfc:isfc+1], atmospheric_state.pressure
-        )[:, 0]
-        humidity_2m_tile = humidity_2m_tile.at[:, isfc].set(
-            q_sfc + (atmospheric_state.humidity - q_sfc) * (z_2m / z_10m)
-        )
-        wind_speed_10m_tile = wind_speed_10m_tile.at[:, isfc].set(wind_speed_10m)
-    
+
     return SurfaceDiagnostics(
         temperature_2m=temp_2m,
         humidity_2m=humidity_2m,
         dewpoint_2m=dewpoint_2m,
-        wind_speed_10m=wind_speed_10m,
-        u_wind_10m=u_wind_10m,
-        v_wind_10m=v_wind_10m,
         friction_velocity=friction_velocity,
         richardson_number=ri_mean,
         surface_layer_height=jnp.full(ncol, 100.0),  # Simplified
@@ -471,5 +452,4 @@ def compute_surface_diagnostics(
         energy_balance_residual=energy_balance_residual,
         temperature_2m_tile=temp_2m_tile,
         humidity_2m_tile=humidity_2m_tile,
-        wind_speed_10m_tile=wind_speed_10m_tile
     )

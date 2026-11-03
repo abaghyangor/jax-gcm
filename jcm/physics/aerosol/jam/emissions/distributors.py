@@ -8,21 +8,41 @@ modal path is implemented here; a sectional distributor is future work (#491).
 
 from __future__ import annotations
 
+import math
+
 import jax.numpy as jnp
 
 from jcm.physics.aerosol.jam.population import AerosolMode, ModalAerosolSpec
 from jcm.physics.aerosol.jam.tracer_layout import mass_name, number_name
 
 
-def particle_mean_mass(mode: AerosolMode, species_density: float) -> float:
-    """Mean single-particle mass [kg] of a class at its reference size.
+def particle_mean_mass(mode: AerosolMode, species_density: float,
+                       emission_diameter=None, number_factor: float | None = None):
+    """Mean single-particle mass [kg] of freshly emitted material.
 
-    ``m_p = ρ_material / number_factor`` — the inverse of the family-agnostic
-    ``mode.number_factor`` (number per unit dry-aerosol volume), so the modal
-    log-normal third-moment formula lives in one place (``AerosolMode``) and a
-    sectional class returns its own mean particle mass through the same call.
+    Freshly emitted particles are not at their class's equilibrium size, so a
+    scheme that knows the volume-mean diameter D of the size distribution it
+    emits into passes it and gets ``m_p = ρ·(π/6)·D³``; the ``None`` fallback
+    is the class's own geometry, ``m_p = ρ/number_factor``. Since the emitted
+    number for a given mass scales as D⁻³, the difference is large wherever
+    the emitted and equilibrium sizes differ.
+
+    ``number_factor``, when given, overrides both of the above: it is a
+    number-per-mass ratio [kg⁻¹] the caller already computed from its own
+    size/σ assumptions (HAM's mass-median-radius ``zm2n`` conversion for the
+    M7 dust policy — ``emissions/dust.py`` — whose lognormal correction has
+    the opposite sign from a count-median :attr:`AerosolMode.number_factor`,
+    so it cannot be expressed as an ``emission_diameter``).
+
+    Each emission scheme owns the size its own reference prescribes, and this
+    is a HAMMOZ package: the primary-carbon and primary-sulfate sizes come
+    from HAM (Stier et al. 2005) with the emissions port, not from CAM/CESM.
     """
-    return species_density / mode.number_factor
+    if number_factor is not None:
+        return 1.0 / number_factor
+    if emission_diameter is None:
+        return species_density / mode.number_factor
+    return species_density * (math.pi / 6.0) * emission_diameter ** 3
 
 
 def emit_over_profile(
@@ -52,8 +72,13 @@ def distribute_surface_flux(
 
     Args:
         spec: the modal population.
-        fluxes: list of ``(species_token, mode_short, mass_flux)`` with
-            ``mass_flux`` shaped ``(ncols,)`` in kg/m²/s.
+        fluxes: list of ``(species_token, mode_short, mass_flux)``,
+            ``(species_token, mode_short, mass_flux, emission_diameter)``, or
+            ``(species_token, mode_short, mass_flux, None, number_factor)``
+            with ``mass_flux`` shaped ``(ncols,)`` in kg/m²/s and either the
+            volume-mean diameter [m] of the emitted size distribution or a
+            direct number-per-mass factor [kg⁻¹] (see
+            :func:`particle_mean_mass`); omitted, the class geometry is used.
         air_density: air density [kg/m³].
         layer_thickness: geometric layer thickness [m].
 
@@ -70,13 +95,13 @@ def distribute_surface_flux(
     tends: dict[str, jnp.ndarray] = {}
     number_flux = {mode.short: jnp.zeros((ncols,)) for mode in spec.modes}
 
-    for species, mode_short, mass_flux in fluxes:
+    for species, mode_short, mass_flux, *rest in fluxes:
         mode = spec.mode(mode_short)
         props = spec.species_props(species)
         mname = mass_name(species, mode_short)
         dq = jnp.zeros((nlev, ncols)).at[-1].set(mass_flux * inv)
         tends[mname] = tends.get(mname, jnp.zeros((nlev, ncols))) + dq
-        m_p = particle_mean_mass(mode, props.density)
+        m_p = particle_mean_mass(mode, props.density, *rest)
         number_flux[mode_short] = number_flux[mode_short] + mass_flux / m_p
 
     for mode_short, n_flux in number_flux.items():

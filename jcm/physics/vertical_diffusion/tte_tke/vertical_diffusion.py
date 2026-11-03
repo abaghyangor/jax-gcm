@@ -4,24 +4,30 @@ This module provides the main interface for vertical diffusion and boundary laye
 physics, integrating turbulence coefficient calculations with the matrix solver.
 """
 
+import functools
+import logging
+
 import jax
 import jax.numpy as jnp
 from typing import Tuple
 
 import jcm.constants as c
+from jcm.forcing import land_snow_cover
+from jcm.physics.surface.echam.albedo import CTFREEZ
+from jcm.physics.surface.echam.ocean import compute_ocean_roughness
+from jcm.physics.thermodynamics import (
+    saturation_specific_humidity,
+    saturation_specific_humidity_and_derivative,
+)
+from jcm.physics.thermodynamics import jsbach_surface_humidity_boundary
 from .vertical_diffusion_types import (
-    VDiffState, VDiffParameters, VDiffTendencies, VDiffDiagnostics
+    VDiffState, VDiffParameters, VDiffTendencies, VDiffDiagnostics,
+    LandBalanceInputs, SurfaceTiles, InterfaceConductances,
 )
-from .turbulence_coefficients import (
-    compute_richardson_number, compute_mixing_length, compute_exchange_coefficients,
-    compute_turbulence_diagnostics, mixed_layer_level
-)
-from .matrix_solver import vertical_diffusion_step
-from .tke_budget import (
-    compute_tke_exchange_coefficient,
-    compute_tke_diagnostics,
-    echam_tke_source_update,
-)
+from .moist_buoyancy import interior_buoyancy_and_shear, richardson_number
+from .closure import interior_closure, surface_tke_boundary
+from .turbulence_coefficients import compute_turbulence_diagnostics, tile_effective_wind
+from .matrix_solver import _surface_air_density, vertical_diffusion_step
 
 
 @jax.jit
@@ -60,6 +66,16 @@ def compute_virtual_temperature(
     return temperature * (1.0 + 0.608 * qv)
 
 
+def _default_sublimation_fraction(like: jnp.ndarray) -> jnp.ndarray:
+    """Sublimating share per tile when none is given: the sea-ice tile only.
+
+    Tile index 1 is sea ice in the water/ice/land ordering this package
+    uses throughout; a single-tile state has no ice tile.
+    """
+    out = jnp.zeros_like(like)
+    return out.at[:, 1].set(1.0) if like.shape[1] > 1 else out
+
+
 @jax.jit
 def prepare_vertical_diffusion_state(
     u: jnp.ndarray,
@@ -68,6 +84,7 @@ def prepare_vertical_diffusion_state(
     qv: jnp.ndarray,
     qc: jnp.ndarray,
     qi: jnp.ndarray,
+    cloud_fraction: jnp.ndarray,
     pressure_full: jnp.ndarray,
     pressure_half: jnp.ndarray,
     geopotential: jnp.ndarray,
@@ -82,6 +99,11 @@ def prepare_vertical_diffusion_state(
     thv_variance: jnp.ndarray,
     roughness_heat: jnp.ndarray = None,
     surface_wetness: jnp.ndarray = None,
+    surface_sublimation_fraction: jnp.ndarray = None,
+    surface_cair: jnp.ndarray = None,
+    surface_csat: jnp.ndarray = None,
+    friction_velocity: jnp.ndarray = None,
+    coriolis: jnp.ndarray = None,
 ) -> VDiffState:
     """Prepare the vertical diffusion state from input variables.
 
@@ -92,6 +114,7 @@ def prepare_vertical_diffusion_state(
         qv: Water vapor mixing ratio [kg/kg] (ncol, nlev)
         qc: Cloud water mixing ratio [kg/kg] (ncol, nlev)
         qi: Cloud ice mixing ratio [kg/kg] (ncol, nlev)
+        cloud_fraction: Cloud cover [-] (ncol, nlev), ECHAM's ``paclc``
         pressure_full: Full level pressure [Pa] (ncol, nlev)
         pressure_half: Half level pressure [Pa] (ncol, nlev+1)
         geopotential: Geopotential [m²/s²] (ncol, nlev)
@@ -102,8 +125,10 @@ def prepare_vertical_diffusion_state(
         roughness_length: Momentum roughness z0m [m] (ncol, nsfc_type)
         ocean_u: Ocean u-velocity [m/s] (ncol,)
         ocean_v: Ocean v-velocity [m/s] (ncol,)
-        tke: Turbulent kinetic energy [m²/s²] (ncol, nlev)
-        thv_variance: Variance of theta_v [K²] (ncol, nlev)
+        tke: Turbulent kinetic energy of the interfaces [m²/s²] (ncol, nlev),
+            column ``k`` the interface below full level ``k``, the last the
+            surface layer (see :class:`VDiffState`).
+        thv_variance: Variance of theta_v [K²] (ncol, nlev), as ``tke``.
         roughness_heat: Heat roughness z0h [m] (ncol, nsfc_type). When
             ``None``, defaults to ``0.1·roughness_length`` — a standard
             ratio that's good enough for the original Businger-Dyer
@@ -114,6 +139,16 @@ def prepare_vertical_diffusion_state(
             every tile (open-water / saturated-leaf assumption); the
             ECHAM-Louis scheme uses this to scale land latent flux from
             the JSBACH-equivalent ``cair``.
+        surface_sublimation_fraction: Fraction of each tile's potential
+            evaporation that sublimates (ncol, nsfc_type), see
+            :class:`VDiffState`. When ``None``: 1 for the sea-ice tile
+            (index 1 of the water/ice/land ordering) and 0 elsewhere.
+        surface_cair, surface_csat: JSBACH's humidity factors per tile
+            (ncol, nsfc_type), see :class:`VDiffState`. ``None``: both
+            ``surface_wetness``.
+        friction_velocity: Previous step's grid-mean u* [m/s] (ncol,), see
+            :class:`VDiffState`.
+        coriolis: Coriolis parameter [1/s] (ncol,), see :class:`VDiffState`.
 
     Returns:
         Complete vertical diffusion state
@@ -124,13 +159,17 @@ def prepare_vertical_diffusion_state(
     dp = jnp.diff(pressure_half, axis=1)  # This gives p[k+1] - p[k], which is positive
     air_mass = dp / c.grav
 
-    # Approximate dry air mass (could be more sophisticated)
-    dry_air_mass = air_mass * (1.0 - qv)
-
     if roughness_heat is None:
         roughness_heat = 0.1 * roughness_length
     if surface_wetness is None:
         surface_wetness = jnp.ones_like(roughness_length)
+    if surface_sublimation_fraction is None:
+        surface_sublimation_fraction = _default_sublimation_fraction(
+            roughness_length)
+    if surface_cair is None:
+        surface_cair = surface_wetness
+    if surface_csat is None:
+        surface_csat = surface_wetness
 
     return VDiffState(
         u=u,
@@ -139,11 +178,11 @@ def prepare_vertical_diffusion_state(
         qv=qv,
         qc=qc,
         qi=qi,
+        cloud_fraction=cloud_fraction,
         pressure_full=pressure_full,
         pressure_half=pressure_half,
         geopotential=geopotential,
         air_mass=air_mass,
-        dry_air_mass=dry_air_mass,
         surface_temperature=surface_temperature,
         surface_fraction=surface_fraction,
         roughness_length=roughness_length,
@@ -154,159 +193,273 @@ def prepare_vertical_diffusion_state(
         tke=tke,
         thv_variance=thv_variance,
         ocean_u=ocean_u,
-        ocean_v=ocean_v
+        ocean_v=ocean_v,
+        surface_sublimation_fraction=surface_sublimation_fraction,
+        surface_cair=surface_cair,
+        surface_csat=surface_csat,
+        friction_velocity=friction_velocity,
+        coriolis=coriolis,
     )
 
 
-@jax.jit
+@functools.partial(jax.jit, static_argnames=("couple_surface",))
 def vertical_diffusion_column(
     state: VDiffState,
     params: VDiffParameters,
-    dt: float
+    dt: float,
+    couple_surface: bool = True,
+    land: LandBalanceInputs = None,
 ) -> Tuple[VDiffTendencies, VDiffDiagnostics]:
     """Compute vertical diffusion for a single column.
-    
+
+    By default the implicit solve carries the ECHAM surface exchange: the
+    per-tile exchange velocities are computed *before* the matrix step;
+    momentum couples through the fraction-weighted Robin bottom row, heat and
+    moisture tile by tile through ECHAM's Richtmyer–Morton relations
+    (:func:`~.matrix_solver.couple_surface_tiles`), and the delivered surface
+    fluxes are diagnosed from the implicit solution (reported == delivered by
+    construction — ECHAM's ``pev_vdiff`` identity). With ``land`` given, the
+    land tile's skin temperature is solved with the lowest level instead of
+    prescribed. Set ``couple_surface=False`` to run the interior-only
+    operator with zero-flux (insulating, free-slip) boundaries — used by the
+    forced-flux mode and by tests that pin the interior diffusion.
+
     Args:
         state: Vertical diffusion state
         params: Vertical diffusion parameters
         dt: Time step [s]
-        
+        couple_surface: Static flag — include the surface coupling (default).
+        land: Inputs of the land skin energy balance, or ``None`` for a
+            prescribed land temperature. Its ``saturation_slope`` is filled
+            here, at the surface pressure the tiles' saturation uses.
+
     Returns:
         Tuple of (tendencies, diagnostics)
 
     """
-    # Compute turbulence coefficients
-    ri = compute_richardson_number(
-        state.u, state.v, state.temperature,
-        state.height_full, state.height_half
-    )
-    
-    # Estimate boundary layer height (initial guess)
-    pbl_height_guess = jnp.full(state.u.shape[0], 1000.0)
-    
-    mixing_length = compute_mixing_length(
-        state.height_full, state.height_half, ri, pbl_height_guess
-    )
-    
-    exchange_coeff_momentum, exchange_coeff_heat, exchange_coeff_moisture = (
-        compute_exchange_coefficients(state, params, mixing_length, ri)
-    )
-    
-    # === ECHAM split-update for TKE ============================================
-    # Match the ECHAM ``vdiff.f90`` formulation:
-    #   1. Apply the source/sink (shear production, buoyancy production,
-    #      dissipation) ANALYTICALLY via the implicit ``sqrt(zktest)-1``
-    #      formula — see ``echam_tke_source_update``. This step is
-    #      unconditionally non-negative and bounded by the production /
-    #      dissipation equilibrium, so it cannot blow up regardless of
-    #      input.
-    #   2. Use that post-source TKE as the matrix-solver input and let
-    #      the matrix do ONLY the vertical-transport implicit step.
-    #
-    # The previous JCM design instead added the source tendency as a
-    # forward-Euler increment on top of the matrix tendency. That
-    # explicit step has no stability bound — combined with the cross-
-    # step ``prev_physics_data`` cache in averaged mode, a single ill-
-    # conditioned column ran TKE to ~10¹⁸ in four steps. ECHAM has
-    # avoided this for decades by doing the source step analytically.
-    # ===========================================================================
+    ncol, nlev = state.u.shape
+    # One moist, cloud-weighted interior buoyancy and squared shear per
+    # interface, as ECHAM forms them (``zbuoy``/``zshear``, vdiff.f90
+    # l.777-799): the Richardson number and the TKE source of the closure both
+    # read these two arrays.
+    buoyancy, shear = interior_buoyancy_and_shear(state)
+    ri = richardson_number(buoyancy, shear)
 
-    # Step 1: analytic implicit source/sink update on a per-cell basis.
-    shear_sq = _column_shear_squared(state.u, state.v, state.height_full)
-    buoy_n2 = _column_buoyancy_freq_squared(
-        state.temperature, state.height_full,
-    )
-    post_source_tke = echam_tke_source_update(
-        prev_tke=state.tke,
-        shear_squared=shear_sq,
-        buoy_freq_squared=buoy_n2,
-        mixing_length=mixing_length,
-        dt=dt,
-    )
+    # ECHAM's ``ustarm`` is the previous step's u*; with none (a cold start, or
+    # a caller without a carry) it is ECHAM's ``lstart`` value of 1 m/s.
+    u_star_prev = state.friction_velocity
+    if u_star_prev is None:
+        u_star_prev = jnp.ones(ncol, state.u.dtype)
+    u_star_prev = jnp.where(u_star_prev > 0.0, u_star_prev, 1.0)
+    coriolis = (jnp.zeros(ncol, state.u.dtype) if state.coriolis is None
+                else state.coriolis)
 
-    # Step 2: matrix solver for vertical transport, with the post-source
-    # TKE as input. Build a shallow-copied state so we don't mutate the
-    # caller-owned ``state`` and so other variables still see the original
-    # ``state.tke`` for their own coupling (if any).
-    state_for_solver = state._replace(tke=post_source_tke)
-
-    tke_exchange_coeff = compute_tke_exchange_coefficient(
-        post_source_tke, mixing_length,
+    # === ECHAM's closure of the interior interfaces (vdiff.f90 l.730-860) ===
+    # PBL extension, mixing length, Louis stability functions, the implicit
+    # TKE source and the θ_v-variance budget, and the exchange coefficients of
+    # every interior interface. The closure is vertical-on-axis-0; this
+    # column's arrays are (ncol, nlev), so they are transposed in and out.
+    closure = interior_closure(
+        temperature=state.temperature.T, qv=state.qv.T, qc=state.qc.T, qi=state.qi.T,
+        pressure_full=state.pressure_full.T, pressure_half=state.pressure_half.T,
+        geopotential=state.geopotential.T, buoyancy=buoyancy.T, shear=shear.T,
+        ri=ri.T, prev_tke=state.tke.T[:-1], prev_thv_variance=state.thv_variance.T[:-1],
+        friction_velocity=u_star_prev, coriolis=coriolis, dt=dt, params=params,
     )
+    zero_row = jnp.zeros((ncol, 1), state.u.dtype)
+    km = jnp.concatenate([closure.km.T, zero_row], axis=1)
+    kh = jnp.concatenate([closure.kh.T, zero_row], axis=1)
 
-    # Diagnostics still use the old per-source decomposition for now —
-    # they're informational, not on the integration path.
-    tke_shear_prod, tke_buoyancy_prod, tke_dissipation, _ = (
-        compute_tke_diagnostics(
-            state_for_solver, params,
-            exchange_coeff_momentum, exchange_coeff_heat, mixing_length,
-        )
-    )
-
+    # Per-tile exchange velocities, computed BEFORE the matrix step so they
+    # serve as the implicit solve's surface boundary condition and as the
+    # surface layer's TKE boundary condition below.
     diagnostics = compute_turbulence_diagnostics(
-        state_for_solver, params, exchange_coeff_momentum,
-        exchange_coeff_heat, exchange_coeff_moisture,
+        state, params, km, kh, kh,
+        boundary_layer_height=closure.pbl.geopotential / c.grav,
+        richardson_number=ri, mixing_length=closure.mixing_length.T,
     )
 
-    # The matrix solver returns ``tke_tendency = (matrix_tke_new -
-    # state_for_solver.tke) / dt``. Since the caller computes
-    # ``new_tke = state.tke + dt * tke_tendency`` against the *original*
-    # (raw, pre-source) ``state.tke``, we rewrite ``tke_tendency`` to be
-    # in those reference units before returning so the caller's formula
-    # recovers ``matrix_tke_new`` directly. Equivalent rewrite:
-    #   new_tke_tend = (matrix_tke_new - state.tke) / dt
-    #                = ((post_source_tke + dt * transport_tend) - state.tke) / dt
-    #                = (post_source_tke - state.tke) / dt + transport_tend
-    tendencies = vertical_diffusion_step(
-        state_for_solver, params,
-        exchange_coeff_momentum, exchange_coeff_heat, exchange_coeff_moisture,
-        dt, tke_exchange_coeff,
+    # === The surface layer's row of TKE and θ_v variance ====================
+    # ECHAM's surface tiles supply the lowest interface's TKE (Mailhot-Benoit,
+    # from u*, the convective velocity scale and zghabl) and its transport
+    # coefficients, the box-averaged momentum and heat exchange ``cdum`` and
+    # ``cduh`` (vdiff.f90 l.1099-1102); the variance's surface row is that of
+    # the lowest interior interface (l.865).
+    frac = state.surface_fraction
+    rho_s = _surface_air_density(state)
+    # Per-tile effective wind (jax-gcm#915): water/ice relative to the ocean
+    # current, land absolute — the SAME wind the per-tile exchange
+    # coefficients above were built from
+    # (``turbulence_coefficients.tile_effective_wind``), not the box's
+    # absolute lowest-level wind, since ECHAM's own precalc_ocean/_ice
+    # surface-TKE source (``mo_surface_ocean.f90`` l.387-388, 422-457) uses
+    # that tile's own (current-relative, for water/ice) ``u*²``.
+    u_tile_eff, v_tile_eff = tile_effective_wind(state)
+    wind_speed_tile_eff = jnp.sqrt(jnp.maximum(
+        u_tile_eff ** 2 + v_tile_eff ** 2, 1.0e-30))
+    tke_surface = surface_tke_boundary(
+        momentum_exchange=diagnostics.surface_exchange_momentum,
+        heat_exchange=diagnostics.surface_exchange_heat,
+        wind_speed=wind_speed_tile_eff,
+        thv_surface=_tile_virtual_potential_temperature(state),
+        thv_air=_lowest_virtual_potential_temperature(state),
+        fraction=frac,
+        pbl_geopotential=closure.pbl.geopotential,
+        lowest_geopotential=closure.geopotential_above_surface[-1],
+        params=params,
     )
+    g_rho = c.grav * rho_s
+    conductances = InterfaceConductances(
+        momentum=closure.conductance_momentum.T,
+        heat=closure.conductance_heat.T,
+        tke=jnp.concatenate(
+            [closure.conductance_tke.T,
+             (g_rho * jnp.sum(frac * diagnostics.surface_exchange_momentum, axis=1))[:, None]],
+            axis=1),
+        thv=jnp.concatenate(
+            [closure.conductance_thv.T,
+             (g_rho * jnp.sum(frac * diagnostics.surface_exchange_heat, axis=1))[:, None]],
+            axis=1),
+    )
+    post_source_tke = jnp.concatenate([closure.tke.T, tke_surface[:, None]], axis=1)
+    post_source_thv_var = jnp.concatenate(
+        [closure.thv_variance.T, closure.thv_variance.T[:, -1:]], axis=1)
+
+    # The matrix solve transports the post-source TKE and variance (ECHAM's
+    # split: the source step is implicit and analytic, the transport a separate
+    # implicit solve, l.1235-1300). A shallow copy keeps the caller's state.
+    state_for_solver = state._replace(
+        tke=post_source_tke, thv_variance=post_source_thv_var,
+    )
+
+    if couple_surface:
+        # === Surface coupling =================================================
+        # Momentum: one fraction-weighted drag against the surface current,
+        # ECHAM's box-averaged ``cdum`` (mo_surface.f90:1205-1219).
+        # Heat and moisture: tile by tile (richtmyer_land/_ocean/_ice and
+        # blend_zq_zt, see couple_surface_tiles). Each tile's moisture flux is
+        # ρ·C·(csat·q_s − cair·q̂_K): cair = csat = 1 over water and ice, the
+        # JSBACH factors over land. The surface saturation is ECHAM's ``ua``
+        # table (Sonntag over ice at and below tmelt, over water above).
+        # =====================================================================
+        frac = state.surface_fraction
+        c_mom = jnp.sum(frac * diagnostics.surface_exchange_momentum, axis=1)
+        # The bottom-row momentum Robin target is the ocean current scaled by
+        # the NON-LAND fraction (water + sea ice), not by the water fraction
+        # alone: ECHAM's own box-averaged momentum row forms its RHS exactly
+        # this way, ``zudif(jl,klev) = tpfac2·(pum1(jl,klev) −
+        # pocu(jl)·(1−pfrl(jl)))`` (vdiff.f90 l.1355-1358, ``pfrl`` = land
+        # fraction) — ECHAM has no separate sea-ice drift velocity in this
+        # routine, so the one current it is given (``pocu``/``pocv``) is
+        # applied over the whole non-land area. The ROW's structure needs no
+        # change for this: ``c_mom`` is still the one fraction-weighted
+        # coefficient ECHAM's ``cdum`` is (``mo_surface.f90:1205-1219``),
+        # and only the (1 − land_fraction) scaling of the Robin target is
+        # new here. What DOES need restructuring is ``c_mom``'s own INPUT:
+        # ECHAM's ``precalc_ocean``/``precalc_ice`` build the water/ice
+        # tiles' own Richardson number and exchange coefficients from the
+        # CURRENT-RELATIVE wind, not the box's absolute one (both routines
+        # are called with ``ocean_u``/``ocean_v``; ``precalc_land`` is not)
+        # -- see ``turbulence_coefficients.tile_effective_wind``, which
+        # feeds ``diagnostics.surface_exchange_momentum`` above. So the
+        # water and sea-ice tiles' own contribution to ``c_mom`` is itself
+        # current-dependent; only land's is not (jax-gcm#915).
+        # ``frac[:, 2]`` would be wrong for a single-tile (water-only) test
+        # column: JAX clamps an out-of-bounds static index to the last axis
+        # position rather than raising, so with ``nsfc_type == 1`` that
+        # would silently read the water tile's OWN fraction (1.0) as "land"
+        # and zero the current entirely (Codex review). Land is tile index
+        # 2 of the water/ice/land ordering only when it exists.
+        land_fraction = frac[:, 2] if frac.shape[1] >= 3 else jnp.zeros_like(frac[:, 0])
+        non_land_fraction = 1.0 - land_fraction
+        surface_momentum = (c_mom,
+                            state.ocean_u * non_land_fraction,
+                            state.ocean_v * non_land_fraction)
+        cair = state.surface_cair if state.surface_cair is not None else state.surface_wetness
+        csat = state.surface_csat if state.surface_csat is not None else state.surface_wetness
+        sub = state.surface_sublimation_fraction
+        if sub is None:
+            sub = _default_sublimation_fraction(frac)
+        p_sfc = state.pressure_half[:, -1]
+        qsat_tiles = saturation_specific_humidity(
+            state.surface_temperature, p_sfc[:, None],
+        )
+        if land is not None:
+            _, dqs = saturation_specific_humidity_and_derivative(
+                land.temperature, p_sfc)
+            land = land._replace(saturation_slope=dqs)
+        surface_tiles = SurfaceTiles(
+            fraction=frac,
+            exchange_heat=diagnostics.surface_exchange_heat,
+            exchange_moisture=diagnostics.surface_exchange_moisture,
+            cair=jnp.clip(cair, 0.0, 1.0),
+            csat=jnp.clip(csat, 0.0, 1.0),
+            temperature=state.surface_temperature,
+            saturation_humidity=qsat_tiles,
+            sublimation_fraction=sub,
+            land=land,
+        )
+    else:
+        surface_momentum = None
+        surface_tiles = None
+
+    tendencies, surface_fluxes, land_balance = vertical_diffusion_step(
+        state_for_solver, params, conductances, dt,
+        surface_momentum=surface_momentum, surface_tiles=surface_tiles,
+    )
+    # The solver's TKE and variance tendencies are relative to the post-source
+    # values it transported; the caller advances the carried (pre-source)
+    # values, so both are rebased onto them:
+    #   (X_new − X_carried)/dt = (X_post − X_carried)/dt + transport tendency.
     tke_tend_rebased = (
         tendencies.tke_tendency + (post_source_tke - state.tke) / dt
     )
-    tendencies = tendencies._replace(tke_tendency=tke_tend_rebased)
+    # ECHAM sets the variance's surface row to the solved row above it
+    # (l.1292), so the surface row's tendency carries it there.
+    thv_var_new = post_source_thv_var + dt * tendencies.thv_var_tendency
+    thv_var_new = thv_var_new.at[:, -1].set(thv_var_new[:, -2])
+    thv_var_tend_rebased = (thv_var_new - state.thv_variance) / dt
+    tendencies = tendencies._replace(
+        tke_tendency=tke_tend_rebased,
+        thv_var_tendency=thv_var_tend_rebased,
+    )
+    # Kinetic energy the momentum diffusion removed, the heat ECHAM's ``zdis``
+    # returns to the temperature (l.1418-1432): -Δ(½|u|²) per unit mass,
+    # column-integrated as a rate [W/m²] (ECHAM's ``pvdis`` per step).
+    u_new = state.u + dt * tendencies.u_tendency
+    v_new = state.v + dt * tendencies.v_tendency
+    ke_loss = 0.5 * (state.u ** 2 + state.v ** 2 - u_new ** 2 - v_new ** 2)
+    diagnostics = diagnostics._replace(
+        surface_fluxes=surface_fluxes, land_balance=land_balance,
+        kinetic_energy_dissipation=jnp.sum(ke_loss * state.air_mass, axis=1) / dt)
 
     return tendencies, diagnostics
 
 
-# ----------------------------------------------------------------------
-# Helper: column-wise shear² and N², independent of K coefficients so
-# they can be fed into the ECHAM analytic TKE update.
-# ----------------------------------------------------------------------
+def _lowest_virtual_potential_temperature(state: VDiffState) -> jnp.ndarray:
+    """``ztvir1(klev)``: θ_v of the lowest level, condensate loading included [K]."""
+    t = state.temperature[:, -1]
+    theta = t * (c.p0 / state.pressure_full[:, -1]) ** (c.rd / c.cpd)
+    return theta * (1.0 + c.vtmpc1 * state.qv[:, -1]
+                    - (state.qc[:, -1] + state.qi[:, -1]))
 
-@jax.jit
-def _column_shear_squared(u: jnp.ndarray, v: jnp.ndarray,
-                          height_full: jnp.ndarray) -> jnp.ndarray:
-    """(du/dz)² + (dv/dz)² on full levels [1/s²].
 
-    Vertical differences are between adjacent full levels; the top
-    level inherits the value just below (matches
-    ``compute_shear_production``'s padding convention).
+def _tile_virtual_potential_temperature(state: VDiffState) -> jnp.ndarray:
+    """θ_v of each tile's surface [K] (ncol, nsfc_type).
+
+    ECHAM's ``ztvw``/``ztvi``/``ztvl`` (``precalc_ocean``/``_ice``/``_land``):
+    the skin temperature referenced to 1000 hPa from the surface pressure, with
+    the tile's surface humidity ``csat·q_s + (1 − cair)·q_a`` (1 over water and
+    ice), the same boundary humidity the surface layer's Richardson number uses.
     """
-    dz = jnp.diff(height_full, axis=1)
-    # ``height_full`` decreases with index (level 0 = top), so dz < 0;
-    # squaring makes sign irrelevant.
-    du_dz = jnp.diff(u, axis=1) / dz
-    dv_dz = jnp.diff(v, axis=1) / dz
-    s2 = du_dz * du_dz + dv_dz * dv_dz
-    # Pad top: re-use the topmost interior gradient.
-    return jnp.concatenate([s2[:, :1], s2], axis=1)
-
-
-@jax.jit
-def _column_buoyancy_freq_squared(temperature: jnp.ndarray,
-                                  height_full: jnp.ndarray) -> jnp.ndarray:
-    """N² = (g/T) · (dθ/dz) approximated as (g/T) · (dT/dz + g/cp) [1/s²].
-
-    Positive when stably stratified (the warmer-above lapse). Matches
-    the sign convention used in ``compute_buoyancy_production``.
-    """
-    dz = jnp.diff(height_full, axis=1)
-    dT_dz = jnp.diff(temperature, axis=1) / dz
-    dT_dz_full = jnp.concatenate([dT_dz[:, :1], dT_dz], axis=1)
-    lapse = c.grav / c.cpd
-    return (c.grav / temperature) * (dT_dz_full + lapse)
+    p_sfc = state.pressure_half[:, -1:]
+    t_s = state.surface_temperature
+    cair = state.surface_cair if state.surface_cair is not None else state.surface_wetness
+    csat = state.surface_csat if state.surface_csat is not None else state.surface_wetness
+    q_s = jsbach_surface_humidity_boundary(
+        saturation_specific_humidity(t_s, p_sfc), state.qv[:, -1:],
+        jnp.clip(cair, 0.0, 1.0), jnp.clip(csat, 0.0, 1.0))
+    return t_s * (c.p0 / p_sfc) ** (c.rd / c.cpd) * (1.0 + c.vtmpc1 * q_s)
 
 
 @jax.jit
@@ -317,6 +470,7 @@ def vertical_diffusion_scheme(
     qv: jnp.ndarray,
     qc: jnp.ndarray,
     qi: jnp.ndarray,
+    cloud_fraction: jnp.ndarray,
     pressure_full: jnp.ndarray,
     pressure_half: jnp.ndarray,
     geopotential: jnp.ndarray,
@@ -341,6 +495,7 @@ def vertical_diffusion_scheme(
         qv: Water vapor mixing ratio [kg/kg] (ncol, nlev)
         qc: Cloud water mixing ratio [kg/kg] (ncol, nlev)
         qi: Cloud ice mixing ratio [kg/kg] (ncol, nlev)
+        cloud_fraction: Cloud cover [-] (ncol, nlev)
         pressure_full: Full level pressure [Pa] (ncol, nlev)
         pressure_half: Half level pressure [Pa] (ncol, nlev+1)
         geopotential: Geopotential [m²/s²] (ncol, nlev)
@@ -362,7 +517,7 @@ def vertical_diffusion_scheme(
     """
     # Prepare state
     state = prepare_vertical_diffusion_state(
-        u, v, temperature, qv, qc, qi,
+        u, v, temperature, qv, qc, qi, cloud_fraction,
         pressure_full, pressure_half, geopotential,
         height_full, height_half,
         surface_temperature, surface_fraction, roughness_length,
@@ -378,7 +533,7 @@ def vertical_diffusion_scheme(
 # Vectorized version for multiple columns
 vertical_diffusion_scheme_vectorized = jax.vmap(
     vertical_diffusion_scheme,
-    in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None),
+    in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None),
     out_axes=(0, 0)
 )
 
@@ -392,12 +547,53 @@ from typing import ClassVar  # noqa: E402
 from flax import nnx  # noqa: E402
 
 from jcm.forcing import ForcingData  # noqa: E402
+from jcm.physics.diagnostics.moist_air_state import advance_thermo_run  # noqa: E402
+from jcm.physics.radiation import SURFACE_OPTICS_KEY  # noqa: E402
+from jcm.physics.surface.echam import jsbach_land  # noqa: E402
+from jcm.physics.surface.echam.jsbach_land import JsbachLandParameters  # noqa: E402
 from jcm.physics.vertical_diffusion.tte_tke.vertical_diffusion_types import (  # noqa: E402
     VerticalDiffusionData,
 )
 from jcm.physics.physics_term import PhysicsTerm, TracerSpec  # noqa: E402
+from jcm.physics.coords_util import column_lat_lon  # noqa: E402
+from .closure import INITIAL_THV_SIGMA  # noqa: E402
 from jcm.physics_interface import PhysicsState, PhysicsTendency  # noqa: E402
 from jcm.terrain import TerrainData  # noqa: E402
+
+
+_LOGGER = logging.getLogger(__name__)
+_LOGGED_NO_SOILW_REL = False
+
+
+def _upper_layer_fill(forcing: ForcingData):
+    """Return the bare soil's upper-layer fill: ``soilw_rel``, else ``soilw_am``.
+
+    ``soilw_rel`` (ERA5 swvl1 over the field capacity of the 0-7 cm layer) is
+    the quantity ECHAM6.3's 5-layer soil gives ``calc_relative_humidity_upper``;
+    a bundle built before it existed carries only ``soilw_am``, which stands in
+    (the two agree within a few per cent in most land boxes). Logged once.
+    """
+    global _LOGGED_NO_SOILW_REL
+    if forcing.soilw_rel is not None:
+        return forcing.soilw_rel
+    if not _LOGGED_NO_SOILW_REL:
+        _LOGGER.warning(
+            "forcing has no soilw_rel (a bundle built before #787): the bare-soil "
+            "humidity of the ECHAM land tile uses soilw_am instead")
+        _LOGGED_NO_SOILW_REL = True
+    return forcing.soilw_am
+
+
+def forcing_land_temperature(forcing: ForcingData):
+    """Return the land skin temperature a fixed-land-temperature run holds [K].
+
+    A selected control-run skin-temperature archive takes precedence over
+    the legacy soil-temperature fallback. Deep soil and prognostic seeds
+    remain ``stl_am``.
+    """
+    if forcing.land_skin_temperature is not None:
+        return forcing.land_skin_temperature
+    return forcing.stl_am
 
 
 class TteTkeVerticalDiffusion(PhysicsTerm):
@@ -408,15 +604,41 @@ class TteTkeVerticalDiffusion(PhysicsTerm):
     the moist-air dict, surface temperature / roughness from the legacy
     ``"surface"`` key, sea-ice / land-temp / soil-water from forcing,
     ``fmask`` from terrain. Builds the 3-tile (water/ice/land) per-column
-    fractions, temperatures, roughness (water uses the Charnock-derived
-    heat roughness ``exp(2 - 86 z0^0.375)``), and surface wetness inline.
+    fractions, temperatures, roughness, and surface wetness inline. The
+    water tile's MOMENTUM roughness is itself Charnock-derived
+    (``z0 = cchar·u*²/g``, jax-gcm#1118, from the PREVIOUS step's water-tile
+    friction velocity — see the comment at the ``roughness`` assignment
+    below), and its HEAT roughness is then the ECHAM kB⁻¹ relationship
+    ``exp(2 - 86 z0^0.375)`` of that same (now wind-dependent) value; ice and
+    land stay fixed constants, matching ECHAM's own ``update_z0_ice``/land
+    treatment.
+
+    Owns the whole turbulent column, ECHAM-style: the per-tile exchange
+    velocities are computed before the implicit solve and enter it as the
+    bottom-row surface Robin boundary condition for u/v/T/qv, so the term's
+    tendencies carry the surface fluxes (drag, sensible/latent heat,
+    evaporation) as well as the interior mixing. The delivered fluxes are
+    diagnosed from the implicit solution (reported == delivered ==
+    column-integrated tendency, the ECHAM ``pev_vdiff`` identity) and
+    exported as ``surface_evaporation`` / ``surface_sensible_heat`` /
+    ``surface_latent_heat`` / ``surface_stress_u/v``, which the downstream
+    ``EchamSurface`` term republishes as the public ``"surface"`` fluxes.
+
+    The land tile is JSBACH's prescribed-moisture land (#979;
+    :mod:`jcm.physics.surface.echam.jsbach_land`): its moisture flux carries
+    JSBACH's humidity factors ``cair``/``csat``, and its skin temperature
+    (``surface.land_surface_temperature``, carried) is solved with the lowest
+    level from the land energy balance against the prescribed soil
+    temperature ``stl_am``. The term writes the land tile's balance and
+    factors onto the ``"surface"`` diagnostics.
 
     Reads the previous-step TKE from
     ``diagnostics["vertical_diffusion"].tke`` and writes the updated
-    TKE / km / kh / surface exchange coefs / PBL height /
-    friction_velocity back to the public ``"vertical_diffusion"`` key.
-    The 0.01 m²/s² TKE clamp matches ECHAM's lower bound; without it the
-    coefficient cascade diverges in the upper troposphere.
+    TKE / km / kh / surface exchange coefs / delivered surface fluxes /
+    PBL height / friction_velocity back to the public
+    ``"vertical_diffusion"`` key. TKE and the θ_v variance are floored at
+    ECHAM's ``ztkemin`` (``VDiffParameters.totte_min``, 1e-10), and the
+    exchange coefficients are ECHAM's, with no clip (:mod:`.closure`).
     """
 
     name: ClassVar[str] = "tte_tke_vertical_diffusion"
@@ -424,29 +646,164 @@ class TteTkeVerticalDiffusion(PhysicsTerm):
     # ``vertical_diffusion`` is read for the previous step's TKE — that
     # comes from prev_physics_data, not a same-step upstream term, so it
     # is intentionally not in ``requires``.
+    # ``clouds`` is the cloud cover that weights the saturated buoyancy of the
+    # interior stability and of the lowest level (ECHAM's ``paclc`` from
+    # ``cover``, diagnosed before ``vdiff`` within the step): required, so a
+    # stack without a cover term is rejected at composition instead of mixing
+    # every cloudy layer on its dry stability.
     requires: ClassVar[tuple[str, ...]] = (
         "pressure_full", "pressure_half",
         "height_full", "height_half",
-        "surface",
+        "surface", "clouds",
     )
-    # ``boundary_layer_height`` is also published as a plain top-level key, not
-    # only inside the ``vertical_diffusion`` struct. Convection schemes need the
-    # depth the turbulence mixes through to pick a source parcel -- ModelE's
-    # ``MSTCNV`` takes ``smixlev``/``dcl`` from its own turbulence scheme the same
-    # way -- and a term cannot reach inside another term's diagnostic struct.
-    # Without it the GISS scheme blends its source parcel over most of the
-    # troposphere and convects on 0.1% of columns instead of 27%.
-    provides: ClassVar[tuple[str, ...]] = (
-        "vertical_diffusion", "boundary_layer_height", "mixed_layer_top")
-    # The structural shape comes from the declarative slot; the TKE
-    # field gets a non-zero seed in :meth:`initial_carry_state` below.
+    provides: ClassVar[tuple[str, ...]] = ("vertical_diffusion", "surface")
+    # The structural shape comes from the declarative slot; TKE and the
+    # variance stay zero (a cold start), and :meth:`initial_carry_state` below
+    # seeds ``thv_sigma`` and the water tile's friction velocity.
     carry_slots: ClassVar[dict[str, type]] = {
         "vertical_diffusion": VerticalDiffusionData,
     }
+    # The fields kept on ECHAM's interfaces (``closure.py``) are saved on the
+    # ``level`` axis with one row per full level, the row of the interface
+    # below it; the lowest level's row is the surface layer's. Stated on the
+    # variables so a reader of the output does not take them for full-level
+    # values.
+    _INTERFACE_ROWS = (
+        "Saved on the full-level axis, one row per level: the value of the "
+        "interface below that level (between it and the level beneath, "
+        "towards the surface, as ECHAM keeps it). The lowest level's row "
+        "(index 0 of the surface-first output) is the surface layer's {}.")
+    output_attrs: ClassVar[dict[str, dict[str, str]]] = {
+        "vertical_diffusion.tke": {
+            "units": "m2 s-2",
+            "long_name": "turbulent kinetic energy on the interface below each level",
+            "comment": _INTERFACE_ROWS.format(
+                "TKE (Mailhot-Benoit, ECHAM's tkevn)"),
+        },
+        "vertical_diffusion.thv_variance": {
+            "units": "K2",
+            "long_name": ("variance of the virtual potential temperature on "
+                          "the interface below each level"),
+            "comment": _INTERFACE_ROWS.format(
+                "row, which repeats the lowest interior interface's value "
+                "(vdiff.f90 l.865)"),
+        },
+        "vertical_diffusion.km": {
+            "units": "m2 s-1",
+            "long_name": ("turbulent exchange coefficient of momentum on the "
+                          "interface below each level"),
+            "comment": _INTERFACE_ROWS.format(
+                "row, which is 0 (the surface exchange is "
+                "surface_exchange_momentum)"),
+        },
+        "vertical_diffusion.kh": {
+            "units": "m2 s-1",
+            "long_name": ("turbulent exchange coefficient of heat on the "
+                          "interface below each level"),
+            "comment": _INTERFACE_ROWS.format(
+                "row, which is 0 (the surface exchange is "
+                "surface_exchange_heat)"),
+        },
+        "vertical_diffusion.pbl_height": {
+            "units": "m",
+            "long_name": "boundary-layer extension height (ECHAM zghabl/g)",
+            "comment": (
+                "Height above the surface of the boundary-layer extension "
+                "level ihpbl: the higher of the dynamic height 0.3 u*/f and "
+                "the level below which the dry static energy exceeds its "
+                "surface value, capped at 50000 m2 s-2 of geopotential "
+                "(vdiff.f90 l.730-765). It is the depth over which the "
+                "Blackadar mixing length applies, not a diagnosed inversion "
+                "height; the TTE-TKE closure reads it as a level index."),
+        },
+        "vertical_diffusion.wind_10m_current_relative": {
+            "units": "m s-1",
+            "long_name": ("open-water 10 m wind speed relative to the ocean "
+                          "surface current"),
+            "comment": (
+                "Water-tile-only (ECHAM's wind10w, mo_surface_ocean.f90::"
+                "postproc_ocean): the water tile's 10 m reduction applied "
+                "to the current-relative lowest-level wind, "
+                "sqrt((u-ocean_u)**2 + (v-ocean_v)**2). Equals the water "
+                "entry of vertical_diffusion.wind_10m_tile when "
+                "ForcingData.ocean_u/ocean_v are None (jax-gcm#915)."),
+        },
+    }
+    # ``"radiation"`` feeds the JSBACH land energy balance's surface SW/LW
+    # down (#979); it is same-step fresh in the default ``echam_physics``
+    # order (the radiation term runs before this one), read via ``.get()``
+    # only so this term still composes without a radiation term (a
+    # vdiff-only unit-test harness) and degrades its land tile to zero
+    # radiative forcing rather than failing to build. ``SURFACE_OPTICS_KEY``
+    # (the boundary-conditions term's land albedo/emissivity) is likewise
+    # same-step fresh — ``EchamBoundaryConditions`` runs first in the
+    # composition — but optional, with a computed fallback below when
+    # absent (jax-gcm#673).
+    optional_requires: ClassVar[tuple[str, ...]] = (
+        "radiation", SURFACE_OPTICS_KEY,
+    )
 
-    def __init__(self, params: VDiffParameters | None = None):
-        """Hold the scheme-native :class:`VDiffParameters`."""
-        self.params = nnx.Param(params or VDiffParameters.default())
+    def __init__(self, params: VDiffParameters | None = None,
+                 couple_surface: bool = True,
+                 land_params: JsbachLandParameters | None = None):
+        """Hold the scheme-native :class:`VDiffParameters`.
+
+        Args:
+            params: Scheme parameters (defaults to ECHAM values).
+            land_params: Constants of the JSBACH land tile
+                (:class:`~jcm.physics.surface.echam.jsbach_land.JsbachLandParameters`),
+                differentiable leaves.
+            couple_surface: Static flag forwarded to
+                :func:`vertical_diffusion_column`. ``True`` (default): the
+                implicit solve carries the surface exchange as its
+                bottom-row Robin BC and the delivered fluxes are diagnosed
+                from the solution. ``False``: interior-only diffusion with
+                insulating / free-slip bottom boundaries — the forced
+                surface mode (jax-gcm#301), where a downstream
+                :class:`~jcm.physics.surface.prescribed_flux.
+                PrescribedSurfaceFlux` term delivers externally prescribed
+                fluxes explicitly instead (the exact replacement seam: the
+                solve's surface coupling is OFF, so no double counting).
+
+        """
+        params = params or VDiffParameters.default()
+        params.validate()
+        self.params = nnx.Param(params)
+        self.couple_surface = couple_surface
+        self.land_params = nnx.Param(land_params or JsbachLandParameters.default())
+        jsbach_land.check_land_temperature_mode(self.land_params.get_value())
+
+    def consumed_forcing_fields(self) -> tuple[str, ...]:
+        """Declare the forcing fields this term reads, so a supplied one is never ignored.
+
+        ``ocean_u``/``ocean_v`` are declared unconditionally (jax-gcm#915):
+        unlike the forced-mode ``prescribed_*`` fields (mode-gated — only a
+        ``prescribed_fluxes=True``/``PrescribedSurfaceFlux`` configuration
+        reads them), this term reads ``forcing.ocean_u/v`` on every call,
+        treating ``None`` as a zero current, so whenever it is composed a
+        supplied current is consumed (see :func:`check_ocean_current_consumers`).
+        ``land_skin_temperature`` is declared only when the land boundary
+        actually consumes it — a surface-coupled term with
+        ``land_temperature='prescribed'`` — because a prognostic land run
+        must not advertise a skin archive it would ignore.
+        """
+        fields = ["ocean_u", "ocean_v"]
+        if (self.couple_surface and jsbach_land.check_land_temperature_mode(
+                self.land_params.get_value()) == "prescribed"):
+            fields.append("land_skin_temperature")
+        return tuple(fields)
+
+    def validate_forcing(self, forcing: ForcingData, run_window=None) -> None:
+        """Reject ignored skin archives and check their dated coverage."""
+        if forcing is None or forcing.land_skin_temperature is None:
+            return
+        if jsbach_land.check_land_temperature_mode(self.land_params.get_value()) != "prescribed":
+            raise ValueError(
+                "land_skin_temperature requires land_temperature='prescribed'; "
+                "a prognostic land run must not receive a prescribed skin archive.")
+        from jcm.forcing import check_forcing_coverage
+        check_forcing_coverage(forcing, run_window, fields=("land_skin_temperature",),
+                               owner=type(self).__name__)
 
     @classmethod
     def required_tracers(cls) -> tuple[TracerSpec, ...]:
@@ -456,21 +813,41 @@ class TteTkeVerticalDiffusion(PhysicsTerm):
             TracerSpec("qi", units="kg/kg"),
         )
 
-    def initial_carry_state(self, coords) -> dict:
-        """Seed the previous-step TKE at the ECHAM floor (0.01 m²/s²).
+    def cache_coords(self, coords) -> None:
+        """Cache the Coriolis parameter ``f = 2Ω·sin(φ)`` of every column.
 
-        ``compute_mixing_length`` and the TKE budget update use the
-        carried TKE on every step. Starting from zero would let the
-        first step's diffusion coefficients fall to floor everywhere
-        and overshoot once turbulence reactivates. Setting the seed at
-        the ECHAM lower bound matches the in-loop clamp and gives the
-        spin-up step a starting reservoir that the analytic source
-        update can build on.
+        ECHAM's ``coriol_2d``, which sets the dynamic PBL height ``0.3·u*/f``
+        (``vdiff.f90`` l.738-739). A term whose coordinates were never cached
+        (a bare unit-test composition) treats every column as equatorial,
+        where ECHAM's ``zepcor`` floor applies.
+        """
+        lat, _ = column_lat_lon(coords.horizontal)
+        self._coriolis = nnx.Variable(2.0 * c.omega * jnp.sin(lat))
+
+    def initial_carry_state(self, coords) -> dict:
+        """Seed the carry as a cold start of ECHAM's vertical diffusion.
+
+        TKE and the θ_v variance stay zero: the closure reads a carried 0 as
+        an interface with no previous step and starts it as ECHAM does
+        (``ioinitial.f90`` l.418-420 and the ``lstart`` branch of
+        ``vdiff.f90`` l.845-847; see :func:`.closure.interior_closure`). The
+        grid-mean ``u*`` likewise stays zero, which the column reads as
+        ECHAM's ``lstart`` value of 1 m/s. ``thv_sigma``, which convection
+        reads before this term has run once, starts at ECHAM's ``thvsig =
+        1e-2`` K (l.421).
         """
         carry = super().initial_carry_state(coords)
         nlev, ncols = carry["vertical_diffusion"].tke.shape
+        params = self.params.get_value()
+        # Water-tile friction velocity, seeded so step 0's Charnock roughness
+        # (jax-gcm#1118) is the 1e-4 m of a moderate wind rather than ECHAM's
+        # floor (1.5e-5 m, ``Z0_OCEAN_MIN``) from an unseeded zero. The
+        # ice/land tiles of this array are never read (only ``[:, 0]`` is),
+        # so a uniform seed is fine.
+        u_star_seed = jnp.sqrt(1.0e-4 * c.grav / params.cchar)
         carry["vertical_diffusion"] = carry["vertical_diffusion"].copy(
-            tke=jnp.full((nlev, ncols), 0.01),
+            thv_sigma=jnp.full((ncols,), INITIAL_THV_SIGMA),
+            surface_friction_velocity_tile=jnp.full((ncols, 3), u_star_seed),
         )
         return carry
 
@@ -495,10 +872,13 @@ class TteTkeVerticalDiffusion(PhysicsTerm):
             "vertical_diffusion",
             VerticalDiffusionData.zeros((ncols,), nlev),
         )
-        tke = prev_vdiff.tke
-        if tke.ndim == 3:
-            tke = tke.reshape(nlev, ncols)
-        thv_variance = jnp.zeros((nlev, ncols))
+        # TKE and the θ_v variance of the interfaces, carried from the
+        # previous step (ECHAM keeps ``ptkem1`` and ``pthvvar`` in the restart
+        # file).
+        tke = prev_vdiff.tke.reshape(nlev, ncols)
+        thv_variance = prev_vdiff.thv_variance.reshape(nlev, ncols)
+        coriolis = getattr(self, "_coriolis", None)
+        coriolis = None if coriolis is None else coriolis.get_value()
 
         # Surface tile fractions: 0=water, 1=sea-ice, 2=land.
         nsfc_type = 3
@@ -513,42 +893,216 @@ class TteTkeVerticalDiffusion(PhysicsTerm):
         surface_fraction = surface_fraction.at[:, 2].set(land_fraction)
 
         # Per-tile surface temperature: SST for water, min(SST, ctfreez)
-        # for ice (saline freezing point, ECHAM iniphy.f90:71), stl_am
-        # for land.
+        # for ice (saline freezing point, ECHAM iniphy.f90:71), the land
+        # skin temperature for land.
         surface_in = diagnostics["surface"]
-        sst_col = surface_in.surface_temperature.reshape(ncols)
-        land_temp_col = forcing.stl_am.reshape(ncols)
-        ctfreez = 271.38
+        # Water-tile temperature straight from the SST FORCING, not the
+        # blended ``surface.surface_temperature`` — that is the
+        # tile-WEIGHTED T**4 mean EchamBoundaryConditions forms for
+        # radiation (#988), a single grid value that is never the right
+        # temperature for any one tile's own turbulent exchange (Codex
+        # review on #555, against the convention as it stood then: a
+        # majority-tile snap that would have exchanged the residual ocean
+        # fraction with the LAND temperature in mixed coastal cells).
+        # Same per-tile sources as EchamSurface.
+        sst_col = forcing.sea_surface_temperature.reshape(ncols)
+        stl_col = forcing.stl_am.reshape(ncols)
+        # The land skin temperature is prognostic (#979), carried in
+        # ``surface.land_surface_temperature`` and seeded from stl_am when
+        # unset (<= 0) by EchamBoundaryConditions; the same rule here keeps a
+        # composition without that term well defined. With
+        # ``land_temperature="prescribed"`` it is the forcing's, every step.
+        land_p = self.land_params.get_value()
+        prescribed_land = jsbach_land.check_land_temperature_mode(land_p) == "prescribed"
+        carried = getattr(surface_in, "land_surface_temperature", None)
+        if prescribed_land:
+            land_temp_col = forcing_land_temperature(forcing).reshape(ncols)
+        elif carried is None:
+            land_temp_col = stl_col
+        else:
+            carried = carried.reshape(ncols)
+            land_temp_col = jnp.where(carried > 0.0, carried, stl_col)
         ice_temp_col = jnp.where(
             sea_ice_fraction > 0.0,
-            jnp.minimum(sst_col, ctfreez),
+            jnp.minimum(sst_col, CTFREEZ),
             sst_col,
         )
         surface_temperature = jnp.stack(
             [sst_col, ice_temp_col, land_temp_col], axis=1,
         )
 
-        roughness_length_col = surface_in.roughness_length.reshape(ncols)
+        # The water tile's momentum roughness follows ECHAM's Charnock
+        # relation (``mo_surface_ocean.f90::update_z0_ocean``, jax-gcm#1118):
+        # z0 = cchar·u*²/g, floored at ECHAM's 1.5e-5 m
+        # (``ocean.py::compute_ocean_roughness``/``Z0_OCEAN_MIN``). ``u*`` is
+        # the PREVIOUS step's water-tile friction velocity
+        # (``prev_vdiff.surface_friction_velocity_tile[:, 0]``): this
+        # roughness is itself an INPUT to ``compute_exchange_coefficients``
+        # below, which is what produces THIS step's u* — so a same-step
+        # value is unavailable and the update is necessarily a one-step-
+        # lagged fixed point (see that carried field's docstring in
+        # ``vertical_diffusion_types.py`` for why this also matches the
+        # structural lag in ECHAM's own call sequence). ``cchar`` is the
+        # reintroduced differentiable ``VDiffParameters`` leaf.
+        prev_u_star_tile = jnp.asarray(
+            prev_vdiff.surface_friction_velocity_tile).reshape(ncols, nsfc_type)
+        z0_water_momentum = compute_ocean_roughness(prev_u_star_tile[:, 0], cchar=params.cchar)
+
+        # The land tile's own momentum roughness is an unconditional 1 cm
+        # constant, not ``surface_in.roughness_length``: that field is
+        # PUBLIC (``jcm.physics.diagnostics.aerocom`` reads it as the
+        # single grid-cell roughness for its 2 m-reduction diagnostic) and
+        # majority-tile-gated for that reason (Codex review on #988). This
+        # tile IS land whenever its fraction is nonzero, regardless of how
+        # EchamBoundaryConditions' public field happens to be gated, so it
+        # must not borrow that field -- doing so previously handed every
+        # coastal cell with land_fraction in (0, 0.5] the OCEAN value
+        # (1e-4 m) for its LAND tile, a 100x error with no ECHAM
+        # counterpart. The ice tile stays a fixed 1 mm constant: ECHAM's
+        # ``update_z0_ice`` (``mo_surface_ice.f90``) sets sea ice to a bare
+        # literal too, not a wind-dependent formula, so only the water tile
+        # becomes state-dependent here.
         roughness = jnp.stack([
-            jnp.full(ncols, 1e-4),
+            z0_water_momentum,
             jnp.full(ncols, 1e-3),
-            roughness_length_col,
+            jnp.full(ncols, 0.01),
         ], axis=1)
 
-        z0_water = jnp.exp(2.0 - 86.0 * roughness[:, 0] ** 0.375)
+        # Ocean heat roughness via the ECHAM kB⁻¹ relationship
+        # z0h = z0m·exp(2 − 86·z0m^0.375) (mo_surface_ocean). With z0m = 1e-4 m
+        # this gives z0h ≈ 4.9e-5 m, just below the momentum roughness. The
+        # ``z0m·`` prefactor is essential: the bare ``exp(2 − 86·z0m^0.375)``
+        # returns ≈0.49 m — an unphysically large ocean heat roughness (z0h ≫
+        # z0m) that corrupts the ECHAM-Louis neutral heat/moisture exchange.
+        z0_water = roughness[:, 0] * jnp.exp(2.0 - 86.0 * roughness[:, 0] ** 0.375)
         z0_ice = roughness[:, 1]
         z0_land = roughness[:, 2]
         roughness_heat = jnp.stack([z0_water, z0_ice, z0_land], axis=1)
 
-        soilw_col = jnp.clip(forcing.soilw_am.reshape(ncols), 0.0, 1.0)
-        surface_wetness = jnp.stack([
+        # Snow-covered share of the land: the prescribed ``snowc_am`` cover
+        # of the non-glacier land plus the glaciers, fully snow covered as
+        # JSBACH sets them (#672; convention on ``ForcingData``).
+        glac_col = (jnp.zeros(ncols) if forcing.glacier_fraction is None
+                    else forcing.glacier_fraction.reshape(ncols))
+        snowc_col = jnp.clip(forcing.snowc_am.reshape(ncols), 0.0, 1.0)
+        snow_col = land_snow_cover(snowc_col, glac_col)
+
+        # === Land tile: JSBACH's humidity factors (#979) ======================
+        # Prescribed-moisture land: soilw_am is the root-zone fill ws/wsmx the
+        # water-stress factor reads, soilw_rel (ERA5 swvl1 over its field
+        # capacity) the upper-layer fill ECHAM6.3's 5-layer soil gives the
+        # bare-soil humidity. Vegetated fraction = the forest fraction.
+        w_root = jnp.clip(forcing.soilw_am.reshape(ncols), 0.0, 1.0)
+        w_upper = jnp.clip(_upper_layer_fill(forcing).reshape(ncols), 0.0, 1.0)
+        veg_col = (jnp.zeros(ncols) if forcing.forest_fraction is None
+                   else jnp.clip(forcing.forest_fraction.reshape(ncols), 0.0, 1.0))
+        radiation = diagnostics.get("radiation")
+        optics = diagnostics.get(SURFACE_OPTICS_KEY)
+        zeros = jnp.zeros(ncols)
+        sw_down = zeros if radiation is None else radiation.surface_sw_down.reshape(ncols)
+        lw_down = zeros if radiation is None else radiation.surface_lw_down.reshape(ncols)
+        if optics is not None and "land_albedo" in optics:
+            land_albedo = optics["land_albedo"].reshape(ncols)
+            land_emissivity = optics["land_emissivity"].reshape(ncols)
+        else:
+            from jcm.physics.forcing.echam_boundary_conditions import (
+                SurfaceOpticsParameters,
+            )
+            land_albedo = jnp.clip(jnp.asarray(forcing.alb0).reshape(ncols), 0.0, 1.0)
+            land_emissivity = jnp.full(ncols, SurfaceOpticsParameters().land_emissivity)
+        # The held downward shortwave is absorbed through the albedo it was
+        # solved with: the radiation holds the land albedo of its last solve
+        # beside surface_sw_down/_up (ECHAM's JSBACH takes the radiation's net
+        # shortwave and moves its interactive albedo only at a radiation
+        # step), so a skin crossing the snow-albedo ramp between solves does
+        # not open the budget against the held upward shortwave. Unset (<= 0:
+        # a cold start, an older checkpoint, a radiation term that does not
+        # hold it) the current step's albedo is used.
+        solve_albedo = getattr(surface_in, "land_albedo_at_solve", None)
+        if solve_albedo is not None:
+            solve_albedo = solve_albedo.reshape(ncols)
+            land_albedo = jnp.where(solve_albedo > 0.0, solve_albedo, land_albedo)
+        land_sw_net = sw_down * (1.0 - land_albedo)
+        canopy_conductance = jsbach_land.unstressed_canopy_conductance(
+            land_p.leaf_area_index, land_p.par_fraction * land_sw_net, land_p)
+        # The canopy factor reads the land tile's exchange velocity C_h·|U|;
+        # like ECHAM's zchl it is the previous step's (ECHAM's factors are the
+        # ones update_soil formed at the end of the previous step, and this
+        # step's coefficients depend on them through the surface-layer
+        # humidity). A cold start has none: see below.
+        prev_exchange = jnp.asarray(prev_vdiff.surface_exchange_heat).reshape(ncols, nsfc_type)
+        p_sfc = pressure_half[-1].reshape(ncols)
+        q_sat_land = saturation_specific_humidity(land_temp_col, p_sfc)
+        bare_h = jsbach_land.bare_soil_relative_humidity(w_upper)
+        cair_land, csat_land, stress = jsbach_land.humidity_factors(
+            bare_h, w_root, snowc_col, glac_col, veg_col, canopy_conductance,
+            prev_exchange[:, 2], state.specific_humidity[-1].reshape(ncols), q_sat_land,
+            land_p)
+        # ECHAM starts the land without evaporation: a run that is not a
+        # restart sets zcair = zcsat = 0 (mo_surface.f90::init_surface), and
+        # update_soil forms the first factors at the end of that step. A carry
+        # without a land exchange velocity is that first step.
+        cold_start = prev_exchange[:, 2] <= 0.0
+        cair_land = jnp.where(cold_start, 0.0, cair_land)
+        csat_land = jnp.where(cold_start, 0.0, csat_land)
+        # The land constants are float64 leaves under x64; the land tile keeps
+        # the state's precision.
+        dtype = state.temperature.dtype
+        cair_land, csat_land, stress, bare_h, canopy_conductance = (
+            x.astype(dtype) for x in (cair_land, csat_land, stress, bare_h, canopy_conductance))
+        ones = jnp.ones(ncols, dtype)
+        surface_cair = jnp.stack([ones, ones, cair_land], axis=1)
+        surface_csat = jnp.stack([ones, ones, csat_land], axis=1)
+
+        # === Land tile: skin energy balance (#979) ============================
+        # Solved with the lowest level in the implicit solve whenever the
+        # surface is coupled and there is radiation to drive it; otherwise the
+        # land keeps the prescribed soil temperature.
+        land_inputs = None
+        if self.couple_surface and radiation is not None:
+            heat_capacity, conductance = (
+                x.astype(dtype) for x in jsbach_land.top_layer_thermal_properties(
+                    snowc_col, glac_col, land_p))
+            # Snow deeper than ECHAM's critical depth (the bundle's own
+            # snowc = SWE/60 mm), or any glacier, holds the skin at tmelt.
+            melt_capped = (glac_col > 0.0) | (
+                (1.0 - glac_col) * snowc_col * land_p.full_cover_snow_water_equivalent
+                > land_p.critical_snow_depth)
+            land_inputs = LandBalanceInputs(
+                temperature=land_temp_col,
+                soil_temperature=stl_col,
+                saturation_slope=zeros,   # filled by vertical_diffusion_column
+                net_shortwave=land_sw_net,
+                longwave_down=lw_down,
+                emissivity=land_emissivity,
+                heat_capacity=heat_capacity,
+                conductance=conductance,
+                melt_capped=melt_capped,
+                params=land_p,
+            )
+
+        # Share of each tile's potential evaporation that sublimates (sets
+        # the reported latent heat only): all of it over sea ice, the
+        # snow-covered part over land.
+        surface_sublimation_fraction = jnp.stack([
+            jnp.zeros(ncols),
             jnp.ones(ncols),
-            jnp.ones(ncols),
-            soilw_col,
+            snow_col,
         ], axis=1)
 
-        ocean_u = jnp.zeros(ncols)
-        ocean_v = jnp.zeros(ncols)
+        # Ocean surface current, fed back from a coupled ocean
+        # (``ForcingData.ocean_u/ocean_v``, jax-gcm#915; zero — a surface at
+        # rest — when the coupler/forcing leaves them unset). Consumed two
+        # ways downstream: raw, as the water-tile-only target of
+        # ``wind_10m_current_relative`` (``compute_turbulence_diagnostics``,
+        # ECHAM's ``wind10w``), and scaled by the non-land fraction as the
+        # momentum Robin row's surface target (``vertical_diffusion_column``,
+        # ECHAM's ``vdiff.f90`` l.1355-1358). See
+        # docs/source/design/surface_exchange.md.
+        ocean_u = (jnp.zeros(ncols) if forcing.ocean_u is None
+                  else forcing.ocean_u.reshape(ncols))
+        ocean_v = (jnp.zeros(ncols) if forcing.ocean_v is None
+                  else forcing.ocean_v.reshape(ncols))
 
         qc = state.tracers.get("qc", jnp.zeros_like(state.temperature))
         qi = state.tracers.get("qi", jnp.zeros_like(state.temperature))
@@ -560,6 +1114,7 @@ class TteTkeVerticalDiffusion(PhysicsTerm):
             qv=state.specific_humidity.T,
             qc=qc.T,
             qi=qi.T,
+            cloud_fraction=diagnostics["clouds"].cloud_fraction.T,
             pressure_full=pressure_full.T,
             pressure_half=pressure_half.T,
             geopotential=state.geopotential.T,
@@ -569,15 +1124,22 @@ class TteTkeVerticalDiffusion(PhysicsTerm):
             surface_fraction=surface_fraction,
             roughness_length=roughness,
             roughness_heat=roughness_heat,
-            surface_wetness=surface_wetness,
+            surface_wetness=surface_csat,
+            surface_sublimation_fraction=surface_sublimation_fraction,
+            surface_cair=surface_cair,
+            surface_csat=surface_csat,
             ocean_u=ocean_u,
             ocean_v=ocean_v,
             tke=tke.T,
             thv_variance=thv_variance.T,
+            friction_velocity=jnp.asarray(
+                prev_vdiff.surface_friction_velocity).reshape(ncols),
+            coriolis=coriolis,
         )
 
         vdiff_tendencies, vdiff_diagnostics = vertical_diffusion_column(
-            vdiff_state, params, dt,
+            vdiff_state, params, dt, couple_surface=self.couple_surface,
+            land=land_inputs,
         )
 
         u_tend = vdiff_tendencies.u_tendency.T
@@ -587,28 +1149,42 @@ class TteTkeVerticalDiffusion(PhysicsTerm):
         qc_tend = vdiff_tendencies.qc_tendency.T
         qi_tend = vdiff_tendencies.qi_tendency.T
         tke_tend = vdiff_tendencies.tke_tendency.T
+        thv_var_tend = vdiff_tendencies.thv_var_tendency.T
 
         km = vdiff_diagnostics.exchange_coeff_momentum.T
         kh = vdiff_diagnostics.exchange_coeff_heat.T
         pbl_height = vdiff_diagnostics.boundary_layer_height
         u_star = vdiff_diagnostics.friction_velocity
+        u_star_tile = vdiff_diagnostics.surface_friction_velocity_tile
+        wind_10m = vdiff_diagnostics.wind_10m
 
+        # Per-tile surface exchange velocities (CH·|U|, CE·|U|, CM·|U|, all
+        # m/s) from the configured surface-layer scheme. The momentum
+        # coefficient is now a real CM·|U| (Louis/Businger drag), not the
+        # interior diffusivity Km[lowest] (m²/s) it used to be tiled from —
+        # that mismatch made the surface-stress implicit-damping factor in the
+        # ``echam_surface`` term dimensionally wrong.
         surface_exchange_heat = vdiff_diagnostics.surface_exchange_heat
-        surface_exchange_moisture = (
-            vdiff_diagnostics.surface_exchange_moisture
-        )
-        surface_exchange_momentum = jnp.repeat(
-            vdiff_diagnostics.exchange_coeff_momentum[:, -1:],
-            nsfc_type, axis=1,
-        )
+        surface_exchange_moisture = vdiff_diagnostics.surface_exchange_moisture
+        surface_exchange_momentum = vdiff_diagnostics.surface_exchange_momentum
 
-        # ``tke`` here is the *post-source* TKE (the analytic ECHAM-style
-        # implicit update done in ``vertical_diffusion_column``);
-        # ``tke_tend`` is purely the matrix-solver transport tendency.
-        # The closed-form source step is unconditionally non-negative
-        # and bounded by the production/dissipation equilibrium, so the
-        # standard 0.01 m²/s² floor is the only safeguard needed here.
-        new_tke = jnp.maximum(tke + dt * tke_tend, 0.01)
+        # Delivered surface fluxes from the implicit surface-coupled solve
+        # (diagnosed from the implicit solution, §1.8 of the ECHAM map:
+        # reported == delivered == column-integrated tendency, exactly).
+        # ``EchamSurface`` republishes these as the public "surface" fluxes.
+        sfc_fluxes = vdiff_diagnostics.surface_fluxes
+
+        # ``tke_tend`` carries the source step and the implicit transport
+        # (``vertical_diffusion_column``). The transport of a non-negative
+        # field by the implicit solve stays non-negative, so ECHAM floors only
+        # the variance after it (ztkemin, vdiff.f90 l.1311) and aborts on a
+        # negative TKE (l.1313); the same floor on TKE here is the round-off
+        # guard that abort stands for.
+        new_tke = jnp.maximum(tke + dt * tke_tend, params.totte_min)
+        new_thv_var = jnp.maximum(thv_variance + dt * thv_var_tend, params.totte_min)
+        # pthvsig = SQRT(pthvvar(klev-1)) (vdiff.f90:1338): the lowest
+        # interior interface, row nlev-2 of the interface rows.
+        new_thv_sigma = jnp.sqrt(new_thv_var[-2])
 
         tendency = PhysicsTendency(
             u_wind=u_tend,
@@ -620,18 +1196,117 @@ class TteTkeVerticalDiffusion(PhysicsTerm):
 
         vdiff_out = prev_vdiff.copy(
             tke=new_tke,
+            thv_variance=new_thv_var,
+            thv_sigma=new_thv_sigma,
             km=km,
             kh=kh,
+            # Same-step moisture-tendency profile for the Tiedtke zdqpbl
+            # closure (ECHAM's pqte at cucall time; convection runs after
+            # this term in the ECHAM physc ordering).
+            qv_tendency=qv_tend,
             surface_exchange_heat=surface_exchange_heat,
             surface_exchange_moisture=surface_exchange_moisture,
             surface_exchange_momentum=surface_exchange_momentum,
             pbl_height=pbl_height,
             surface_friction_velocity=u_star,
+            surface_friction_velocity_tile=u_star_tile,
+            wind_10m=wind_10m,
+            wind_10m_u=vdiff_diagnostics.wind_10m_u,
+            wind_10m_v=vdiff_diagnostics.wind_10m_v,
+            wind_10m_reduction=vdiff_diagnostics.wind_10m_reduction,
+            wind_10m_tile=vdiff_diagnostics.wind_10m_tile,
+            wind_10m_u_tile=vdiff_diagnostics.wind_10m_u_tile,
+            wind_10m_v_tile=vdiff_diagnostics.wind_10m_v_tile,
+            wind_10m_current_relative=vdiff_diagnostics.wind_10m_current_relative,
+            surface_fraction=surface_fraction,
+            surface_evaporation=sfc_fluxes.evaporation,
+            surface_sensible_heat=sfc_fluxes.sensible_heat,
+            surface_latent_heat=sfc_fluxes.latent_heat,
+            surface_stress_u=sfc_fluxes.stress_u,
+            surface_stress_v=sfc_fluxes.stress_v,
         )
 
-        # `kh` here is (nlev, ncol) after the transpose above; the level helper
-        # wants (ncol, nlev) like the rest of the turbulence routines.
-        return tendency, {**diagnostics,
-                          "vertical_diffusion": vdiff_out,
-                          "boundary_layer_height": pbl_height,
-                          "mixed_layer_top": mixed_layer_level(kh.T)}
+        # Advance the running thermodynamic view so downstream terms
+        # (Tiedtke convection, then the cloud microphysics) see the
+        # post-vdiff (T, q) — ECHAM's ``physc`` runs vdiff before
+        # ``cucall``/``cloud`` and each sees the accumulated provisional
+        # state (ztp1 = ptm1 + ptte·dt). Same pattern as the convection
+        # wrapper; see ``advance_thermo_run`` for the operator-split
+        # tendency-ownership rules (nothing is zeroed here).
+        diagnostics = advance_thermo_run(
+            diagnostics,
+            dt,
+            d_temperature=temp_tend,
+            d_specific_humidity=qv_tend,
+            # Condensate view too: downstream cloud terms must see the
+            # DIFFUSED qc/qi, not the step-start tracers (Codex review).
+            d_qc=qc_tend,
+            d_qi=qi_tend,
+        )
+
+        # The land tile onto the public surface namespace. A prescribed land
+        # (forced fluxes, or no radiation) keeps stl_am and reports no balance.
+        lb = vdiff_diagnostics.land_balance
+        if lb is None:
+            balance = {name: zeros for name in (
+                "land_net_radiation", "land_sensible_heat_flux", "land_latent_heat_flux",
+                "ground_heat_flux", "snow_melt_heat_flux", "land_heat_storage",
+                "land_evaporation", "land_energy_residual")}
+            new_land_temperature = land_temp_col if prescribed_land else stl_col
+        else:
+            balance = dict(
+                land_net_radiation=lb.net_radiation,
+                land_sensible_heat_flux=lb.sensible_heat_flux,
+                land_latent_heat_flux=lb.latent_heat_flux,
+                ground_heat_flux=lb.ground_heat_flux,
+                snow_melt_heat_flux=lb.melt_heat_flux,
+                land_heat_storage=lb.heat_storage,
+                land_evaporation=lb.evaporation,
+                land_energy_residual=lb.energy_residual,
+            )
+            new_land_temperature = lb.temperature
+        surface_out = surface_in.copy(
+            land_surface_temperature=new_land_temperature,
+            cair=cair_land,
+            csat=csat_land,
+            water_stress_factor=stress,
+            bare_soil_humidity=bare_h,
+            canopy_conductance=canopy_conductance,
+            **balance,
+        )
+
+        return tendency, {**diagnostics, "vertical_diffusion": vdiff_out,
+                          "surface": surface_out}
+
+
+def check_ocean_current_consumers(physics, forcing) -> None:
+    """Reject a coupled ocean current that no composed term consumes (jax-gcm#915).
+
+    The ocean-current analogue of
+    :func:`jcm.physics.surface.prescribed_flux.check_prescribed_flux_consumers`:
+    a package with no ``TteTkeVerticalDiffusion`` (SPEEDY, Held-Suarez, or an
+    ECHAM composition that dropped the term) never reads
+    ``ForcingData.ocean_u/v``, so a current supplied to such a composition —
+    via ``forcing.ocean_current`` or a coupler setting the fields directly —
+    would be silently ignored. Consumers are found by the declared capability
+    (:meth:`TteTkeVerticalDiffusion.consumed_forcing_fields`, aggregated by
+    ``physics.consumed_forcing_fields()``), never by class name. Called from
+    :func:`jcm.physics.surface.prescribed_flux.validate_run_forcing`, the one
+    choke point every run entry point funnels through.
+    """
+    supplied = [name for name in ("ocean_u", "ocean_v")
+               if getattr(forcing, name, None) is not None]
+    if not supplied:
+        return
+    consumed_fn = getattr(physics, "consumed_forcing_fields", None)
+    consumed = set(consumed_fn()) if consumed_fn is not None else set()
+    if consumed.intersection(supplied):
+        return
+    raise ValueError(
+        "forcing.ocean_current is set (ForcingData carries "
+        f"{supplied}), but no term in the composed physics consumes an "
+        "ocean current: only the ECHAM TteTkeVerticalDiffusion term reads "
+        "ForcingData.ocean_u/v, so the run would silently ignore the "
+        "supplied current. Compose an ECHAM physics package (which includes "
+        "TteTkeVerticalDiffusion), or drop the ocean_current block / leave "
+        "ocean_u/v None. See docs/source/design/surface_exchange.md.")

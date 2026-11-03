@@ -1,3 +1,5 @@
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import tree_math
@@ -66,6 +68,8 @@ class SWRadiationData:
     ftop: Net downward flux of short-wave radiation at the top of the atmosphere
     dfabs: Flux of short-wave radiation absorbed in each atmospheric layer
     compute_shortwave: Flag to compute shortwave radiation
+    heating_rate: Cached shortwave temperature tendency [K/s] from the last radiation step,
+        re-applied on the steps in between (SPEEDY's tt_rsw)
     """
 
     qcloud: jnp.ndarray
@@ -83,6 +87,7 @@ class SWRadiationData:
     ftop: jnp.ndarray
     dfabs: jnp.ndarray
     compute_shortwave: jnp.bool
+    heating_rate: jnp.ndarray
     # SPEEDY's shortwave sub-stepping counter (every `nstrad` calls).
     # `set_physics_flags` reads it, computes ``compute_shortwave``, then
     # writes ``step+1`` back so the next step sees the advanced value.
@@ -91,7 +96,7 @@ class SWRadiationData:
     step: jnp.int32
 
     @classmethod
-    def zeros(cls, nodal_shape, num_levels, qcloud=None, fsol=None, rsds=None, rsns=None, ozone=None, ozupp=None, zenit=None, stratz=None, gse=None, icltop=None, cloudc=None, cloudstr=None, ftop=None, dfabs=None, compute_shortwave=None, step=None):
+    def zeros(cls, nodal_shape, num_levels, qcloud=None, fsol=None, rsds=None, rsns=None, ozone=None, ozupp=None, zenit=None, stratz=None, gse=None, icltop=None, cloudc=None, cloudstr=None, ftop=None, dfabs=None, compute_shortwave=None, step=None, heating_rate=None):
         return cls(
             qcloud = qcloud if qcloud is not None else jnp.zeros(nodal_shape),
             fsol = fsol if fsol is not None else jnp.zeros(nodal_shape),
@@ -109,10 +114,11 @@ class SWRadiationData:
             dfabs = dfabs if dfabs is not None else jnp.zeros((num_levels,)+nodal_shape),
             compute_shortwave = compute_shortwave if compute_shortwave is not None else False,
             step = step if step is not None else jnp.int32(0),
+            heating_rate = heating_rate if heating_rate is not None else jnp.zeros((num_levels,)+nodal_shape),
         )
 
     @classmethod
-    def ones(cls, nodal_shape, num_levels, qcloud=None, fsol=None, rsds=None, rsns=None, ozone=None, ozupp=None, zenit=None, stratz=None, gse=None, icltop=None, cloudc=None, cloudstr=None, ftop=None, dfabs=None, compute_shortwave=None, step=None):
+    def ones(cls, nodal_shape, num_levels, qcloud=None, fsol=None, rsds=None, rsns=None, ozone=None, ozupp=None, zenit=None, stratz=None, gse=None, icltop=None, cloudc=None, cloudstr=None, ftop=None, dfabs=None, compute_shortwave=None, step=None, heating_rate=None):
         return cls(
             qcloud = qcloud if qcloud is not None else jnp.ones(nodal_shape),
             fsol = fsol if fsol is not None else jnp.ones(nodal_shape),
@@ -130,9 +136,10 @@ class SWRadiationData:
             dfabs = dfabs if dfabs is not None else jnp.ones((num_levels,)+nodal_shape),
             compute_shortwave = compute_shortwave if compute_shortwave is not None else True,
             step = step if step is not None else jnp.int32(1),
+            heating_rate = heating_rate if heating_rate is not None else jnp.ones((num_levels,)+nodal_shape),
         )
 
-    def copy(self, qcloud=None, fsol=None, rsds=None, rsns=None, ozone=None, ozupp=None, zenit=None, stratz=None, gse=None, icltop=None, cloudc=None, cloudstr=None, ftop=None, dfabs=None, compute_shortwave=None, step=None):
+    def copy(self, qcloud=None, fsol=None, rsds=None, rsns=None, ozone=None, ozupp=None, zenit=None, stratz=None, gse=None, icltop=None, cloudc=None, cloudstr=None, ftop=None, dfabs=None, compute_shortwave=None, step=None, heating_rate=None):
         return SWRadiationData(
             qcloud=qcloud if qcloud is not None else self.qcloud,
             fsol=fsol if fsol is not None else self.fsol,
@@ -150,6 +157,7 @@ class SWRadiationData:
             dfabs=dfabs if dfabs is not None else self.dfabs,
             compute_shortwave=compute_shortwave if compute_shortwave is not None else self.compute_shortwave,
             step=step if step is not None else self.step,
+            heating_rate=heating_rate if heating_rate is not None else self.heating_rate,
         )
     
     def isnan(self):
@@ -169,25 +177,30 @@ class ModRadConData:
         albsfc: Combined surface albedo (land + sea)
         snowc: Effective snow cover (fraction)
         tau2: Transmissivity of atmospheric layers
+        emis2: Layer emissivity ``1 - tau2``, carried alongside ``tau2`` (not
+            derived from it) so speedy_longwave's ``emis = 1 - tau2`` reads a
+            non-cancelling ``-expm1(-optical_depth)`` instead of subtracting
+            from an already-rounded transmissivity near 1 (#571).
         st4a: Blackbody emission from full and half atmospheric levels
         stratc: Stratospheric correction term
         flux: Radiative flux in different spectral bands
 
     """
 
-    ablco2: float 
-    alb_l: jnp.ndarray  
-    alb_s: jnp.ndarray  
-    albsfc: jnp.ndarray 
-    snowc: jnp.ndarray  
+    ablco2: float
+    alb_l: jnp.ndarray
+    alb_s: jnp.ndarray
+    albsfc: jnp.ndarray
+    snowc: jnp.ndarray
     # Transmissivity and blackbody radiation (updated in radsw/radlw)
-    tau2: jnp.ndarray  
-    st4a: jnp.ndarray  
-    stratc: jnp.ndarray     
-    flux: jnp.ndarray         
+    tau2: jnp.ndarray
+    emis2: jnp.ndarray
+    st4a: jnp.ndarray
+    stratc: jnp.ndarray
+    flux: jnp.ndarray
 
     @classmethod
-    def zeros(cls, nodal_shape, num_levels, ablco2=None, alb_l=None,alb_s=None,albsfc=None,snowc=None,tau2=None,st4a=None,stratc=None,flux=None):
+    def zeros(cls, nodal_shape, num_levels, ablco2=None, alb_l=None,alb_s=None,albsfc=None,snowc=None,tau2=None,emis2=None,st4a=None,stratc=None,flux=None):
         return cls(
             ablco2 = ablco2 if ablco2 is not None else ablco2_ref,
             alb_l = alb_l if alb_l is not None else jnp.zeros(nodal_shape),
@@ -195,13 +208,26 @@ class ModRadConData:
             albsfc = albsfc if albsfc is not None else jnp.zeros(nodal_shape),
             snowc = snowc if snowc is not None else jnp.zeros(nodal_shape),
             tau2 = tau2 if tau2 is not None else jnp.zeros(((num_levels,)+nodal_shape+(4,))),
+            # emis2 defaults to 1 - tau2 (the complement relation it exists
+            # to carry), from whichever tau2 this call actually used -- the
+            # explicit argument when given, else the "zeros" reference
+            # tau2 = 0, whose complement is 1, not 0 (the opposite asymmetry
+            # from ones() below, since emis2 is tau2's complement rather
+            # than its twin). A caller supplying tau2 without emis2 would
+            # otherwise get the unconditional class default regardless of
+            # the tau2 it passed (Codex review, PR #1124 thread on this
+            # file): no current caller does, but the factory contract
+            # should not depend on that staying true.
+            emis2 = (emis2 if emis2 is not None else
+                    1.0 - tau2 if tau2 is not None else
+                    jnp.ones(((num_levels,)+nodal_shape+(4,)))),
             st4a = st4a if st4a is not None else jnp.zeros(((num_levels,)+nodal_shape+(2,))),
             stratc = stratc if stratc is not None else jnp.zeros((nodal_shape+(2,))),
             flux = flux if flux is not None else jnp.zeros((nodal_shape+(4,)))
         )
-    
+
     @classmethod
-    def ones(cls, nodal_shape, num_levels, ablco2=None, alb_l=None,alb_s=None,albsfc=None,snowc=None,tau2=None,st4a=None,stratc=None,flux=None):
+    def ones(cls, nodal_shape, num_levels, ablco2=None, alb_l=None,alb_s=None,albsfc=None,snowc=None,tau2=None,emis2=None,st4a=None,stratc=None,flux=None):
         return cls(
             ablco2 = ablco2 if ablco2 is not None else ablco2_ref,
             alb_l = alb_l if alb_l is not None else jnp.ones(nodal_shape),
@@ -209,12 +235,20 @@ class ModRadConData:
             albsfc = albsfc if albsfc is not None else jnp.ones(nodal_shape),
             snowc = snowc if snowc is not None else jnp.ones(nodal_shape),
             tau2 = tau2 if tau2 is not None else jnp.ones(((num_levels,)+nodal_shape+(4,))),
+            # emis2 defaults to 1 - tau2, from whichever tau2 this call
+            # actually used -- see zeros() above. At the "ones" reference
+            # tau2 = 1 (zero optical depth) the complement is 0, not 1 --
+            # unlike every other field here, ones() is not 1 - zeros() for
+            # this one.
+            emis2 = (emis2 if emis2 is not None else
+                    1.0 - tau2 if tau2 is not None else
+                    jnp.zeros(((num_levels,)+nodal_shape+(4,)))),
             st4a = st4a if st4a is not None else jnp.ones(((num_levels,)+nodal_shape+(2,))),
             stratc = stratc if stratc is not None else jnp.ones((nodal_shape+(2,))),
             flux = flux if flux is not None else jnp.ones((nodal_shape+(4,)))
         )
 
-    def copy(self, alb_l=None,alb_s=None,ablco2=None,albsfc=None,snowc=None,tau2=None,st4a=None,stratc=None,flux=None):
+    def copy(self, alb_l=None,alb_s=None,ablco2=None,albsfc=None,snowc=None,tau2=None,emis2=None,st4a=None,stratc=None,flux=None):
         return ModRadConData(
             ablco2=ablco2 if ablco2 is not None else self.ablco2,
             alb_l=alb_l if alb_l is not None else self.alb_l,
@@ -222,6 +256,7 @@ class ModRadConData:
             albsfc=albsfc if albsfc is not None else self.albsfc,
             snowc=snowc if snowc is not None else self.snowc,
             tau2=tau2 if tau2 is not None else self.tau2,
+            emis2=emis2 if emis2 is not None else self.emis2,
             st4a=st4a if st4a is not None else self.st4a,
             stratc=stratc if stratc is not None else self.stratc,
             flux=flux if flux is not None else self.flux
@@ -351,7 +386,13 @@ class HumidityData:
 
 @tree_math.struct
 class SurfaceFluxData:
-    """Parameters:
+    """Surface fluxes, all as ``(ix, il)`` grid maps.
+
+    Every field is the area-weighted land/sea grid mean; the separate land
+    and sea contributions are intermediates internal to
+    ``jcm.physics.surface.speedy_surface_flux``.
+
+    Fields:
     ustr: u-stress
     vstr: v-stress
     shf: Sensible heat flux
@@ -359,7 +400,7 @@ class SurfaceFluxData:
     rlus: Upward flux of long-wave radiation at the surface
     rlds: Downward flux of long-wave radiation at the surface
     rlns: Net upward flux of long-wave radiation at the surface
-    hfluxn: Net downward heat flux
+    hfluxn: Net downward heat flux into the surface
     tsfc: Surface temperature
     tskin: Skin surface temperature
     u0: Near-surface u-wind
@@ -367,73 +408,50 @@ class SurfaceFluxData:
     t0: Near-surface temperature
     """
 
-    ustr: jnp.ndarray 
-    vstr: jnp.ndarray 
-    shf: jnp.ndarray 
-    evap: jnp.ndarray 
-    rlus: jnp.ndarray 
-    rlds: jnp.ndarray 
-    rlns: jnp.ndarray 
-    hfluxn: jnp.ndarray 
-    tsfc: jnp.ndarray 
-    tskin: jnp.ndarray 
-    u0: jnp.ndarray 
-    v0: jnp.ndarray 
-    t0: jnp.ndarray 
+    ustr: jnp.ndarray
+    vstr: jnp.ndarray
+    shf: jnp.ndarray
+    evap: jnp.ndarray
+    rlus: jnp.ndarray
+    rlds: jnp.ndarray
+    rlns: jnp.ndarray
+    hfluxn: jnp.ndarray
+    tsfc: jnp.ndarray
+    tskin: jnp.ndarray
+    u0: jnp.ndarray
+    v0: jnp.ndarray
+    t0: jnp.ndarray
 
     @classmethod
-    def zeros(cls, nodal_shape, ustr=None, vstr=None, shf=None, evap=None, rlus=None, rlds=None, rlns=None, hfluxn=None, tsfc=None, tskin=None, u0=None, v0=None, t0=None):
-        return cls(
-            ustr = ustr if ustr is not None else jnp.zeros((nodal_shape)+(3,)),
-            vstr = vstr if vstr is not None else jnp.zeros((nodal_shape)+(3,)),
-            shf = shf if shf is not None else jnp.zeros((nodal_shape)+(3,)),
-            evap = evap if evap is not None else jnp.zeros((nodal_shape)+(3,)),
-            rlus = rlus if rlus is not None else jnp.zeros((nodal_shape)+(3,)),
-            rlds = rlds if rlds is not None else jnp.zeros(nodal_shape),
-            rlns = rlns if rlns is not None else jnp.zeros(nodal_shape),
-            hfluxn = hfluxn if hfluxn is not None else jnp.zeros((nodal_shape)+(2,)),
-            tsfc = tsfc if tsfc is not None else jnp.zeros(nodal_shape),
-            tskin = tskin if tskin is not None else jnp.zeros(nodal_shape),
-            u0 = u0 if u0 is not None else jnp.zeros(nodal_shape),
-            v0 = v0 if v0 is not None else jnp.zeros(nodal_shape),
-            t0 = t0 if t0 is not None else jnp.zeros(nodal_shape)
-        )
-    
-    @classmethod
-    def ones(cls, nodal_shape, ustr=None, vstr=None, shf=None, evap=None, rlus=None, rlds=None, rlns=None, hfluxn=None, tsfc=None, tskin=None, u0=None, v0=None, t0=None):
-        return cls(
-            ustr = ustr if ustr is not None else jnp.ones((nodal_shape)+(3,)),
-            vstr = vstr if vstr is not None else jnp.ones((nodal_shape)+(3,)),
-            shf = shf if shf is not None else jnp.ones((nodal_shape)+(3,)),
-            evap = evap if evap is not None else jnp.ones((nodal_shape)+(3,)),
-            rlus = rlus if rlus is not None else jnp.ones((nodal_shape)+(3,)),
-            rlds = rlds if rlds is not None else jnp.ones(nodal_shape),
-            rlns = rlns if rlns is not None else jnp.ones(nodal_shape),
-            hfluxn = hfluxn if hfluxn is not None else jnp.ones((nodal_shape)+(2,)),
-            tsfc = tsfc if tsfc is not None else jnp.ones(nodal_shape),
-            tskin = tskin if tskin is not None else jnp.ones(nodal_shape),
-            u0 = u0 if u0 is not None else jnp.ones(nodal_shape),
-            v0 = v0 if v0 is not None else jnp.ones(nodal_shape),
-            t0 = t0 if t0 is not None else jnp.ones(nodal_shape)
-        )
+    def zeros(cls, nodal_shape, **overrides):
+        return cls._filled(jnp.zeros(nodal_shape), overrides)
 
-    def copy(self, ustr=None, vstr=None, shf=None, evap=None, rlus=None, rlds=None, rlns=None, hfluxn=None, tsfc=None, tskin=None, u0=None, v0=None, t0=None):
-        return SurfaceFluxData(
-            ustr=ustr if ustr is not None else self.ustr,
-            vstr=vstr if vstr is not None else self.vstr,
-            shf=shf if shf is not None else self.shf,
-            evap=evap if evap is not None else self.evap,
-            rlus=rlus if rlus is not None else self.rlus,
-            rlds=rlds if rlds is not None else self.rlds,
-            rlns=rlns if rlns is not None else self.rlns,
-            hfluxn=hfluxn if hfluxn is not None else self.hfluxn,
-            tsfc=tsfc if tsfc is not None else self.tsfc,
-            tskin=tskin if tskin is not None else self.tskin,
-            u0=u0 if u0 is not None else self.u0,
-            v0=v0 if v0 is not None else self.v0,
-            t0=t0 if t0 is not None else self.t0
-        )
-    
+    @classmethod
+    def ones(cls, nodal_shape, **overrides):
+        return cls._filled(jnp.ones(nodal_shape), overrides)
+
+    @classmethod
+    def _filled(cls, fill, overrides):
+        """Build from ``fill``, taking any field given in ``overrides``.
+
+        Every field is a plain 2D map on the nodal grid, so one fill value
+        serves them all and there is no per-field shape to drift out of
+        step. The shape check keeps it that way: a caller still passing an
+        array with a trailing surface-type axis would otherwise broadcast
+        silently through the bulk formulae and reach the output file.
+        """
+        wrong = {name: jnp.shape(value) for name, value in overrides.items()
+                 if jnp.shape(value) != jnp.shape(fill)}
+        if wrong:
+            raise ValueError(
+                f"SurfaceFluxData fields are {jnp.shape(fill)} grid maps; got {wrong}")
+        # An unknown name raises TypeError from the generated __init__.
+        return cls(**({f.name: fill for f in dataclasses.fields(cls)} | overrides))
+
+    def copy(self, **overrides):
+        return dataclasses.replace(self, **overrides)
+
+
     def isnan(self):
         return tree_util.tree_map(jnp.isnan, self)
 
@@ -477,11 +495,11 @@ class PhysicsData:
     surface_flux: SurfaceFluxData
     # Model timestep in seconds. Sourced from
     # ``ComposablePhysics.dt_seconds`` each step via the
-    # ``diagnostics["_dt_seconds"]`` plumbing; consumed by
-    # ``speedy_orographic`` to translate the SPEEDY instantaneous
-    # T/q corrections into per-step tendencies. The shortwave
-    # sub-stepping counter (`mod nstrad`) lives on
-    # :attr:`SWRadiationData.step` and rides the radiation carry slot.
+    # ``diagnostics["_dt_seconds"]`` plumbing, for SPEEDY terms that
+    # need to translate instantaneous corrections into per-step
+    # tendencies. The shortwave sub-stepping counter (`mod nstrad`)
+    # lives on :attr:`SWRadiationData.step` and rides the radiation
+    # carry slot.
     dt_seconds: float
     land_model: LandModelData
     speedy_coords: SpeedyCoords

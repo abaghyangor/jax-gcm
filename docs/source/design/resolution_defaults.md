@@ -1,0 +1,149 @@
+# Resolution-dependent parameter defaults
+
+ECHAM6.3 sets a number of tunable parameters per model grid: the cloud cover's
+critical relative humidities, the convective precipitation conversion, the
+cloud-optics inhomogeneity factors and others take different values at T63 and
+at T127. They are tunables, not constants of the formulation, and calibration
+has to be able to move them. This page records how jcm chooses them for a grid
+and how a scheme adopts the mechanism.
+
+## The mechanism
+
+`jcm/physics/resolution_defaults.py` holds one function for every scheme:
+
+* A scheme keeps a table of its reference values per spectral truncation,
+  `{truncation: {field: value}}`, next to its `Parameters` class
+  (`jcm/physics/clouds/echam_cloud_defaults.py` for the cloud schemes).
+* `resolution_defaults(table, truncation, nearest=..., fallback=..., ...)`
+  returns one `{field: value}` mapping. At a tabulated truncation it returns
+  the table's values exactly. Between two tabulated truncations it
+  interpolates linearly in the truncation number; fields that are integers or
+  switches in the reference (`nearest`) take the nearer truncation's value, the
+  finer one on a tie. Outside the tabulated range it holds the end value and
+  warns once per grid. A grid without a spectral truncation (the pySES cubed
+  sphere) takes the `fallback` row, with a warning.
+* The scheme's `Parameters.default(truncation=...)` builds its defaults from
+  that mapping; the numeric fields stay ordinary differentiable pytree leaves.
+
+Interpolation continues the resolution trend the reference encodes instead of
+switching between its rows. The interpolated values are jcm's choice and are
+untuned; the reference itself has no configuration between its truncations
+(ECHAM6.3 stops with "Truncation not supported").
+
+## A calibrated row
+
+A table row is the reference's unless jcm has calibrated it. The cloud cover's
+table keeps ECHAM's four rows verbatim (`ECHAM_CLOUD_DEFAULTS`, which its own
+test pins against the Fortran source) and lays jcm's calibrated T63 values of
+`crt`, `crs`, `nex`, `csatsc` and `cinv` over the T63 row. The cover is
+calibrated per droplet-number source, so there are two such tables:
+`JCM_CALIBRATED_COVER_T63` gives `JCM_CLOUD_DEFAULTS` (prescribed droplets: the
+1M and 2M hosts), and `JCM_CALIBRATED_COVER_T63_JAM` gives
+`JCM_CLOUD_DEFAULTS_JAM` (droplets activated from the JAM aerosol), which
+`echam_physics` reads for any JAM composition ({doc}`jam_aerosol_retune`, "The
+v3.1 refit"). The other T63 fields (`nadd`, `cvtfall`, `csecfrl`, `clwprat`)
+and the other rows are ECHAM's and uncalibrated. Every consequence follows from
+the rule above and needs no special case, in either table:
+
+* T63, and a grid without a spectral truncation (the fallback row), get the
+  calibrated values.
+* A truncation between T63 and T127 interpolates between the calibrated T63 row
+  and ECHAM's T127 row, so T106 (43/64 of the way) is an untuned blend of the
+  two. `nex`, an integer in ECHAM, takes the nearer truncation's value: the
+  calibrated, real-valued one up to T94, ECHAM's 2 from T95.
+* Between T31 and T63 the interpolation runs toward the calibrated row.
+* The comparison against the ECHAM Fortran takes ECHAM's constants from the
+  reference data, not from the shipped defaults, so it tests the formulation
+  whatever is calibrated.
+
+## Chosen at construction
+
+The defaults are fixed when the physics is built, so that the parameter pytree
+a user holds afterwards is final: calibration code builds its optimiser state
+from it, and nothing may change it behind the optimiser's back.
+
+* `echam_physics(coords=...)` builds the defaults of every scheme that has
+  them for the grid's truncation; without `coords` it builds the T63 defaults.
+* The Hydra runner builds the coordinates before the physics and passes them
+  to both configuration doors: the factory presets (`physics.builder`) get
+  `coords`, and the term-list presets build each term's `Parameters` base with
+  `default_parameters(ParamsCls, truncation)`. With the pySES dycore the
+  coordinates are the dycore's, which exists only after the physics has named
+  its tracers: the runner reads the tracer declarations from a first build and
+  builds the physics the model runs with `dycore.coords`. That grid has no
+  spectral truncation, so its defaults are the T63 row, with the warning that
+  says so.
+* `default_parameters` calls `default(truncation=...)` on a class that accepts
+  it and plain `default()` otherwise, so a scheme gains resolution defaults by
+  adding the keyword and nothing else.
+
+## Precedence
+
+Highest first:
+
+1. An explicit `Parameters` object passed by the caller is used as given.
+2. A field override (a Hydra `physics.clouds.crs=...`, a factory mapping, a
+   term-list `params:` block) replaces that one field; the base it is applied
+   to is the grid's defaults, so the other fields keep them.
+3. The grid's resolution default.
+
+## The grid check
+
+`cache_coords` does not re-resolve anything. A term that holds
+resolution-dependent parameters records, as static metadata, the truncation its
+defaults were built for (`defaults_truncation` on the `Parameters`) and whether
+they were built by the factory or runner (`params_are_defaults=True`) or
+supplied by the user. For factory-built defaults it calls
+`check_defaults_grid`, which warns once, naming both grids, when they differ; a
+user-supplied object is never checked, and a single-column grid, which has no
+horizontal resolution, is never checked.
+
+Grid geometry that the reference derives from the vertical grid, such as
+ECHAM's inversion-search levels `jbmin`/`jbmax`, is not a tunable. It is
+computed from the model's own levels in `cache_coords`.
+
+## Adopting it in another scheme
+
+1. Put the reference table next to the scheme's `Parameters`.
+2. Give `default` a `truncation: int | None = 63` keyword that fills the
+   table-driven fields (explicit keyword values winning) and records
+   `defaults_truncation` as a `pytree_node=False` field (a `flax.struct.dataclass`
+   `Parameters` class, which every scheme below but `RadiationParameters` uses).
+   A `tree_math.struct` `Parameters` class has no `pytree_node=False`
+   mechanism at all (`tree_flatten` always returns every field as a leaf;
+   see `RadiationParameters` below for how it adapts this step).
+3. Give the term a `params_are_defaults: bool = False` keyword and call
+   `check_defaults_grid` from its `cache_coords` when it is set.
+
+The factory and the runner then need no change. Today the cloud cover
+(`CloudParameters`), the 1M cloud scheme (`MicrophysicsParameters`: `cvtfall`,
+`csecfrl`, `clwprat`), the 2M cloud scheme (`CloudParams2M`: `cvtfall`, the
+one value ECHAM's 2M reads from `sucloud`, `mo_cloud_micro_2m.f90` l.97, 536)
+and the RRTMGP backend's cloud-optics inhomogeneity factors
+(`RadiationParameters`: `zinhoml1`/`zinhoml2`/`zinhoml3`/`zinhomi`,
+`mo_cloud_optics.f90::setup_cloud_optics` l.114-134) use it. `RadiationParameters`
+is a `tree_math.struct`, so step 2's `pytree_node=False` field is not
+available to it; `defaults_truncation` is instead a plain (non-static) leaf,
+the same treatment the struct already gives its other non-numeric fields
+(`emulator_weights`, `sw_scaling`, `lw_scaling`). It still carries the
+truncation `default(truncation=...)` was built for, so step 3's
+`check_defaults_grid` call works unmodified from `RRTMGPRadiation.cache_coords`
+— the struct's inability to mark it static only means it is also,
+inertly, a pytree leaf (never read as a gradient target in practice, like
+`cloud_overlap`). ECHAM-HAM's own override of the ice factor for the JAM
+pairing (`zinhomi = 0.7`, `lcdnc_progn` with `ncd_activ = 2`) is defined at
+T63 only; `echam_physics()` holds it at that value at every truncation
+(the JAM composition has no other row to interpolate from or to), applied on
+top of the per-truncation table's other three factors.
+
+ECHAM6.3 also sets these by truncation, which jcm holds fixed at present:
+
+* convection (`cmfctop`, `cprcon`, `mo_echam_conv_constants.f90` l.121-137,
+  and `cmftau = min(3 h, 7200 s·63/nn)`) and the subgrid-orography wake
+  coefficient `gkwake` (`mo_ssodrag.f90` l.93-122). The order the maintainer
+  chose is convection and gravity-wave values per truncation first and the
+  Tiedtke retune after; that retune left the Tiedtke defaults unchanged
+  ({doc}`jam_aerosol_retune`).
+
+Horizontal diffusion already follows ECHAM's truncation table through its own
+interpolation in `jcm/diffusion.py`.

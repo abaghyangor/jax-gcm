@@ -6,6 +6,17 @@ Reads the per-mode dry radius / κ / number from the ``_jam_state`` diagnostic
 is the same diagnostics key the 2M scheme's SPA floor produces, so ARG and SPA
 are interchangeable activation sources (one factory arg) — see #342.
 
+Also publishes ``activation_potential`` as a plain alias of
+``activated_cdnc`` (jax-gcm#1160): ARG's output is already a per-cell
+activation POTENTIAL (the number parcel-theory activation would give at
+this level's updraft/aerosol state) with no cloud-fraction weighting
+anywhere in `arg_activation` — unlike the MACv2-SP SPA floor, which bakes
+``cloud_fraction`` in by design (see `jcm.physics.aerosol.spa`'s module
+docstring). The alias exists so `Lohmann2MMicrophysics`'s two section-1
+droplet-number sources (cloud-base activation, convective-detrainment
+number) can read one name, ``activation_potential``, regardless of which
+aerosol route is composed.
+
 Updraft velocity: the characteristic activation updraft is read from
 ``updraft_velocity`` if some upstream term provides it; otherwise it is
 derived from the previous step's TTE-TKE (w = √(2·TKE/3)), falling back to a
@@ -25,6 +36,21 @@ from jcm.physics.aerosol.jam.microphysics.mam4_data import MAM4_SPEC
 from jcm.physics.aerosol.jam.population import ModalAerosolSpec
 from jcm.physics.physics_term import PhysicsTerm
 from jcm.physics_interface import PhysicsTendency
+
+
+@tree_math.struct
+class JamActivationData:
+    """Per-mode ARG activated fractions (the ``_jam_activation`` key).
+
+    Written each step for the cloud-borne exchange term (#602): the fraction
+    of each mode's interstitial number and mass that would reside in cloud
+    droplets at the diagnosed maximum supersaturation. Mode axis first,
+    ``(n_aer, nlev, ncols)``, matching ``_jam_state``; zero for modes that
+    cannot activate.
+    """
+
+    number_frac: jnp.ndarray   # activated number fraction [-]
+    mass_frac: jnp.ndarray     # activated mass fraction [-]
 
 
 @tree_math.struct
@@ -53,7 +79,16 @@ class ArgActivation(PhysicsTerm):
         "_jam_state", "pressure_full", "air_density",
     )
     provides: ClassVar[tuple[str, ...]] = (
-        "activated_cdnc", "activated_fraction",
+        "activated_cdnc", "activation_potential", "activated_fraction",
+        "_jam_activation",
+    )
+    # Both read in ``_updraft`` (module docstring): ``updraft_velocity`` is
+    # a deliberately-empty hook (no in-tree term provides it yet);
+    # ``vertical_diffusion`` is a cross-step read of last step's TTE-TKE
+    # (this term runs in the pre-cloud aerosol block, upstream of
+    # ``TteTkeVerticalDiffusion`` in the default ``echam_physics`` order).
+    optional_requires: ClassVar[tuple[str, ...]] = (
+        "updraft_velocity", "vertical_diffusion",
     )
 
     def __init__(
@@ -74,7 +109,7 @@ class ArgActivation(PhysicsTerm):
         self._can_activate = tuple(
             float(m.can_activate) for m in self._spec.modes
         )
-        self._sigma_acc = self._spec.mode("accum").geom_std_dev
+        self._sigma_acc = self._spec.mode(self._spec.accumulation_mode).geom_std_dev
 
     def _updraft(self, diagnostics, shape, params):
         """Characteristic activation updraft [m/s]."""
@@ -82,7 +117,19 @@ class ArgActivation(PhysicsTerm):
             w = diagnostics["updraft_velocity"]
         elif "vertical_diffusion" in diagnostics:
             tke = diagnostics["vertical_diffusion"].tke
-            w = jnp.sqrt(jnp.maximum(params.tke_factor * tke, 0.0))
+            # Double-where on the root's argument, as
+            # ``closure.py::_sqrt_nonnegative`` guards the same root in the
+            # TKE closure. Zero TKE is a laminar layer's value, and there
+            # ``sqrt(maximum(x, 0))`` is not protected: ``maximum`` ties at 0
+            # and hands half of ``sqrt'(0) = inf`` back, which makes the
+            # derivative with respect to TKE and to ``tke_factor`` NaN. The
+            # value is the same (0 either way, and ``w_min`` floors it
+            # below), and the derivative reported at 0 is 0, which is the
+            # reference derivative there: ``w_min`` is the active floor.
+            w_sq = params.tke_factor * tke
+            turbulent = w_sq > 0.0
+            w = jnp.where(
+                turbulent, jnp.sqrt(jnp.where(turbulent, w_sq, 1.0)), 0.0)
         else:
             w = jnp.full(shape, params.updraft_default)
         return jnp.maximum(w, params.w_min)
@@ -101,7 +148,8 @@ class ArgActivation(PhysicsTerm):
 
         updraft = self._updraft(diagnostics, state.temperature.shape, params)
 
-        activated_cdnc, activated_fraction, _ = arg_activation(
+        activated_cdnc, activated_fraction, _, number_frac, mass_frac = (
+            arg_activation(
             r_dry=aer.r_dry,
             kappa=aer.kappa,
             number_vol=number_vol,
@@ -112,11 +160,18 @@ class ArgActivation(PhysicsTerm):
             pressure=diagnostics["pressure_full"],
             sigma_acc=self._sigma_acc,
             variant=self._variant,
-        )
+        ))
 
         tendency = PhysicsTendency.zeros(state.temperature.shape)
         return tendency, {
             **diagnostics,
             "activated_cdnc": activated_cdnc,
+            # Alias, not a second computation (jax-gcm#1160): ARG's own
+            # output never has cloud_fraction baked in, so it already IS
+            # the activation potential — see the module docstring.
+            "activation_potential": activated_cdnc,
             "activated_fraction": activated_fraction,
+            "_jam_activation": JamActivationData(
+                number_frac=number_frac, mass_frac=mass_frac,
+            ),
         }

@@ -19,9 +19,9 @@ Day/night is handled continuously through the oxidant fields themselves
 integrated over the physics step with a stable exponential decay. Sulfur is
 conserved atom-for-atom (DMS→SO₂→H₂SO₄ each carry one S).
 
-SOAG: jcm has no VOC precursor yet, so SOA gas is produced at a small
-boundary-layer-weighted prescribed rate (tunable, interim) so the core sees a
-nonzero condensable organic; replace with a real VOC+OH source later.
+SOAG production defaults to zero here. The CAM6 prescribed VOC-yield source
+is supplied through the emissions reader (``jcm.data.emissions.cam6_soa``),
+not through the historical uniform boundary-layer production stub.
 """
 
 from __future__ import annotations
@@ -66,6 +66,7 @@ _DMS_OH_ADD_A, _DMS_OH_ADD_C = 1.7e-42, 7810.0
 _DMS_OH_ADD_DEN_A, _DMS_OH_ADD_DEN_C = 5.5e-31, 7460.0
 # 1.7e-42 underflows float32, so its log is folded into the exponent below.
 _LN_DMS_OH_ADD_A = math.log(_DMS_OH_ADD_A)
+_LN_DMS_OH_ADD_DEN_A = math.log(_DMS_OH_ADD_DEN_A)
 _O2_FRAC = 0.21   # molar fraction of O₂ in air
 
 # SO₂ + OH + M → HSO₃ (→ H₂SO₄), Troe termolecular (JPL):
@@ -79,13 +80,18 @@ _DMS_NO3_A, _DMS_NO3_C = 1.9e-13, 520.0
 
 
 def _k_dms_oh(t: jnp.ndarray, n_air: jnp.ndarray):
-    """DMS+OH abstraction (k1) and addition (k2) rates [cm³ molec⁻¹ s⁻¹]."""
-    o2 = _O2_FRAC * n_air
+    """DMS+OH abstraction (k1) and addition (k2) rates [cm³ molec⁻¹ s⁻¹].
+
+    ``k2 = A·exp(C/T)·[O₂] / (1 + B·exp(D/T)·[O₂])`` is evaluated in log
+    space, ``exp(ln A + C/T + ln[O₂] − softplus(ln B + D/T + ln[O₂]))``: the
+    same function, but the two exponentials overflow float32 separately below
+    about 84 K (where the plain quotient became 0, then inf/inf = NaN near
+    50 K), and the log form has no intermediate that can.
+    """
+    ln_o2 = jnp.log(_O2_FRAC * n_air)
     k1 = _DMS_OH_ABS_A * jnp.exp(-_DMS_OH_ABS_C / t)
-    numerator = jnp.exp(_DMS_OH_ADD_C / t + _LN_DMS_OH_ADD_A) * o2
-    k2 = numerator / (
-        1.0 + _DMS_OH_ADD_DEN_A * jnp.exp(_DMS_OH_ADD_DEN_C / t) * o2
-    )
+    log_den = jnp.logaddexp(0.0, _LN_DMS_OH_ADD_DEN_A + _DMS_OH_ADD_DEN_C / t + ln_o2)
+    k2 = jnp.exp(_LN_DMS_OH_ADD_A + _DMS_OH_ADD_C / t + ln_o2 - log_den)
     return k1, k2
 
 
@@ -102,15 +108,53 @@ def _k_dms_no3(t: jnp.ndarray) -> jnp.ndarray:
     return _DMS_NO3_A * jnp.exp(_DMS_NO3_C / t)
 
 
+#: Below this, evaluate ``_stable_phi`` by its Taylor series rather than
+#: the ``expm1``/``x`` quotient form -- not because the quotient's VALUE is
+#: inaccurate there (``expm1`` is itself accurate near 0), but because its
+#: derivative, formed by the autodiff quotient rule, needs ``1/x`` and
+#: ``1/x**2`` terms that partially cancel; the series has no such term. At
+#: ``x = 1e-4`` the next series term (``x**4/120``) is ~1e-20, far below
+#: float32 precision, so the two branches agree to rounding at the
+#: boundary.
+_PHI_SMALL_X = 1.0e-4
+
+
+def _stable_phi(x: jnp.ndarray) -> jnp.ndarray:
+    """``(1 - exp(-x)) / x``, continued through its ``x -> 0`` limit of 1.
+
+    This is a genuine removable singularity, not a masked branch: the
+    two-sided limit of ``(1-exp(-x))/x`` as ``x -> 0`` is exactly 1 with
+    derivative exactly ``-1/2`` from both sides, so the Taylor branch below
+    is the *same* analytic function as the quotient branch, evaluated in
+    its convergent series near 0 instead of as a quotient whose derivative
+    needs ``1/x**2``. Used so the DMS loss split (below) never forms a
+    branching *fraction* of two rates that can simultaneously vanish.
+    """
+    small = jnp.abs(x) < _PHI_SMALL_X
+    safe_x = jnp.where(small, 1.0, x)
+    quotient = -jnp.expm1(-safe_x) / safe_x
+    series = 1.0 - x / 2.0 + x ** 2 / 6.0 - x ** 3 / 24.0
+    return jnp.where(small, series, quotient)
+
+
 @tree_math.struct
 class SulfurGasParameters:
     """Tunable knobs for the gas-phase sulfur chemistry (differentiable)."""
 
-    soag_production: jnp.ndarray   # interim SOAG source [kg/kg/s] at the surface
+    soag_production: jnp.ndarray   # prescribed SOAG source [kg/kg/s], BL-weighted
 
     @classmethod
     def default(cls) -> "SulfurGasParameters":
-        return cls(soag_production=jnp.asarray(2.0e-15))
+        # 0 by default: jcm has no biogenic VOC chemistry yet, so any
+        # nonzero value here is an unopposed global SOA source. The
+        # previous 2e-15 "interim" default (~0.9 mg SOA/m²/day column-
+        # integrated) was the sole SOA source in every JAM run and, being
+        # ~5× the total sulfur source with only weak accumulation-mode
+        # removal against it, drove multi-hundred-mg/m² SOA burdens that
+        # in turn distorted sulfate removal (jax-gcm#654). Until real
+        # biogenic emissions land, JAM carries zero SOA unless a run
+        # opts in explicitly.
+        return cls(soag_production=jnp.asarray(0.0))
 
 
 def sulfur_gas_tendencies(
@@ -135,11 +179,27 @@ def sulfur_gas_tendencies(
     k_dms = k_oh + k_no3
     f_so2 = (k1 + 0.75 * k2) / jnp.maximum(k1 + k2, _TINY)  # OH→SO2 branch
 
-    # DMS loss (exponential over dt), split by channel.
-    dms_lost = dms * (1.0 - jnp.exp(-k_dms * dt))
-    frac_oh = k_oh / jnp.maximum(k_dms, _TINY)
-    dms_lost_oh = dms_lost * frac_oh
-    dms_lost_no3 = dms_lost - dms_lost_oh
+    # DMS loss (exponential over dt), split by channel. Each channel's loss
+    # is dms*k_i*dt*phi(k_dms*dt): algebraically identical to the combined
+    # loss dms*(1-exp(-k_dms*dt)) times the instantaneous branching ratio
+    # k_i/k_dms (both channels decay at the SAME combined rate, so that
+    # ratio integrates to exactly this over dt), but written so the
+    # branching fraction k_i/k_dms is never formed as an intermediate.
+    #
+    # A first fix (#971) double-`where`d the fraction itself
+    # (`k_oh/max(k_dms,_TINY)`, 0 where `k_dms==0`): that made the VALUE
+    # correct (both channels are 0 when k_dms=0) but made `has_loss`'s
+    # constant branch carry a zero *derivative*, so d(dms_lost_oh)/d(oh) at
+    # oh=no3=0 came out 0 -- wrong, because an infinitesimal OH perturbation
+    # immediately produces OH-channel loss (the true one-sided limit is
+    # dms*dt*d(k_oh)/d(oh), via phi(0)=1). Caught in review, PR #1113.
+    # `_stable_phi` has no such branch: it is the SAME smooth function on
+    # both sides of k_dms*dt=0 (a removable singularity, not a masked
+    # discontinuity), so both the value and every derivative are exact.
+    phi_dms = _stable_phi(k_dms * dt)
+    dms_lost_oh = dms * k_oh * dt * phi_dms
+    dms_lost_no3 = dms * k_no3 * dt * phi_dms
+    dms_lost = dms_lost_oh + dms_lost_no3
 
     so2_from_dms = (dms_lost_oh * f_so2 + dms_lost_no3) * _CONV_DMS_SO2
     h2so4_from_dms = dms_lost_oh * (1.0 - f_so2) * _CONV_DMS_H2SO4
@@ -178,14 +238,17 @@ class SulfurGasChemistry(PhysicsTerm):
         return gas_tracer_specs(SULFUR_GASES)
 
     def __call__(self, state, diagnostics, forcing, terrain):
+        from jcm.physics.aerosol.jam.removal_split import split_view
+
         params = self.params.get_value()
+        view = split_view(None, state, diagnostics)
         zeros = jnp.zeros_like(state.temperature)
         ox = diagnostics["oxidants"]
         dt = jnp.asarray(diagnostics["_dt_seconds"], state.temperature.dtype)
 
         tends = sulfur_gas_tendencies(
-            dms=state.tracers.get(gas_name("dms"), zeros),
-            so2=state.tracers.get(gas_name("so2"), zeros),
+            dms=view.get(gas_name("dms"), zeros),
+            so2=view.get(gas_name("so2"), zeros),
             temperature=state.temperature,
             pressure=diagnostics["pressure_full"],
             oh=ox.oh,

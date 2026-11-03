@@ -1,7 +1,8 @@
 """``jam_aerosol_physics()`` factory — the ordered JAM harness term list.
 
 Returns the HAMMOZ-style process chain (emissions → microphysics core →
-activation → sedimentation → dry deposition → wet deposition) as a list of
+activation → sedimentation → dry deposition → cloud-borne exchange →
+aqueous chemistry → wet deposition) as a list of
 ``PhysicsTerm``s, ready to splice into ``echam_physics``. The microphysics
 core is the swap point: pass ``"placeholder"`` (default κ-Köhler equilibrium)
 or any ``ModalMicrophysicsTerm`` instance (e.g. a future MAM4-JAX wrapper,
@@ -11,9 +12,27 @@ on mode/species layout.
 
 from __future__ import annotations
 
+import dataclasses
+import os
+import inspect
+from typing import Any, Mapping
+
+from jcm.physics.aerosol.carry_seeder import AerosolCarrySeeder
 from jcm.physics.aerosol.jam.activation.arg_term import (
     ArgActivation,
     ArgParameters,
+)
+from jcm.physics.aerosol.jam.activation.ham_activation_term import (
+    HamActivation,
+    HamActivationParameters,
+)
+from jcm.physics.aerosol.jam.cloud_borne import (
+    CloudBorneExchange,
+    CloudBorneExchangeParameters,
+)
+from jcm.physics.aerosol.jam.cloud_borne_store import (
+    CloudBorneCarryStore,
+    carry_mode,
 )
 from jcm.physics.aerosol.jam.chemistry.aqueous import (
     AqueousSulfur,
@@ -29,7 +48,7 @@ from jcm.physics.aerosol.jam.chemistry.sulfur_gas import (
 )
 from jcm.physics.aerosol.jam.drydep.drydep_term import (
     DryDepParameters,
-    SlinnDryDeposition,
+    CAMDryDeposition,
 )
 from jcm.physics.aerosol.jam.emissions.anthropogenic import (
     AnthropogenicEmissions,
@@ -42,24 +61,93 @@ from jcm.physics.aerosol.jam.emissions.seasalt import (
     SeaSaltEmissions,
     SeaSaltParameters,
 )
-from jcm.physics.aerosol.jam.ice_nucleation.ice_term import IceNucleation
-from jcm.physics.aerosol.jam.ice_nucleation.params import (
-    IceNucleationParameters,
+from jcm.physics.aerosol.jam.ice_nucleation.ham_freezing import (
+    HamFreezingClasses,
 )
+from jcm.physics.aerosol.jam.ice_nucleation.ice_term import IceNucleation
 from jcm.physics.aerosol.jam.microphysics.base import ModalMicrophysicsTerm
+from jcm.physics.aerosol.jam.microphysics.m7_data import M7_SPEC
 from jcm.physics.aerosol.jam.microphysics.placeholder import (
     PlaceholderMicrophysics,
 )
 from jcm.physics.aerosol.jam.optics.optics_term import JamOpticsTerm
+from jcm.physics.aerosol.jam.optics.ham_lut_optics_term import HamLutOpticsTerm
 from jcm.physics.aerosol.jam.sedimentation.sedi_term import (
     StokesSedimentation,
     SedParameters,
 )
+from jcm.physics.aerosol.jam.wetdep.convective_fractions import convective_csr
 from jcm.physics.aerosol.jam.wetdep.wetdep_term import (
     WetScavenging,
     WetDepParameters,
 )
+from jcm.physics.aerosol.jam.tracer_layout import mass_name, number_name
+from jcm.physics.convection.tracer_transport import (
+    ConvectiveTracerTransport,
+    ConvTransportParameters,
+)
 from jcm.physics.physics_term import PhysicsTerm
+from jcm.physics.vertical_diffusion.tracer_diffusion import (
+    TracerDiffusionParameters,
+    TracerVerticalDiffusion,
+)
+
+#: ``jam_aerosol_physics`` keyword -> the ``Parameters`` class of that scheme,
+#: for every scheme a field-override mapping can be applied to. It is the one
+#: list the factory door of ``echam_physics`` builds on: a mapping
+#: (``wetdep={"incloud_scale": 0.5}``, Hydra's
+#: ``++physics.wetdep.incloud_scale=0.5``) is applied on top of the class's
+#: ``.default()``, and an object is forwarded as given.
+#: ``ConvTransportParameters.default()`` leaves the per-tracer ``csr_conv``
+#: empty, which the transport term fills from the mode layout below.
+#:
+#: ``dust`` is not here because its default depends on the composition rather
+#: than on the class: the dust preset is rebuilt at the model's own
+#: truncation in ``DustEmissions.cache_coords`` (an explicit object is never
+#: rebuilt). ``echam_physics`` still has a ``dust`` mapping door
+#: (jax-gcm#995) — but resolving a mapping into a concrete object at the
+#: factory's own (possibly fallback) truncation and handing it to
+#: ``DustEmissions`` as ``params=`` would make it indistinguishable from an
+#: explicit object, so ``cache_coords`` could never correct it for the real
+#: grid (Codex review, jax-gcm#1123; a T42 run with a ``dust`` mapping
+#: silently kept the T63 values). The mapping is instead carried through as
+#: ``dust_field_overrides``, applied by ``cache_coords`` on the
+#: truncation-aware ``DustParameters.preset(...)`` AFTER it rebuilds for the
+#: real grid, not folded into this table's ``.default()`` here.
+JAM_PARAMETER_CLASSES = {
+    "seasalt": SeaSaltParameters,
+    "dms": DmsParameters,
+    "anthropogenic_params": EmissionParameters,
+    "oxidants": OxidantParameters,
+    "sulfur_gas": SulfurGasParameters,
+    "aqueous": AqueousSulfurParameters,
+    "activation": ArgParameters,
+    "cloud_borne_exchange": CloudBorneExchangeParameters,
+    "sedimentation": SedParameters,
+    "drydep": DryDepParameters,
+    "wetdep": WetDepParameters,
+    "tracer_diffusion": TracerDiffusionParameters,
+    "conv_transport": ConvTransportParameters,
+}
+
+
+#: Activation schemes ``jam_aerosol_physics`` composes: CAM's ARG on κ (the
+#: JAM default) or ECHAM-HAM's own activation (``HamActivation``: Köhler A/B
+#: from the electrolyte species + ARG, ``ncd_activ = 2``; or Lin & Leaitch,
+#: ``ncd_activ = 1``), each publishing the same diagnostics.
+ACTIVATION_SCHEMES = ("arg", "ham_arg", "ham_lin_leaitch")
+
+
+def activation_parameter_class(activation_scheme: str):
+    """Return the ``Parameters`` class an ``activation`` mapping applies to."""
+    if activation_scheme == "arg":
+        return ArgParameters
+    if activation_scheme in ACTIVATION_SCHEMES:
+        return HamActivationParameters
+    raise ValueError(
+        f"Unknown activation_scheme {activation_scheme!r}; choose one of "
+        f"{ACTIVATION_SCHEMES}.")
+
 
 def _load_mam4_jax() -> type[ModalMicrophysicsTerm]:
     """Import the MAM4-JAX core lazily (optional GPL-3.0 dependency)."""
@@ -70,37 +158,158 @@ def _load_mam4_jax() -> type[ModalMicrophysicsTerm]:
     return Mam4JaxMicrophysics
 
 
-# Core resolvers. ``placeholder`` is built-in; ``mam4_jax`` is loaded lazily so
-# the optional GPL-3.0 ``mam4-jax`` dependency is only imported when selected.
+def _load_m7_jax() -> type[ModalMicrophysicsTerm]:
+    """Import the M7-JAX core lazily (optional ``jcm[m7]`` dependency)."""
+    from jcm.physics.aerosol.jam.microphysics.m7_jax import M7JaxMicrophysics
+
+    return M7JaxMicrophysics
+
+
+def _build_core(core_cls, spec, options, name):
+    """Construct ``core_cls(spec=spec, **options)``, validating ``options``'
+    keys against the core's own constructor first.
+
+    ``options`` is the string-named core's ``microphysics_options`` mapping
+    (``None`` means "none given", same as an empty mapping). An unknown key
+    raises, naming the core and the keys its constructor actually accepts
+    (every ``__init__`` parameter but ``self``/``spec``) — e.g.
+    ``nucleation_scheme``/``organic_scheme``/``coagulation``/``condensation``/
+    ``enable_x64``/``core_dtype``/``kappa_table`` for ``"m7_jax"``. Every
+    other core (``placeholder``, ``m7_placeholder``, ``mam4_jax`` today) takes
+    no options, so any key is unknown for them.
+    """
+    kwargs = {} if options is None else dict(options)
+    valid = set(inspect.signature(core_cls.__init__).parameters) - {
+        "self", "spec"}
+    unknown = sorted(set(kwargs) - valid)
+    if unknown:
+        raise ValueError(
+            f"Unknown microphysics_options {unknown} for the {name!r} core. "
+            f"Valid keys: {sorted(valid)}."
+        )
+    return core_cls(spec=spec, **kwargs)
+
+
+# Core resolvers (each takes a spec override, ``None`` for the core default,
+# and a ``microphysics_options`` mapping, ``None`` for none given).
+# ``placeholder``/``m7_placeholder`` are built-in; ``mam4_jax``/``m7_jax`` are
+# loaded lazily so their optional dependencies are only imported when
+# selected.
 _MICROPHYSICS = {
-    "placeholder": lambda: PlaceholderMicrophysics(),
-    "mam4_jax": lambda: _load_mam4_jax()(),
+    "placeholder": lambda spec, options: _build_core(
+        PlaceholderMicrophysics, spec, options, "placeholder"),
+    "mam4_jax": lambda spec, options: _build_core(
+        _load_mam4_jax(), spec, options, "mam4_jax"),
+    # The κ-Köhler zero-tendency core on the M7 population (jax-gcm#1017) —
+    # the chain-test vehicle for the echam-jam-m7 preset until the real M7
+    # core adapter lands. ``spec`` defaults to M7_SPEC rather than
+    # PlaceholderMicrophysics's own MAM4_SPEC default.
+    "m7_placeholder": lambda spec, options: _build_core(
+        PlaceholderMicrophysics, spec or M7_SPEC, options, "m7_placeholder"),
+    # The ECHAM-HAM M7 core over m7-jax (jax-gcm#1017), the optional
+    # ``jcm[m7]`` extra; loaded lazily like mam4_jax. ``microphysics_options``
+    # is how a preset selects ``nucleation_scheme=2`` (Kazil/Lovejoy) or the
+    # float32 forward core (``core_dtype="float32"``) without a bespoke
+    # factory argument for every switch the core adds.
+    "m7_jax": lambda spec, options: _build_core(
+        _load_m7_jax(), spec, options, "m7_jax"),
+    "mam4_jax_astem": lambda spec, options: _build_core(
+        _load_mam4_jax(), spec,
+        {"condensation_backend": "astem", **(options or {})},
+        "mam4_jax_astem"),
 }
 
 
 def _resolve_microphysics(
     microphysics: ModalMicrophysicsTerm | str,
+    cloud_borne: bool | None = None,
+    microphysics_options: Mapping[str, Any] | None = None,
 ) -> ModalMicrophysicsTerm:
     if isinstance(microphysics, ModalMicrophysicsTerm):
+        if microphysics_options is not None:
+            # An already-constructed core has already made every one of
+            # these choices (or taken its own defaults); a mapping here
+            # would either be silently ignored or ambiguously re-applied
+            # on top of it, so it is rejected rather than guessed at —
+            # construct the instance with those keyword arguments directly.
+            raise ValueError(
+                "microphysics_options is only for a string-named core; got "
+                f"an already-constructed {type(microphysics).__name__} "
+                "instance. Pass those keyword arguments to its constructor "
+                "instead."
+            )
+        if (
+            cloud_borne is not None
+            and microphysics.spec.cloud_borne != cloud_borne
+        ):
+            raise ValueError(
+                f"cloud_borne={cloud_borne} conflicts with the supplied "
+                "core's population "
+                f"(spec.cloud_borne={microphysics.spec.cloud_borne}); "
+                "construct the core with a spec carrying the intended flag "
+                "instead."
+            )
         return microphysics
     try:
-        return _MICROPHYSICS[microphysics]()
+        factory = _MICROPHYSICS[microphysics]
     except KeyError:
         raise ValueError(
             f"Unknown aer microphysics {microphysics!r}. "
             f"Choose one of {sorted(_MICROPHYSICS)} or pass a "
             "ModalMicrophysicsTerm instance."
         ) from None
+    core = factory(None, microphysics_options)
+    if cloud_borne is not None and core.spec.cloud_borne != cloud_borne:
+        # Rebuild on the same population with the flag flipped; construction
+        # is compose-time only, so the double build costs nothing at run time.
+        core = factory(
+            dataclasses.replace(core.spec, cloud_borne=cloud_borne),
+            microphysics_options,
+        )
+    return core
+
+
+def _activation_term(scheme, params, spec, arg_variant, nactivpdf):
+    """Build the activation term ``activation_scheme`` names."""
+    expected = activation_parameter_class(scheme)   # validates the name
+    if params is not None and not isinstance(params, expected):
+        raise TypeError(
+            f"activation_scheme={scheme!r} takes {expected.__name__}, got "
+            f"{type(params).__name__}.")
+    if scheme == "arg":
+        if nactivpdf:
+            raise ValueError(
+                "nactivpdf is HAM's updraft PDF switch; it applies only to "
+                "activation_scheme='ham_arg'.")
+        return ArgActivation(params=params, spec=spec, variant=arg_variant)
+    if scheme == "ham_lin_leaitch" and nactivpdf:
+        raise ValueError(
+            "Lin & Leaitch uses a single updraft (setphys.f90 sets nw = 1 for "
+            "ncd_activ = 1); nactivpdf must stay 0.")
+    return HamActivation(spec, params, scheme=scheme.removeprefix("ham_"),
+                         nactivpdf=nactivpdf)
 
 
 def jam_aerosol_physics(
     *,
     microphysics: ModalMicrophysicsTerm | str = "placeholder",
+    microphysics_options: Mapping[str, Any] | None = None,
+    cloud_borne: bool | None = None,
     arg_variant: str = "arg2000",
+    activation_scheme: str = "arg",
+    nactivpdf: int = 0,
     optics: bool = True,
+    optics_backend: str = "jcm",
+    optics_diagnostics: bool = False,
+    ham_optics_tables_dir: str | os.PathLike | None = None,
     seasalt: SeaSaltParameters | None = None,
+    seasalt_scheme: str = "gong",
     dms: DmsParameters | None = None,
     dust: DustParameters | None = None,
+    dust_preset: int = 4,
+    dust_nudged: bool = False,
+    dust_nduscale_scale: float | None = None,
+    dust_field_overrides: Mapping[str, Any] | None = None,
     anthropogenic: bool = False,
     anthropogenic_params: EmissionParameters | None = None,
     prescribed_speciated: bool = False,
@@ -108,21 +317,134 @@ def jam_aerosol_physics(
     sulfur_gas: SulfurGasParameters | None = None,
     aqueous: AqueousSulfurParameters | None = None,
     aqueous_scheme: str = "full",
-    ice_scheme: str = "niemand",
-    ice_nucleation_params: IceNucleationParameters | None = None,
-    activation: ArgParameters | None = None,
+    incloud_impaction: str = "ham",
+    below_cloud_lookup: str = "ham",
+    stratiform_nucleation: str = "ham",
+    freezing_classes: HamFreezingClasses | None = None,
+    activation: ArgParameters | HamActivationParameters | None = None,
+    cloud_borne_exchange: CloudBorneExchangeParameters | None = None,
     sedimentation: SedParameters | None = None,
     drydep: DryDepParameters | None = None,
     wetdep: WetDepParameters | None = None,
+    wetdep_scheme: str = "jcm",
+    nucleation_activation: str | None = None,
+    vertical_mixing: bool = True,
+    tracer_diffusion: TracerDiffusionParameters | None = None,
+    convective_transport: bool = True,
+    conv_transport: ConvTransportParameters | None = None,
 ) -> list[PhysicsTerm]:
     """Build the ordered JAM harness term list.
 
     Args:
-        microphysics: the swappable core — ``"placeholder"`` or a
-            ``ModalMicrophysicsTerm`` instance.
+        microphysics: the swappable core — ``"placeholder"``,
+            ``"mam4_jax"`` (fixed substeps), ``"mam4_jax_astem"``
+            (CAM's adaptive semi-implicit solve), or a term instance.
+        optics_backend: which ``_mode_optics`` implementation ``optics=True``
+            attaches (``docs/source/design/jam_optics_mode_seam.md``):
+            ``"jcm"`` (default) is the on-the-fly Gauss-Hermite quadrature
+            over jcm's own Mie LUT; ``"ham_lut"`` is ``HamLutOpticsTerm``,
+            ECHAM-HAM M7's own nearest-neighbour Mie-table lookup (#1017).
+            This is the one in-tree exception to the seam's "no registry"
+            design — the implementation lives in this repository, so it
+            gets a selector here rather than requiring an out-of-tree
+            subclass and a manual ``physics.replace(...)``.
+        ham_optics_tables_dir: directory holding HAM's authentic Mie LUT
+            NetCDF files for ``optics_backend="ham_lut"`` (see
+            ``ham_mie_tables.load_ham_mie_tables``). ``None`` (default)
+            reads the ``HAM_INPUT_DIR`` environment variable; ignored for
+            ``optics_backend="jcm"``.
+        wetdep_scheme: ``WetScavenging``'s stratiform below-cloud and
+            in-cloud nucleation pathways (jax-gcm#1017). ``"jcm"`` (default)
+            is CAM's Slinn-table below-cloud impaction with the implicit
+            activated-fraction nucleation scavenging. ``"ham_below_cloud"``
+            replaces only the below-cloud pathway with ECHAM-HAM's
+            size-dependent Croft tables (``bc_rain``/``bc_snow``), for
+            below-cloud ablation runs. ``"ham"`` is ECHAM-HAM's ``nwetdep=3``
+            scheme: the Croft below-cloud tables plus HAM's own nucleation
+            scavenging ``ic_scav_nuc``
+            (``jcm.physics.aerosol.jam.wetdep.ham_nucleation``). In-cloud
+            impaction (``ic_scav_imp``) is selected by ``incloud_impaction``
+            under every scheme, so ``"ham"`` with the default
+            ``incloud_impaction="ham"`` is the full ``nwetdep=3``. The HAM
+            schemes need ``cloud_scheme="2m"``, which alone publishes
+            ``"precip_cover"``/``"pfrain"``/``"pfsnow"`` (``echam_physics``
+            wires that). See ``WetScavenging.__init__``.
+        nucleation_activation: only consulted for ``wetdep_scheme="ham"``
+            -- ``"ham_arg"`` or ``"ham_lin_leaitch"``, HAM's own
+            ``ncd_activ`` switch for which activation scheme
+            ``ic_scav_nuc`` reads its critical radius and per-mode fraction
+            from. ``ic_scav_nuc`` reads whatever activation term this
+            factory actually composed (:func:`_activation_term`, keyed by
+            ``activation_scheme``), so the two selectors MUST agree: ``None``
+            (default) derives it FROM ``activation_scheme`` when that is
+            itself ``"ham_arg"``/``"ham_lin_leaitch"`` (the common case --
+            one selector controls both), and an explicit value is checked
+            against ``activation_scheme`` and rejected on a mismatch (e.g.
+            ``nucleation_activation="ham_arg"`` with
+            ``activation_scheme="ham_lin_leaitch"`` would read
+            ``ic_scav_nuc``'s critical-radius/fraction inputs from the
+            WRONG activation term's output). ``activation_scheme="arg"``
+            (CAM's own ARG, the default) has no ``ncd_activ`` analogue at
+            all (see ``WetScavenging.__init__``'s docstring), so it cannot
+            satisfy ``wetdep_scheme="ham"`` either way -- pass
+            ``activation_scheme="ham_arg"`` or ``"ham_lin_leaitch"``
+            explicitly alongside ``wetdep_scheme="ham"``.
+        microphysics_options: keyword arguments forwarded to a string-named
+            core's constructor (e.g. ``{"nucleation_scheme": 2}`` for
+            ``"m7_jax"``'s Kazil/Lovejoy (2007) ion-mediated nucleation, or
+            ``{"core_dtype": "float32"}`` for its forward-only float32
+            core). ``None`` (default) means today's call for every core —
+            MAM4 and the placeholder are unaffected. An unknown key raises,
+            naming the core and the keys its constructor actually accepts.
+            Only valid for a string-named core; an already-constructed
+            ``ModalMicrophysicsTerm`` instance has made these choices
+            itself, so passing both is an error — construct the instance
+            with the keyword arguments directly instead.
+        cloud_borne: prognose an explicit cloud-borne aerosol phase (#602).
+            ``None`` (default) follows the core population's own
+            ``spec.cloud_borne``; ``True``/``False`` override it for a
+            string-named core (and merely validate an instance core). On:
+            the ``mc_*``/``nc_*`` phase lives in the physics carry and is
+            cycled — activation transfer + resuspension
+            (``CloudBorneExchange``), in-droplet wet removal, surface dry
+            deposition, and the aqueous sulfate split. Off: no cloud-borne
+            store at all and the harness scavenges interstitial aerosol by
+            its activated fraction, the implicit M7/TOMAS-style treatment.
+            Both settings are complete physics, one flag apart.
         arg_variant: ``"arg2000"`` (default) or ``"ghosh2025"`` activation.
+        activation_scheme: ``"arg"`` (default; CAM's ARG on κ with
+            ``arg_variant``), ``"ham_arg"`` or ``"ham_lin_leaitch"``
+            (ECHAM-HAM's activation, :class:`HamActivation`; ``arg_variant``
+            is then unused). ``activation`` takes the matching Parameters
+            class (:func:`activation_parameter_class`).
+        nactivpdf: HAM's updraft switch for ``"ham_arg"``: ``0`` (default)
+            a single characteristic updraft, ``1`` the West et al. (2013)
+            20-bin PDF, ``n > 1`` an ``n``-bin PDF.
         seasalt/dms/dust: optional ``Parameters`` overrides for the natural
-            emission schemes (Gong sea salt, Nightingale DMS, Tegen dust).
+            emission schemes (Gong/Long sea salt, Nightingale DMS, Tegen dust).
+        seasalt_scheme: ``"gong"`` (default, unchanged) or ``"long"`` (Long
+            et al. 2011 + the Sofiev et al. 2011 SST correction, HAM
+            ``nseasalt=7``; #1017). ``"long"`` requires the microphysics
+            core's population to carry exactly two ``ss`` classes of
+            different size (HAM's accumulation and coarse roles) — see
+            :class:`~jcm.physics.aerosol.jam.emissions.seasalt.SeaSaltEmissions`.
+        dust_preset: HAMMOZ ``ndust`` preset — 4 (default, Stier 2005 +
+            East-Asian soils = HAM2), 5 (HAM2 + the MSG-SEVIRI Saharan
+            source-activation map; needs ``forcing.dust_msg``), 3
+            (Stier 2005) or 2 (Cheng 2008). Ignored when an explicit ``dust``
+            parameter object is given.
+        dust_nudged: use HAM's nudged regional tuning vector (0.95/1.25 at
+            T63) rather than the free-running one (1.05/1.45).
+        dust_nduscale_scale: global multiplier on that regional vector, jcm's
+            single dust calibration knob (#808). ``None`` takes the
+            calibrated default (T63 ndust=4 or 5 only; HAM's value elsewhere).
+        dust_field_overrides: a mapping of :class:`DustParameters` field
+            overrides, applied by :meth:`DustEmissions.cache_coords` on the
+            preset resolved for the model's own truncation (jax-gcm#995/
+            #1123) — not here, where the grid is not yet known. An explicit
+            ``dust`` object given alongside it wins, as it does everywhere
+            else in this factory; the overrides are then inert (there is no
+            base left for them to apply to).
         anthropogenic: include prescribed CEDS anthropogenic emissions (#498),
             the *bulk* path (in-model differentiable speciation + smooth
             injection); ``anthropogenic_params`` overrides the defaults.
@@ -134,25 +456,102 @@ def jam_aerosol_physics(
             prescribed-oxidant + gas-phase + aqueous sulfur chemistry (#496).
         aqueous_scheme: ``"full"`` (default, HAM ``ham_wet_chemistry`` port) or
             ``"simple"`` (H2O2-limited stoichiometric oxidation).
-        ice_scheme: heterogeneous freezing scheme — ``"niemand"`` (default,
-            singular/active-site) or ``"lohmann_diehl"`` (ECHAM-HAM number-based);
-            ``ice_nucleation_params`` overrides the differentiable defaults.
-        activation/sedimentation/drydep/wetdep: optional per-process
-            ``Parameters`` overrides (each ``None`` resolves to its default).
+        incloud_impaction: in-cloud impaction scavenging of interstitial
+            aerosol by droplets and ice crystals: ``"ham"`` (default, HAM's
+            ``ic_scav_imp`` with its three r7492 lookup defects corrected),
+            ``"ham_r7492"`` (the compiled r7492 lookup) or ``"none"``. See
+            ``WetScavenging``.
+        below_cloud_lookup: the Croft rain lookup of the HAM below-cloud
+            schemes (``wetdep_scheme="ham_below_cloud"``/``"ham"``):
+            ``"ham"`` (default, r7492's two ``bc_rain`` lookup defects
+            corrected) or ``"ham_r7492"`` (the compiled routine).
+        stratiform_nucleation: the WEIGHT on stratiform nucleation
+            scavenging of droplet/crystal-resident aerosol under
+            ``wetdep_scheme="jcm"`` (#1080): ``"ham"`` (default) is
+            ECHAM-HAM's mode-wise, temperature-regime fraction table
+            (``mo_ham_wetdep.f90::get_icscavfrac`` ``kscavICtype=2``,
+            ``wetdep.stratiform_fractions``); ``"activated_fraction"`` is
+            the pre-#1080 behaviour (ARG's own per-mode activated fraction
+            with no explicit cloud-borne phase, or no cap at all with one).
+            Inert under ``wetdep_scheme="ham"``, which already runs HAM's
+            own size-dependent ``ic_scav_nuc``. See ``WetScavenging``.
+        freezing_classes: which classes of the population play HAM's roles in
+            the aerosol inputs to mixed-phase freezing (``HamFreezingClasses``);
+            ``None`` takes the MAM4 mapping, ``MAM4_FREEZING_CLASSES``.
+        activation/cloud_borne_exchange/sedimentation/drydep/wetdep/
+            tracer_diffusion/conv_transport: optional per-process
+            ``Parameters`` overrides (each ``None`` resolves to its
+            default).
+        vertical_mixing: turbulent vertical diffusion of every JAM tracer
+            with the TTE-TKE exchange coefficients (#602 item 2 — ECHAM
+            diffuses all tracers in vdiff; without this the dycore is the
+            sole aerosol transporter). On by default.
+        convective_transport: bulk mass-flux transport of the interstitial
+            aerosol and gas tracers through Tiedtke updrafts and
+            downdrafts with compensating subsidence (ECHAM ``cuxtte``
+            analogue; #602 item 2, #622), including in-plume scavenging
+            of every aerosol mode at HAMMOZ's per-mode ``csr_conv`` and
+            the plume's precipitation efficiency (#621) — which moves the
+            convective in-cloud wet-removal pathway out of
+            ``WetScavenging`` (``in_plume_convective``). Cloud-borne
+            mirrors are deliberately excluded — their updraft processing
+            is entangled with convective scavenging and neither reference
+            model transports a stratiform cloud-borne phase convectively.
+            On by default.
+
+    Stratiform in-cloud wet removal and cloud-borne resuspension key to
+    the cloud scheme's process-time scavenging ledger (#708 — the
+    ECHAM-HAM ``cloud_subm`` interface), so the harness requires a cloud
+    scheme that publishes the ``CloudData`` ledger fields (the 2M
+    scheme); ``echam_physics`` enforces this at compose time.
 
     Returns:
         The ordered term list: natural emissions, prescribed oxidants and
         gas-phase sulfur chemistry, the microphysics core (optionally followed
-        by online optics), activation, sedimentation, dry deposition, in-cloud
+        by online optics), activation, sedimentation, dry deposition,
+        cloud-borne exchange (when the population prognoses one), in-cloud
         aqueous sulfur chemistry, and wet deposition.
 
     """
-    core = _resolve_microphysics(microphysics)
+    # ``ic_scav_nuc`` (wetdep_scheme="ham") reads whichever activation term
+    # ``_activation_term(activation_scheme, ...)`` below actually composed,
+    # so the two selectors must name the SAME scheme; see the
+    # ``nucleation_activation`` Args entry above for the full rationale.
+    # Irrelevant for any other ``wetdep_scheme`` (WetScavenging never
+    # consults it), so resolve to an inert placeholder rather than raise.
+    if wetdep_scheme == "ham":
+        if nucleation_activation is None:
+            if activation_scheme not in ("ham_arg", "ham_lin_leaitch"):
+                raise ValueError(
+                    "wetdep_scheme='ham' requires activation_scheme="
+                    "'ham_arg' or 'ham_lin_leaitch' (HAM's own ic_scav_nuc "
+                    "has no analogue for CAM's own 'arg' -- see "
+                    "WetScavenging.__init__'s docstring); got "
+                    f"activation_scheme={activation_scheme!r}. Pass "
+                    "activation_scheme='ham_arg' (or 'ham_lin_leaitch') "
+                    "explicitly."
+                )
+            nucleation_activation = activation_scheme
+        elif nucleation_activation != activation_scheme:
+            raise ValueError(
+                "wetdep_scheme='ham' requires nucleation_activation to "
+                "match activation_scheme -- ic_scav_nuc reads whichever "
+                "activation term was actually composed, so a mismatch "
+                "would read it from the wrong one; got "
+                f"nucleation_activation={nucleation_activation!r} with "
+                f"activation_scheme={activation_scheme!r}."
+            )
+    elif nucleation_activation is None:
+        nucleation_activation = "ham_arg"
+    core = _resolve_microphysics(
+        microphysics, cloud_borne, microphysics_options)
     spec = core.spec
     emissions = [
-        SeaSaltEmissions(params=seasalt, spec=spec),
+        SeaSaltEmissions(params=seasalt, spec=spec, scheme=seasalt_scheme),
         DmsEmissions(params=dms, spec=spec),
-        DustEmissions(params=dust, spec=spec),
+        DustEmissions(params=dust, ndust=dust_preset, nudged=dust_nudged,
+                      nduscale_scale=dust_nduscale_scale, spec=spec,
+                      field_overrides=dust_field_overrides),
     ]
     if anthropogenic:
         # Prescribed CEDS anthropogenic SO2/BC/OC (#498); inert until forcing
@@ -164,29 +563,138 @@ def jam_aerosol_physics(
         # CAM6/MAM4-faithful already-speciated emissions (#498); inert until
         # per-tracer forcing fields are supplied.
         emissions.append(PreSpeciatedEmissions())
-    pre_core = [
-        *emissions,
+    if emissions:
+        # Must precede every emitter: the emi_* accumulators are additive
+        # across terms, and the diagnostics dict is threaded back in from the
+        # previous step, so they have to be zeroed once per step.
+        from jcm.physics.aerosol.jam.emissions.flux_diagnostic import (
+            ResetEmissionFluxes)
+        emissions = [ResetEmissionFluxes(), *emissions]
+    chemistry = [
         # Sulfur chemistry: oxidants → gas-phase DMS/SO2 oxidation, producing
         # the H2SO4/SOAG gas the core condenses + nucleates this same step.
         PrescribedOxidants(params=oxidants),
         SulfurGasChemistry(params=sulfur_gas),
     ]
+    # Physics-side vertical transport (#602 item 2). The tracer set is
+    # everything the composed JAM terms declare (aerosol in both phases +
+    # gas precursors); ECHAM's vdiff diffuses all of them. Convection
+    # moves the interstitial + gas tracers only (see the docstring).
+    # Placed right after the emitters so the narrative order matches
+    # ECHAM's physc (vdiff -> convection -> chemistry). Each transport term
+    # reads the running working population; source mass can mix before it
+    # reaches chemistry and deposition in the same step.
+    transport_names: list[str] = []
+    for _t in [core, *emissions, *chemistry]:
+        for _s in _t.required_tracers():
+            if _s.name not in transport_names:
+                transport_names.append(_s.name)
+    transport_terms: list[PhysicsTerm] = []
+    if vertical_mixing:
+        transport_terms.append(
+            TracerVerticalDiffusion(
+                tuple(transport_names), params=tracer_diffusion,
+            )
+        )
+    if convective_transport:
+        interstitial_names = tuple(
+            n for n in transport_names if not n.startswith(("mc_", "nc_"))
+        )
+        # In-plume scavenging (jax-gcm#621): every aerosol tracer of a mode
+        # takes HAMMOZ's convective in-droplet fraction ``csr_conv`` of the
+        # M7 class the mode corresponds to (number and mass alike;
+        # ``wetdep.convective_fractions.HAM_CSR_CONV`` holds the mapping and
+        # its reasoning); the gas precursors ride the plume unscavenged.
+        # WetScavenging retires its own environment-profile convective
+        # pathway in turn (``in_plume_convective`` below).
+        csr_of: dict[str, float] = {}
+        for mode in spec.modes:
+            csr = convective_csr(mode)
+            csr_of[number_name(mode.short)] = csr
+            for sp in mode.species:
+                csr_of[mass_name(sp, mode.short)] = csr
+        transport_terms.append(
+            ConvectiveTracerTransport(
+                interstitial_names, params=conv_transport,
+                csr_conv=tuple(csr_of.get(n, 0.0) for n in interstitial_names),
+            )
+        )
+    # Carry-stored cloud-borne phase (#602 item 3, the measured decision
+    # — see cloud_borne_store, which also records why the advected-tracer
+    # alternative was removed): the store term runs first so every
+    # consumer this step sees a well-formed store, and applies the
+    # carry's turbulent vertical mixing (its fields are not in
+    # state.tracers, so TracerVerticalDiffusion never sees them).
+    # The carry's mixing uses the same exchange-coefficient scale as the
+    # advected tracers' (``TracerDiffusionParameters``), so one setting must
+    # reach both phases; each term holds its own copy of the object.
+    store_terms = (
+        [CloudBorneCarryStore(params=tracer_diffusion, spec=spec,
+                              vertical_mixing=vertical_mixing)]
+        if carry_mode(spec) else []
+    )
+    pre_core = [
+        # Own the shared ``aerosol`` carry slot (#640). Radiation hard-requires
+        # it and the 2M microphysics reads ``aerosol.Nccn``; with MACv2-SP gone
+        # from the JAM path this seeder resets it to an all-zero base each step
+        # (JamOpticsTerm overwrites the optics when ``optics=True``; left zero =
+        # radiatively passive when ``optics=False``). Runs first so every
+        # downstream aerosol/radiation consumer sees a well-formed slot.
+        AerosolCarrySeeder(),
+        *store_terms,
+        *emissions,
+        *transport_terms,
+        *chemistry,
+    ]
     # Online aerosol direct radiative effect (#495): placed right after the core
     # (needs ``_jam_state``); overwrites the MACv2-SP ``aerosol`` optics.
-    optics_terms = [JamOpticsTerm(spec=spec)] if optics else []
+    # ``optics_diagnostics`` adds the AeroCom per-species / per-mode /
+    # spectral optics pass (jax-gcm#584) — a second Mie sweep at the
+    # observation wavelengths, off unless a run asks for it.
+    if optics_backend == "jcm":
+        optics_extra_kwargs = {}
+        optics_cls = JamOpticsTerm
+    elif optics_backend == "ham_lut":
+        # HAM's own authentic Mie LUTs (#1017): loaded from HAM_INPUT_DIR
+        # (or this explicit override) at construction, never built by jcm
+        # itself -- see ham_mie_tables.py's module docstring for why.
+        optics_extra_kwargs = {"tables_dir": ham_optics_tables_dir}
+        optics_cls = HamLutOpticsTerm
+    else:
+        raise ValueError(
+            f"Unknown optics_backend={optics_backend!r}. Choose 'jcm' or "
+            "'ham_lut'."
+        )
+    optics_terms = [
+        optics_cls(spec=spec, optics_diagnostics=optics_diagnostics, **optics_extra_kwargs)
+    ] if optics else []
     post_core = [
-        ArgActivation(params=activation, spec=spec, variant=arg_variant),
-        # Heterogeneous ice nucleation on dust/BC → ``ice_nuclei`` for the 2M
-        # cloud scheme (#494). Harmless with the 1M scheme (diagnostic unused).
-        IceNucleation(
-            params=ice_nucleation_params, spec=spec, scheme=ice_scheme,
-        ),
+        _activation_term(activation_scheme, activation, spec, arg_variant,
+                         nactivpdf),
+        # ECHAM-HAM's aerosol inputs to mixed-phase freezing (mo_ham_freezing
+        # ham_IN_setup) -> ``freezing_aerosol``, which the 2M scheme turns into
+        # contact + immersion freezing rates (#953). After ARG: HAM's
+        # activated number per class is ARG's.
+        IceNucleation(spec=spec, classes=freezing_classes),
         StokesSedimentation(params=sedimentation, spec=spec),
-        SlinnDryDeposition(params=drydep, spec=spec),
+        CAMDryDeposition(params=drydep, spec=spec),
+        # Cloud-borne cycling (#602): activation transfer + resuspension
+        # against the current step's cloud field, so it runs in the
+        # post-cloud block, before the aqueous chemistry that splits its
+        # product by cloud-borne number and the scavenging that drains the
+        # reservoir. Only composed when the population prognoses the phase.
+        *([CloudBorneExchange(params=cloud_borne_exchange, spec=spec)]
+          if spec.cloud_borne else []),
         # In-cloud aqueous SO2 oxidation → cloud-borne sulfate; runs in the
         # post-cloud block (needs current clouds), just before wet scavenging.
         AqueousSulfur(params=aqueous, spec=spec, scheme=aqueous_scheme),
-        WetScavenging(params=wetdep, spec=spec),
+        WetScavenging(params=wetdep, spec=spec,
+                      in_plume_convective=convective_transport,
+                      scheme=wetdep_scheme,
+                      nucleation_activation=nucleation_activation,
+                      incloud_impaction=incloud_impaction,
+                      below_cloud_lookup=below_cloud_lookup,
+                      stratiform_nucleation=stratiform_nucleation),
     ]
     terms = [*pre_core, core, *optics_terms, *post_core]
     return terms

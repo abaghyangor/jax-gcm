@@ -3,6 +3,7 @@
 import types
 import unittest
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -11,6 +12,7 @@ from jcm.physics.aerosol.jam.chemistry.oxidants import (
     PrescribedOxidants,
     air_number_density,
     oxidant_field,
+    oxidant_field_from_vmr,
 )
 from jcm.physics_interface import PhysicsState
 
@@ -25,6 +27,21 @@ class AirNumberDensityTest(unittest.TestCase):
         n_sfc = air_number_density(jnp.asarray(250.0), jnp.asarray(1.0e5))
         n_top = air_number_density(jnp.asarray(250.0), jnp.asarray(1.0e4))
         self.assertGreater(float(n_sfc), float(n_top))
+
+    def test_temperature_gradient_finite_across_the_full_range(self):
+        """``d(n_air)/dT`` is finite at every T (#971, the ``k_B*T`` denominator).
+
+        Before the fix (``n = P/(k_B*T)*1e-6``) the reverse pass needed
+        ``(k_B*T)**2``, which underflows float32 at EVERY atmospheric
+        temperature (``k_B*T`` ~ 1e-21 regardless of T), so this failed for
+        every T, not just a cold edge.
+        """
+        for p in (1.0e5, 9.0e4, 1.0):
+            for t in (320.0, 290.0, 200.0, 100.0, 50.0):
+                g = jax.grad(air_number_density, argnums=0)(
+                    jnp.asarray(t, jnp.float32), jnp.asarray(p, jnp.float32))
+                self.assertTrue(np.isfinite(float(g)), (t, p))
+                self.assertLess(float(g), 0.0)  # denser air as T falls
 
 
 class OxidantFieldTest(unittest.TestCase):
@@ -98,6 +115,91 @@ class PrescribedOxidantsTermTest(unittest.TestCase):
             self.assertTrue(np.all(a >= 0.0))
         # Fallback O3 is finite and positive.
         self.assertGreater(float(ox.o3.mean()), 0.0)
+
+
+class PrescribedOxidantsFromFileTest(unittest.TestCase):
+    """The prescribed-climatology path (``forcing.oxidant_vmr``)."""
+
+    def _state(self, nlev=3, ncols=2):
+        return PhysicsState.zeros((nlev, ncols)).copy(
+            temperature=jnp.full((nlev, ncols), 280.0),
+        )
+
+    def _vmr(self, shape):
+        return {
+            "oh": jnp.full(shape, 1.0e-13),
+            "no3": jnp.full(shape, 2.0e-14),
+            "o3": jnp.full(shape, 4.0e-8),
+            "h2o2": jnp.full(shape, 5.0e-10),
+        }
+
+    def test_vmr_converts_with_air_density(self):
+        t = jnp.full((3, 2), 280.0)
+        p = jnp.full((3, 2), 9.0e4)
+        f = oxidant_field_from_vmr(t, p, self._vmr((3, 2)))
+        n_air = air_number_density(t, p)
+        np.testing.assert_allclose(
+            np.asarray(f.o3), np.asarray(4.0e-8 * n_air), rtol=1e-6
+        )
+        np.testing.assert_allclose(
+            np.asarray(f.oh), np.asarray(1.0e-13 * n_air), rtol=1e-6
+        )
+
+    def test_negative_vmr_clamped(self):
+        t = jnp.full((3, 2), 280.0)
+        p = jnp.full((3, 2), 9.0e4)
+        vmr = self._vmr((3, 2))
+        vmr["no3"] = jnp.full((3, 2), -1.0e-12)
+        f = oxidant_field_from_vmr(t, p, vmr)
+        self.assertEqual(float(f.no3.max()), 0.0)
+
+    def test_grid_layout_reshapes_to_columns(self):
+        # A (nlev, lon, lat) forcing slice against a column-vectorized
+        # (nlev, ncols) state reshapes level-preserving (C order).
+        t = jnp.full((3, 6), 280.0)
+        p = jnp.full((3, 6), 9.0e4)
+        f = oxidant_field_from_vmr(t, p, self._vmr((3, 3, 2)))
+        self.assertEqual(f.o3.shape, (3, 6))
+
+    def test_term_prefers_file_climatology_over_proxies(self):
+        state = self._state()
+        diagnostics = {
+            "pressure_full": jnp.full((3, 2), 9.0e4),
+            # Carry chemistry/radiation so the proxy path *would* produce a
+            # different (nonzero-OH daytime) answer if it were taken.
+            "chemistry": types.SimpleNamespace(
+                ozone_vmr=jnp.full((3, 2), 0.05)
+            ),
+            "radiation": types.SimpleNamespace(
+                cos_zenith=jnp.full((2,), 0.8)
+            ),
+        }
+        forcing = types.SimpleNamespace(oxidant_vmr=self._vmr((3, 2)))
+        _, diags = PrescribedOxidants()(state, diagnostics, forcing, None)
+        ox = diags["oxidants"]
+        n_air = air_number_density(
+            state.temperature, diagnostics["pressure_full"]
+        )
+        np.testing.assert_allclose(
+            np.asarray(ox.o3), np.asarray(4.0e-8 * n_air), rtol=1e-6
+        )
+        # OH from the file (1e-13 VMR · n_air ≈ 2e6) — not the cos-zenith
+        # proxy, which for these inputs would be 2.5e6 · 0.8 · 1.25 = 2.5e6.
+        proxy = oxidant_field(
+            state.temperature, diagnostics["pressure_full"],
+            jnp.full((3, 2), 0.05), jnp.full((3, 2), 0.8),
+            OxidantParameters.default(),
+        )
+        self.assertFalse(np.allclose(np.asarray(ox.oh), np.asarray(proxy.oh)))
+
+    def test_term_falls_back_without_field(self):
+        # ``oxidant_vmr=None`` (the ForcingData default) keeps the proxies.
+        state = self._state()
+        diagnostics = {"pressure_full": jnp.full((3, 2), 9.0e4)}
+        forcing = types.SimpleNamespace(oxidant_vmr=None)
+        _, diags = PrescribedOxidants()(state, diagnostics, forcing, None)
+        for arr in (diags["oxidants"].oh, diags["oxidants"].o3):
+            self.assertTrue(np.all(np.isfinite(np.asarray(arr))))
 
 
 if __name__ == "__main__":

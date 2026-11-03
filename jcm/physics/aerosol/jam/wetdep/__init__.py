@@ -1,17 +1,25 @@
 """Aerosol wet deposition for the JAM harness."""
 
+from jcm.physics.aerosol.jam.wetdep.impaction import (
+    bcscavcoef,
+    build_impaction_table,
+    impaction_scavenging_rates,
+    table_log_coefficients,
+)
 from jcm.physics.aerosol.jam.wetdep.wetdep_term import (
     WetScavenging,
     WetDepParameters,
     below_cloud_rate,
-    in_cloud_rate,
-    precip_formation_rate,
+    reinjection_budget,
 )
 
 __all__ = [
     "WetScavenging",
     "WetDepParameters",
-    "precip_formation_rate",
-    "in_cloud_rate",
+    "reinjection_budget",
     "below_cloud_rate",
+    "bcscavcoef",
+    "build_impaction_table",
+    "impaction_scavenging_rates",
+    "table_log_coefficients",
 ]

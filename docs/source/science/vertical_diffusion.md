@@ -1,0 +1,539 @@
+# Vertical diffusion (boundary-layer turbulence)
+
+**What we do.** Boundary-layer turbulent mixing is ECHAM6.3's ``vdiff`` TKE
+closure (``vdiff.f90`` r7492), wrapped as the composable term
+``jcm/physics/vertical_diffusion/tte_tke/vertical_diffusion.py::TteTkeVerticalDiffusion``.
+It carries a prognostic TKE and θᵥ variance on the interfaces, as ECHAM does:
+shear and buoyancy production and dissipation in ECHAM's implicit form, then
+implicit transport. The exchange coefficients are ``K = S·l·√e`` with Louis
+(1979) stability functions ``S`` of the moist Richardson number and Blackadar's
+mixing length ``l`` under a diagnosed boundary-layer extension (*Closure*,
+below). The implicit solve (``matrix_solver.py``, ``vdiff.f90`` sections 3.8,
+4 and 5) diffuses momentum, ECHAM's dry static energy, moisture and
+condensate, and returns the kinetic energy the momentum diffusion removes as
+heat. The term owns the whole turbulent column ECHAM-style. Momentum couples to the surface
+through one bottom-row Robin term with the fraction-weighted drag. Heat and
+moisture couple tile by tile, as ECHAM6.3's ``richtmyer_land``/``_ocean``/``_ice``
+and ``blend_zq_zt`` do. After the top-down elimination, each tile relates the
+lowest level to its own surface value, ``X̂_K,t = E_t·X̂_s,t + F_t``. The land
+tile solves its skin energy balance against its own coefficients (see
+{doc}`surface`), the bottom value is the fraction-weighted blend, and each tile's
+flux is taken against its own lowest-level value. The delivered fluxes are
+diagnosed from the implicit solution (the ``pev_vdiff`` identity: reported
+equals delivered by construction). Surface-layer exchange coefficients use a
+faithful Louis (1979) port of ECHAM6.3's own stability functions, in both the
+stable and unstable branches (``surface_layer.py``,
+``mo_surface_land.f90::precalc_land`` and the matching ``precalc_ocean``/
+``precalc_ice``) — not ICON's own ``mo_turbulence_diag::sfc_exchange_coeff``,
+whose stable branch is instead Mauritsen et al. (2007).
+The interior stability — the Richardson number that scales the mixing length
+and the buoyancy term of the TKE budget — is ECHAM's moist, cloud-weighted
+buoyancy of each interface (see *Interior stability* below).
+TKE and the θᵥ variance floor at ECHAM's ``ztkemin = 1e-10``; the exchange
+coefficients have no floor or cap (ECHAM has none), and the friction velocity
+floors at 0.01 m/s. Tracer diffusion is a separate generic
+term ``tracer_diffusion.py::TracerVerticalDiffusion`` that mixes an explicit
+tracer list with the ``kh`` profile the TTE-TKE term publishes, via one batched
+unconditionally-stable backward-Euler solve that conserves each tracer's column
+mass exactly.
+
+**What ECHAM/CAM does.** ICON/ECHAM6 ``vdiff`` (Brinkop & Roeckner 1995;
+Mauritsen et al. 2007 total-turbulent-energy closure) — prognostic TKE,
+Louis/Mauritsen surface-layer stability functions, and an implicit column solve
+whose bottom row couples to the surface tiles through the Richtmyer–Morton
+elimination (ECHAM6.3 ``vdiff.f90`` with ``mo_surface_land/ocean/ice``;
+ICON's ``mo_vdiff_solver.f90``, ``mo_turbulence_diag.f90``). ECHAM diffuses every tracer with the heat exchange
+coefficient ``cfh`` (the ``pxtte`` update in ``mo_vdiff_solver``); CAM diffuses
+all constituents likewise.
+
+**Why we differ.**
+- `differentiability` — SPEEDY's shallow convection and moisture diffusion
+  (``speedy_vdiff.py``) switch fluxes proportional to ``drh`` on hard tests:
+  ``dmse >= 0`` selects shallow convection (``drh >= 0``) or moisture
+  diffusion (``drh > drh0``) at the lowest interface, and ``drh > drh0``
+  starts the diffusion above it. The regime split and the onsets are value
+  jumps with a zero reference derivative. They keep their reference values;
+  with ``vertical_diffusion.mse_gate_smoothing`` / ``rh_gate_smoothing`` > 0
+  they take the derivatives of smooth functions
+  ({doc}`../design/surrogate_gradients`). The lowest interface's moisture
+  flux is one function of the whole block, the two regimes crossfaded by a
+  sigmoid in ``dmse``, shallow convection's ``max(drh, 0)`` a softplus and
+  the onset a sigmoid, so its ``dmse`` derivative is the jump the flux makes,
+  and zero where neither regime carries a flux. A derivative of each
+  regime's flux regardless of its own ``drh`` test would be, below the
+  switch with ``drh < 0``, that of a reversed shallow-convection flux, a
+  positive feedback on the bottom humidity in the tangent-linear model, a
+  tangent unstable where the forward model is not (the hazard of linearised
+  switches in variational-assimilation physics; Janisková and Lopez 2013).
+  On T30 L8 twin forecasts the whitened 7- to 14-day tangent stays within
+  4 % of the width-0 one at ``mse_gate_smoothing`` from 200 to 2000 J/kg in
+  all seven members tested, and from 50 J/kg in the two where that
+  reversed-flux derivative grows it up to 7×10⁴-fold with the forecast
+  bit-identical.
+- `science` — the open-water tile's unstable branch does not reproduce
+  ECHAM6.3's ``precalc_ocean`` free-convection gustiness enhancement (a
+  ``zcr**cgam``-weighted term on top of the Louis base, absent from
+  ``precalc_land``/``precalc_ice``); this scheme shares one unstable form
+  across all three tiles, so that enhancement is not applied over open water
+  (#1147). Every other branch — the stable branch on all three tiles, and
+  the unstable branch on land/ice — is ECHAM6.3's compiled ``precalc_land``/
+  ``precalc_ocean``/``precalc_ice`` form, verified against a 324-column land
+  reference set to round-off (stable) and 0.1 % (unstable).
+- `compute` — the TTE-TKE column solve covers only its fixed variable block
+  (u, v, T, qᵥ, qc, qi, TKE, θᵥ variance), so aerosol/gas tracers are mixed by the
+  separate ``TracerVerticalDiffusion`` term rather than in the same tridiagonal
+  ; its boundaries are zero-flux (surface exchange is dry deposition's job).
+
+The tracer solve consumes the sequential working population, including
+surface emissions already injected this step, and returns only its mixing
+change. `science` — the emitted mass enters the implicit RHS before
+deposition, consistent with ECHAM `mo_vdiff_solver`'s surface tracer source;
+fresh aerosol must not wait a step to mix while being eligible for same-step
+deposition. Source-plus-mixing column conservation is tested explicitly.
+
+**Status & known limitations.** ``TracerVerticalDiffusion`` is a no-op on the
+first step: it reads the previous step's ``kh`` carry, because vdiff runs after
+the aerosol block in the ECHAM ordering, and that carry is zero on step 0. The
+retune of the shipped defaults ({doc}`../design/jam_aerosol_retune`) was made
+with an earlier, simplified closure (constant stability coefficients and a
+fixed 1000 m mixing-length scale), not this one.
+
+**Code pointers.**
+- ``jcm/physics/vertical_diffusion/tte_tke/`` — ``vertical_diffusion.py``
+  (``TteTkeVerticalDiffusion``, ``vertical_diffusion_column``),
+  ``closure.py`` (the TKE closure), ``turbulence_coefficients.py``
+  (``compute_turbulence_diagnostics``), ``matrix_solver.py``
+  (``setup_matrix_system``, ``solve_tridiagonal_system``,
+  ``couple_surface_tiles``), ``surface_layer.py``
+  (``compute_surface_exchange_coefficients_echam_louis``),
+  ``vertical_diffusion_types.py`` (``VDiffParameters``).
+- ``jcm/physics/vertical_diffusion/tracer_diffusion.py`` —
+  ``TracerVerticalDiffusion``, ``diffuse_tracers_implicit``.
+
+## Closure
+
+**What we do.** ``closure.py`` is ``vdiff.f90``'s closure of every interior
+interface:
+
+- the **boundary-layer extension** ``ihpbl``: the higher of the dynamic height
+  ``min(z_top, 0.3·u*/max(|f|, 5×10⁻⁵ s⁻¹))`` (the previous step's ``u*``) and
+  the lowest level whose dry static energy exceeds the lowest level's;
+  ``zghabl = min(50000 m²/s², φ(ihpbl))``;
+- the **mixing length** ``l = κz/(1 + κz/λ)`` (Blackadar) with ``λ = 150 m``
+  (``clam``) at and below the extension and Holtslag and Boville's
+  ``λ = 1 + 149·exp(1 − φ/φ_ihpbl)`` m above it;
+- the **Louis (1979) stability functions** of the moist ``Ri``: unstable
+  ``S = S_n(1 − c·b·Ri·ucf)`` with ``ucf`` the unstable correction, stable
+  ``S_m = S_mn/(1 + 2b·Ri/√(1 + Ri))`` and ``S_h = S_hn/(1 + 2b·Ri·√(1 + Ri))``,
+  with the neutral ``S_hn = 0.691``, ``S_mn = 0.550`` from Mellor-Yamada's
+  level-2 constants and ``b = c = 5`` shared with the surface layer;
+- the **TKE source and dissipation** solved implicitly in ``√e``, with the
+  dissipation constant ``S_mn³ = 0.167``; the exchange coefficients
+  ``K = S·l·√e`` of the previous ``e``, the TKE and variance transport
+  coefficients rescaled to the post-source ``e``;
+- the **θᵥ variance** produced by ``2·K_h·(∂θᵥ/∂z)²`` and dissipated at
+  ``√e/(l/S_mn³)``, whose lowest interior value is the convective trigger's
+  ``thv_sigma``.
+
+TKE, the variance and ``km``/``kh`` live on the interfaces as ECHAM keeps them:
+row ``k`` of the carry is the interface below full level ``k``, and the last
+row is the surface layer's TKE, which the surface tiles supply (Mailhot and
+Benoit 1982: ``(1/S_mn² + stability)·u*² + 0.2·w*²``, fraction-weighted). The
+closure constants are differentiable ``VDiffParameters`` leaves. Heat is
+diffused as ECHAM's dry static energy ``φ + c_pd·T·(1 + vtmpc2·q)`` against
+the tiles' ``c_pd·T_s·(1 + vtmpc2·q_s)``.
+
+**What ECHAM/CAM does.** ``vdiff.f90::vdiff`` (r7492): constants l.560-604;
+PBL extension l.737-765; mixing length l.801-817; Louis functions l.819-832;
+TKE source l.837-848; exchange coefficients l.849-856; variance l.857-866;
+transport of TKE and variance l.1235-1314; momentum, heat and moisture solves
+and the dissipation heating l.877-941, 1212-1229, 1347-1456; the surface TKE
+in ``mo_surface_ocean.f90::precalc_ocean`` (and the land and ice analogues),
+handed over at l.1099-1102.
+
+**Why we differ.**
+- `science` — the geopotential above the surface, which ECHAM's ``vdiff``
+  receives, is formed from the model's geopotential and the hydrostatic
+  thickness of the lowest layer (``geopot.f90``'s discretisation), exactly.
+- `science` — jcm's physics is two-level, so the carried TKE has no Asselin
+  filter (ECHAM's leapfrog applies one, l.1318-1332). ECHAM's RCE switch
+  ``lrce`` (l.756-760), under which the convective level alone sets the
+  boundary-layer extension, is ``VDiffParameters.lrce``: off in every 3D
+  configuration and on in the RCE testbed ({doc}`../design/rce_testbed`), a
+  non-rotating column whose dynamic height ``0.3·u*/|f|`` sits on ECHAM's
+  ``zepcor`` floor of ``|f|``. The first step starts from ECHAM's ``lstart``
+  treatment.
+- `differentiability` — the boundary-layer extension is a level index and the
+  closure keeps ECHAM's branch points (``Ri = 0``, the implicit update's
+  ``zktest = 1``, the floors). Each is differentiated on the branch it selects;
+  the mixing length jumps when the extension moves a level (see
+  {doc}`../design/surrogate_gradients`).
+
+**Code pointers.**
+- ``jcm/physics/vertical_diffusion/tte_tke/closure.py`` — ``interior_closure``,
+  ``pbl_extension``, ``mixing_length``, ``louis_stability``,
+  ``tke_source_update``, ``thv_variance_source_update``,
+  ``surface_tke_boundary``.
+- ``jcm/physics/vertical_diffusion/tte_tke/matrix_solver.py`` —
+  ``setup_matrix_system`` (interface rows), ``heat_variable``,
+  ``compute_tendencies_from_solution`` (dissipation heating).
+- {doc}`../design/tte_tke_closure` — the line-by-line map, the staggering and
+  the checkpoint migration.
+
+**Validation evidence.**
+``jcm/physics/vertical_diffusion/tte_tke/closure_test.py`` compares the
+closure, the implicit TKE/variance/momentum solves and the surface TKE with
+the compiled ``vdiff.f90`` and ``precalc_ocean`` statements for 384 columns and
+192 surface cells (``jcm/data/test/echam_vdiff_reference/vdiff_closure_T63L47.npz``):
+float64 agreement to 7e-14 of each field's largest value, the boundary-layer
+indices identical. ``boundary_layer_cases_test.py`` and
+``scm_boundary_layer_cases_test.py`` pin the neutral, stable and convective
+regimes.
+
+## Interior stability
+
+**What we do.** The buoyancy of every interior interface is ECHAM's
+``zbuoy``: the liquid-water potential temperature ``θ_l = θ − (L/c_p)(θ/T)·x``
+(``x = q_c + q_i``) and the total water ``q_t = q + x`` of the two adjacent full
+levels, averaged to the interface with the layer masses
+(``zsdep1 = Δp_k/(Δp_k + Δp_{k+1})``), weighted by the interface's cloud cover
+``cc`` (the same mass-weighted average of the cover)::
+
+    zbuoy = (∂θ_l/∂z · zdus1 + θ · zdus2 · ∂q_t/∂z) · g / θ_v
+    zdus1 = cc · zmult5 + (1 − cc) · zmult1
+    zdus2 = cc · zmult4 + (1 − cc) · vtmpc1
+
+``zmult1 = 1 + vtmpc1·q_t`` and ``zmult5 = zmult1 − (L/c_p T · zmult1 − rv/rd) ·
+(rd/rv)(L/R_d T) q_s / (1 + (rd/rv)(L/c_p T)(L/R_d T) q_s)`` carry the latent
+heating of the condensation a displaced parcel undergoes, and ``zmult4 =
+(L/c_p T)·zmult5 − 1``. ``q_s`` is the mass-weighted average of the full levels'
+saturation humidities from ECHAM's ``ua`` table
+(``jcm/physics/thermodynamics.py::saturation_specific_humidity``), not the
+saturation at the mean temperature, and ``L`` is the condensation heat at and
+above the melting point and the sublimation heat below it, averaged like the
+rest. A saturated, cloudy layer therefore mixes on its moist-adiabatic
+stability: a layer of uniform ``θ_l`` and ``q_t`` is neutral whatever its dry
+static stability.
+
+The Richardson number ``Ri = zbuoy / max(zshear, 10⁻⁵ s⁻²)`` and the TKE
+source ``zshear·S_m·l − zbuoy·S_h·l`` read this one ``zbuoy``, and the surface
+layer's bulk Richardson number takes the lowest level's cover into the same
+multipliers, on every tile. The cover is the Sundqvist diagnostic
+(``SundqvistCloudFraction``, ECHAM's ``cover``) of the same step, which the
+composition requires upstream of the vertical diffusion.
+
+**What ECHAM/CAM does.** ``vdiff.f90::vdiff`` (r7492) l.658-700 forms
+``zlteta1``, ``ztvir1``, ``zqss`` (from the ``ua`` table), and the half-level
+averages ``zqssm``, ``ztmitte``, ``zfaxen``, ``zccover``; l.777-799 forms
+``zbuoy``, ``zshear`` and ``zri = zbuoy/MAX(zshear, zepshr)``, with
+``zepshr = 1e-5``. The TKE budget (l.837) uses the same ``zbuoy``. The
+surface exchange routines (``mo_surface_land.f90::precalc_land`` l.224-236 and
+the ocean and ice analogues) apply the multipliers to the lowest level with
+``paclc(klev)``.
+
+**The surface layer's reference height.** ``z_ref`` — the lowest full
+level's height above the surface that both the bulk Richardson number
+(``Ri = z_ref·g·zbuoy/(θ_v·max(|U|², 1))``) and the neutral drag
+(``ln(1 + z_ref/z0)``, Businger-Dyer and Louis alike) use — is ECHAM's own
+hydrostatic ``pgeom1(klev)/g``: the lowest layer's own
+``α_K = 1 − p_{K−1/2}·ln(p_{K+1/2}/p_{K−1/2})/Δp_K`` times ``R_d·T_{v,K}``
+(``auxhyb.f90`` for ``α_K``; ``geopot.f90`` l.82 for
+``φ = α_K·R_d·T_v,K + φ_s``, with ``φ_s`` zeroed by ``physc.f90``'s call).
+This is **not** half the gap between the two lowest full levels, which a
+naive ``height_full[-1] − height_half[-1]`` difference gives: the output
+``height_half`` field's surface-adjacent row is an extrapolated bottom
+half-level built for OTHER diagnostics' layer-thickness bookkeeping (see
+{doc}`../design/output_vertical_conventions`), not a surface-layer reference
+height, and the two differ by 77% on the standard L47 levels (32.5 m vs
+57.6 m at 1013 hPa, 288 K) — large enough to move the drag, the Richardson
+number and the 10 m wind reduction that all key off it.
+
+**Why we differ.**
+- `differentiability` — the latent heat switches at the melting point
+  (``FSEL(T − tmelt, alv, als)``, a 13% jump), and the shear is floored under the
+  denominator of ``Ri``. Both are ECHAM's exact values and are differentiated as
+  they stand: the floor is a floor under a denominator, which stays in the value,
+  and the phase switch is the class of jumps the ``ua`` table itself carries
+  (see {doc}`../design/surrogate_gradients` and #843). ``cc`` weights the
+  multipliers linearly, so the buoyancy is differentiable in the cover.
+
+**Code pointers.**
+- ``jcm/physics/vertical_diffusion/tte_tke/moist_buoyancy.py`` —
+  ``interior_buoyancy_terms``, ``cloud_weighted_buoyancy_multipliers`` (the one
+  implementation both the interior and the surface layer call),
+  ``richardson_number``.
+- ``jcm/physics/vertical_diffusion/tte_tke/turbulence_coefficients.py`` —
+  ``compute_richardson_number``, ``businger_dyer_neutral_drag``,
+  ``compute_turbulence_diagnostics``.
+- ``jcm/physics/vertical_diffusion/tte_tke/surface_layer.py`` —
+  ``surface_bulk_richardson``, ``echam_louis_neutral_drag``,
+  ``compute_surface_exchange_coefficients_echam_louis``.
+- ``jcm/physics/vertical_diffusion/tte_tke/closure.py`` —
+  ``lowest_level_height_above_surface`` (the reference height itself).
+- ``jcm/physics/vertical_diffusion/tte_tke/vertical_diffusion.py`` —
+  ``vertical_diffusion_column`` (the TKE source), ``TteTkeVerticalDiffusion``
+  (reads ``diagnostics["clouds"]``).
+
+**Validation evidence.**
+``jcm/physics/vertical_diffusion/tte_tke/moist_buoyancy_test.py`` compares the
+interior ``zbuoy``/``zshear``/``zri`` and their ingredients with the compiled
+statements of ``vdiff.f90`` for 384 columns, and the surface Richardson number
+with ``precalc_land``/``precalc_ocean``/``precalc_ice`` for 96 cells
+(``jcm/data/test/echam_vdiff_reference/``): float64 agreement to the tables'
+interpolation error (6.5e-14 of the largest value in ``zqss``) and 2e-15 in
+the buoyancy and Richardson number; with the tables replaced by the Sonntag fit
+they tabulate, to round-off. The limits are pinned: a layer of uniform ``θ_l``,
+``q_t`` is neutral while dry-stable, the conditionally unstable layer's
+Richardson number falls monotonically with the cover through zero, the dry
+clear limit is ``(g/θ)∂θ/∂z``. ``closure_test.py`` checks
+``lowest_level_height_above_surface`` against this same reference's own
+``pgeom1`` (an independent, non-degenerate 384-column pressure profile);
+``surface_layer_test.py``'s ``TestL47ReferenceHeight`` checks the standard
+L47 levels give the issue's own 32.5 m (not 57.6 m) and that the Louis
+neutral drag and the bulk Richardson number move with it.
+
+## Surface saturation and latent heat
+
+**What we do.** The saturation specific humidity of every surface tile, and of
+the air at the lowest level in the surface-layer Richardson number, is ECHAM's
+``ua`` table: Sonntag (1990) over ice at and below the melting point and over
+water above it (``jcm/physics/thermodynamics.py::saturation_specific_humidity``,
+``phase="auto"``; see {doc}`constants`): the sea-ice tile (at
+``min(SST, 271.38 K)``) always saturates over ice, frozen land does at and
+below 273.15 K. The latent heat in the
+surface-layer buoyancy is the condensation heat when the lowest-level air is at
+or above the melting point and the sublimation heat below, and the
+liquid-water potential temperature subtracts ``(L/c_p)·(θ/T)·q_x`` with the same
+``L``. The latent heat of the delivered moisture flux is assembled per tile:
+``alhc·E`` over open water, ``alhs·E`` over sea ice, and over land
+``alhc·E + (alhs − alhc)·s·E_pot`` with ``s`` the snow-covered fraction (the
+prescribed ``snowc_am``, glaciers fully covered) and ``E_pot`` the flux at full
+wetness. The land's moisture flux carries JSBACH's humidity factors,
+``ρ·C·(csat·q_s − cair·q̂_K)`` (see {doc}`surface`). The snow-covered share
+evaporates at the potential rate within them, so the land flux always covers
+the snow share the sublimation heat is charged to. The same factors set the
+surface humidity the surface-layer buoyancy sees, ``csat·q_s + (1 − cair)·q_a``
+(``precalc_land``). Each tile's latent heat comes from its own flux against its
+own lowest-level value, and the reported latent heat is their fraction-weighted
+sum, so it stays exactly consistent with the delivered moisture flux.
+
+**What ECHAM/CAM does.** ECHAM's ``precalc_ocean``/``precalc_ice``/
+``precalc_land`` read the tile saturation from the ``tlucua`` table
+(``mo_echam_convect_tables``), which switches from water to ice at the melting
+point with no mixed-phase blend, as does the lowest-level ``zqss`` in
+``vdiff.f90``; ``zfaxe = FSEL(T − tmelt, alv, als)`` sets the latent heat in the
+buoyancy and in ``zlteta1``. ``postproc_ice`` reports ``als·E`` and JSBACH
+(``mo_soil.f90``) reports ``alv·E_T + (als − alv)·snow_fract·E_pot``, with the
+snow fraction entering the land ``csat``/``cair`` as
+``snow_fract + (1 − snow_fract)·(…)`` (``qsat_fact``).
+
+**Why we differ.** The snow-covered fraction is the prescribed climatology
+until snow is prognostic (#672), and JSBACH's humidity factors are built on
+prescribed soil moisture with no wet skin (see {doc}`surface`).
+
+**Code pointers.**
+- ``jcm/physics/vertical_diffusion/tte_tke/surface_layer.py`` —
+  ``compute_surface_exchange_coefficients_echam_louis``.
+- ``jcm/physics/vertical_diffusion/tte_tke/vertical_diffusion.py`` —
+  ``vertical_diffusion_column`` (the surface tiles),
+  ``TteTkeVerticalDiffusion`` (sublimation fractions, JSBACH factors).
+- ``jcm/physics/vertical_diffusion/tte_tke/matrix_solver.py`` —
+  ``couple_surface_tiles``.
+
+**Validation evidence.**
+``jcm/physics/vertical_diffusion/tte_tke/vertical_diffusion_test.py`` —
+``TestSurfaceTilePhase``: ``LH/E`` equals ``alhs`` over sea ice, ``alhc`` over
+open water and ``alhc + (alhs − alhc)·s/w`` for a tile with factors ``w``; the
+term's land follows JSBACH's factors (a dry bare soil does not evaporate, and
+snow sublimates at the potential rate); and a column at the ice saturation of a
+260 K tile exchanges no moisture. ``land_coupling_test.py``: a single tile
+reproduces the Robin row exactly, and mixed tiles close the column budget
+against their own fluxes.
+
+## Water-tile momentum roughness
+
+**What we do.** The water tile's momentum roughness ``z0m`` is Charnock-wind-
+dependent, ``z0m = cchar·u*²/g``, with the differentiable
+``VDiffParameters.cchar`` leaf (default 0.018) and a 1.5×10⁻⁵ m floor
+(``jcm/physics/surface/echam/ocean.py::compute_ocean_roughness``,
+``Z0_OCEAN_MIN``). The ``u*`` is the water tile's OWN friction velocity —
+not the grid-mean one the aerosol/dry-deposition diagnostics read, which
+would let a coastal cell's land/ice stress leak into the open-water
+roughness — carried from the PREVIOUS step
+(``VerticalDiffusionData.surface_friction_velocity_tile``,
+``TteTkeVerticalDiffusion.__call__``): this step's roughness is itself an
+input to the exchange-coefficient calculation that produces this step's
+``u*``, so a same-step value is unavailable and the update is a one-step-
+lagged fixed point, evaluated fresh every step. The water tile's heat
+roughness (the kB⁻¹ relation, ``exp(2 − 86·z0m^0.375)``, directly above)
+is then itself wind-dependent through this now-live ``z0m``. The ice and
+land tiles stay fixed constants (1 mm, 1 cm).
+
+**What ECHAM/CAM does.** ECHAM6 ``mo_surface_ocean.f90::update_z0_ocean``:
+
+```
+zcons14 = cchar·rd / (grav²·Δt)
+paz0w   = MAX(zepzzo, zcons14·zcfmw·|U_diff|·Tv/paphm1(:,klevp1))
+```
+
+which is the textbook Charnock relation once ``zcfmw·|U_diff|`` is read as
+``τ/ρ`` and ``Tv/paphm1 = 1/(ρ·rd)`` from the ideal-gas law (see
+``compute_ocean_roughness``'s docstring for the full reduction); ``cchar =
+0.018`` (``mo_physc2.f90``/``iniphy.f90``) and ``zepzzo = 1.5×10⁻⁵`` m are
+both bare literals there, matched here as named constants. ECHAM's own
+call sequence (``update_surface`` runs the ocean roughness update ahead of
+the SAME step's momentum elimination) has the same structural one-step
+lag this port makes explicit.
+
+**Why we differ.** We do not, in formulation. ECHAM's sea-ice roughness
+(``mo_surface_ice.f90::update_z0_ice``) is likewise a bare constant
+(``cz0ice``), so leaving the ice and land tiles fixed here matches ECHAM
+rather than extending the wind dependence beyond it.
+
+**Status & known limitations.** ``ocean.py``'s OWN bulk-flux reference
+path (``compute_ocean_surface_fluxes``, used by the diagnostic-only
+``surface.bulk_*`` fields below, not by the live column) evaluates the
+SAME formula from its own, same-step bulk estimate of ``u*`` — a separate
+evaluation from the live roughness above, so the two are not required to
+agree.
+
+Below ``u* ≈ 0.09`` m/s (roughly the lightest winds a Louis
+exchange coefficient produces), ``compute_ocean_roughness``'s own
+``Z0_OCEAN_MIN`` floor sets ``z0m``, not the Charnock formula: at
+``compute_friction_velocity``'s 0.01 m/s floor (the lowest u* this port
+ever evaluates), ``cchar·u*²/g ≈ 1.8×10⁻⁷`` m, two orders of magnitude
+below the 1.5×10⁻⁵ m floor, so EVERY calm-to-light-wind step reads the
+floor rather than a wind-responsive value. This is intended ECHAM
+behaviour — ``update_z0_ocean``'s own ``MAX(zepzzo, ...)`` has the
+identical floor-dominates-at-low-wind regime — not a defect of this port.
+
+The surface-layer diagnostic bundle ``surface_physics_step`` also computes
+(2 m T/q, dew point, bulk Richardson number, the bulk estimate's own
+energy-balance residual) is published as ``surface.temperature_2m`` /
+``humidity_2m`` / ``dewpoint_2m`` / ``richardson_number`` /
+``energy_balance_residual`` and the per-tile ``_tile`` pair — see
+{doc}`surface`'s *Surface-layer diagnostics* section. The bundle's
+``friction_velocity`` and ``surface_layer_height`` fields stay unpublished
+(the live ``vertical_diffusion.surface_friction_velocity``/``pbl_height``
+above are the real versions of each), and its ``net_radiation``/
+``radiation_balance`` are omitted as an exact duplicate pair fully
+recoverable from the published residual and the bulk fluxes.
+
+**Validation evidence.**
+``jcm/physics/vertical_diffusion/tte_tke/vertical_diffusion_test.py::TestWaterTileCharnockRoughness``:
+calm wind floors at ``Z0_OCEAN_MIN``; a larger carried ``u*`` roughens the
+water tile (larger ``CM·|U|``) at fixed wind; a multi-step column run shows
+a high-wind column growing a larger carried ``u*`` than a low-wind column
+from the same seed; a batched run agrees with separate single-column runs
+of the same inputs; ``initial_carry_state`` seeds the carried ``u*`` so
+step 0 reproduces the former fixed-roughness value (1e-4 m) rather than
+collapsing to the floor from an unseeded zero.
+``jcm/physics/surface/echam/ocean_test.py::TestOceanRoughness``: the
+formula against a hand-computed value, the floor, no upper cap (ECHAM has
+none), and finite, non-zero gradients through both ``cchar`` and ``u*``.
+
+**Code pointers.**
+- ``jcm/physics/surface/echam/ocean.py`` — ``compute_ocean_roughness``,
+  ``CHARNOCK_ALPHA_DEFAULT``, ``Z0_OCEAN_MIN``.
+- ``jcm/physics/vertical_diffusion/tte_tke/vertical_diffusion.py`` —
+  ``TteTkeVerticalDiffusion.__call__``'s ``roughness`` assignment (the live
+  consumer) and ``initial_carry_state`` (the cold-start seed).
+- ``jcm/physics/vertical_diffusion/tte_tke/vertical_diffusion_types.py`` —
+  ``VDiffParameters.cchar``,
+  ``VerticalDiffusionData.surface_friction_velocity_tile``.
+- ``jcm/physics/vertical_diffusion/tte_tke/turbulence_coefficients.py`` —
+  ``compute_turbulence_diagnostics``'s per-tile friction velocity.
+
+## Ten-metre wind diagnostic
+
+**What we do.** The term publishes the 10 m wind as a grid-mean speed and
+vector, ``VerticalDiffusionData.wind_10m`` / ``wind_10m_u`` / ``wind_10m_v``,
+and per tile (``wind_10m_tile`` / ``wind_10m_u_tile`` / ``wind_10m_v_tile``,
+with the ``surface_fraction`` they are weighted by), alongside the exchange
+coefficients. It is the ECHAM family's one 10 m wind: the surface-exchange
+contract publishes it as ``wind_u``/``wind_v``, and the AeroCom ``uas``/``vas``
+apply its grid-mean reduction (``wind_10m_reduction``) to the post-physics
+lowest-level wind, the time level of the other AeroCom winds. It is
+the surface-layer profile evaluated at 10 m rather than an interpolation
+between levels: with ``bn = ln(z₁/z₀ₘ)`` the neutral profile factor and
+``bm = bn·√(CMₙ|U| / CM|U|)`` its stability-corrected counterpart,
+
+```
+zrat = 10/z₁
+cbn  = ln(1 + (e^bn − 1)·zrat)
+red  = [cbn + (stable: −(bn − bm)·zrat | unstable: −ln(1 + (e^(bn−bm) − 1)·zrat))] / bm
+```
+
+and each tile's 10 m wind is ``red·U(z₁)`` component-wise; the grid mean is
+their fraction-weighted sum, ``U(z₁)·Σ f·red``, so it keeps the lowest-level
+direction. The
+reduction is computed **inside** each surface-layer scheme's ``lax.cond``
+branch, from that scheme's own neutral drag: the two schemes differ in
+roughness (state-carried vs a hard-coded table), in the bound on ``z/z₀`` and
+in whether the wind is ``zepdu2``-floored, and both branches build their
+momentum drag from the same helper the reduction uses, so the pair cannot
+drift. The profile factor uses the ``zepdu2``-floored speed the coefficients
+themselves were built from (``max(|U|, 1 m/s)``), and the resulting reduction
+multiplies the true wind.
+
+**What ECHAM/CAM does.** ECHAM5 ``vdiff.f90`` / ICON
+``mo_surface_diag::nsurf_diag`` compute the 10 m wind by exactly this
+construction, from the ``pbn``/``pbm`` profile factors ``mo_turbulence_diag``
+exports for the purpose, from the step-start wind ``pum1`` that
+``vdiff.f90::update_surface`` passes to the surface (per tile ``zu10w = zred·pum1`` in
+``mo_surface_ocean.f90::postproc_ocean`` and its ice/land analogues, box-averaged
+by fraction in ``mo_surface.f90::surface_box_average`` into ``u10``/``v10``/
+``wind10``); ``zepdu2 = 1 m²/s²`` is ECHAM's calm-wind floor on the
+bulk Richardson number and the drag.
+
+**Why we differ.** We do not. The stable/unstable branch is selected by
+``CM|U| < CMₙ|U|`` rather than by the sign of ``Ri``, which is equivalent for
+both schemes here (their stability factors are <1 stable, ≥1 unstable, and both
+equal 1 — with equal stable and unstable expressions — at ``Ri = 0``) and keeps
+the Richardson number inside the coefficient solve.
+
+**Status & known limitations.** The grid-mean 10 m wind published here
+(``wind_10m``/``wind_10m_u/v``) multiplies the ABSOLUTE lowest-level wind,
+matching ECHAM's ``zu10w = zred·pum1``. The ocean surface current
+(``ForcingData.ocean_u``/``ocean_v``, ``None`` = zero) enters everywhere
+ECHAM's own ``precalc_ocean``/``precalc_ice`` take it (both are called with
+``ocean_u``/``ocean_v``; ``precalc_land`` is not): the water AND sea-ice
+tiles' own Richardson number, exchange coefficients (so their reduction
+factor ``zred`` too — the published absolute 10 m wind of those tiles
+therefore shifts with the current through this stability dependence, not
+because the wind vector itself is relativized), the delivered per-tile
+momentum/heat/moisture flux, and the surface TKE source
+(``turbulence_coefficients.tile_effective_wind``). The water-tile-only
+``wind_10m_current_relative`` (ECHAM's ``wind10w``) and the momentum Robin
+row's surface target (scaled by the non-land fraction) are relative to the
+current in the literal wind-vector sense; see {doc}`../design/surface_exchange`
+for the tiling and regridding decisions, including the Codex-review finding
+that the first version of this consumption fed every tile the box's
+absolute wind and only subtracted the current at the two output points,
+which left ``c_mom``'s own water/ice contribution (and `wind10w`'s
+magnitude) built on the wrong stability. The Businger-Dyer branch's neutral
+reference uses that scheme's own hard-coded von Kármán constant rather than
+the live ``jcm.constants`` value, so a ``set_constants`` override changes
+the drag and its neutral reference together.
+
+**Code pointers.**
+- ``jcm/physics/vertical_diffusion/tte_tke/surface_layer.py`` —
+  ``wind_10m_reduction``, ``echam_louis_neutral_drag``.
+- ``jcm/physics/vertical_diffusion/tte_tke/turbulence_coefficients.py`` —
+  ``businger_dyer_neutral_drag``, ``compute_turbulence_diagnostics``.
+- ``jcm/physics/vertical_diffusion/tte_tke/vertical_diffusion_types.py`` —
+  ``VerticalDiffusionData``.
+- ``jcm/physics/surface/echam/turbulent_fluxes.py`` —
+  ``compute_surface_diagnostics`` (the reported 10 m wind and its components).
+
+**Validation evidence.**
+``jcm/physics/vertical_diffusion/tte_tke/surface_layer_test.py`` — the neutral
+limit against a hand-computed log profile (0.912/0.904/0.894 for
+z₀ = 5e-5/1.5e-4/5e-4 m at z₁ = 32.6 m), monotonicity in stability, continuity
+across the branch, and that each scheme uses its own neutral drag.
+
+**Validation evidence.**
+``jcm/physics/vertical_diffusion/tte_tke/`` test suite —
+``vertical_diffusion_test.py``, ``surface_layer_test.py``,
+``boundary_layer_cases_test.py``, ``scm_boundary_layer_cases_test.py``;
+``tracer_diffusion_test.py`` (column-mass conservation).

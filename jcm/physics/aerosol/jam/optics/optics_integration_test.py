@@ -27,31 +27,59 @@ class OpticsIntegrationTest(unittest.TestCase):
     def test_jam_optics_rrtmgp_runs_finite(self):
         from jcm.model import Model
         from jcm.physics.echam.echam_terms import echam_physics
+        from jcm.physics.radiation.radiation_types import RadiationParameters
         from jcm.terrain import TerrainData
         from jcm.utils import get_coords
 
-        coords = get_coords(np.linspace(0, 1, 21), spectral_truncation=21)
+        # T21 is the lowest spectral truncation get_coords accepts; 3 sigma
+        # levels (vs. the original 20) is a vertical-resolution choice the
+        # optics-wiring invariant below does not depend on and measurably
+        # shrinks the RRTMGP gas-optics compile (confirmed: aod_550 is still
+        # comfortably non-zero, ~8e-9, after the same 6 steps).
+        coords = get_coords(np.linspace(0, 1, 4), spectral_truncation=21)
         model = Model(
             coords=coords, time_step=30,
             terrain=TerrainData.aquaplanet(coords),
+            # radiation_interval=0: per-step radiation AND per-step band
+            # optics. With the default 2 h gate this 3-step test saves a
+            # frame that replays the step-0 (cold-start, zero-aerosol)
+            # optics cache, so the AOD assertion below reads an exact zero
+            # regardless of wiring. The gate's replay semantics have their
+            # own unit test (optics_term_test); this test wants the wiring.
             physics=echam_physics(
                 aerosol_module="jam", cloud_scheme="2m",
                 radiation_scheme="rrtmgp",
+                radiation=RadiationParameters.default(radiation_interval=0),
             ),
         )
-        predictions = model.run(save_interval=0.0625, total_time=0.0625)
+        # 6 steps, not 3: the emission -> transport -> core -> optics chain
+        # needs the aerosol to reach the core before AOD can be non-zero (see
+        # jam_integration_test).
+        predictions = model.run(save_interval=0.125, total_time=0.125)
         dyn = predictions.dynamics
         self.assertFalse(bool(jnp.any(jnp.isnan(dyn.temperature))))
         self.assertTrue(bool(jnp.all(dyn.temperature > 150.0)))
         self.assertTrue(bool(jnp.all(dyn.temperature < 360.0)))
 
         # The column AOD (~550 nm) diagnostic surfaces in the physics output,
-        # finite and non-negative. (Magnitudes are tiny here — cold-start spin-up
-        # has barely any aerosol — but the field must be present and physical.)
-        aod = predictions.physics["aerosol_optical_depth"]
+        # finite, non-negative, and STRICTLY positive somewhere: three steps
+        # of surface emissions must reach the optics chain (measured healthy
+        # cold-start max ≈ 1.5e-8 — tiny, but an exact zero means the
+        # emissions→microphysics→optics wiring silently dropped out, which
+        # the old ``aod >= 0`` bound could not distinguish from healthy).
+        # A stronger on/off flux-difference test needs a seeded aerosol
+        # burden (cold-start AOD is radiatively invisible) — deferred.
+        aod = predictions.physics["_jam_optics"]["aod_550"]
         aod = np.asarray(aod)
         self.assertTrue(np.all(np.isfinite(aod)))
         self.assertTrue(np.all(aod >= 0.0))
+        self.assertGreater(float(aod.max()), 0.0,
+                           "AOD identically zero — optics chain unwired")
+
+        # And RRTMGP genuinely ran with the optics in the loop: daytime
+        # columns received shortwave at the surface.
+        rad = predictions.physics["radiation"]
+        self.assertGreater(float(np.max(np.asarray(rad.surface_sw_down))), 0.0)
 
 
 if __name__ == "__main__":

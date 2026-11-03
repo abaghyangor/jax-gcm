@@ -1,0 +1,970 @@
+# Clouds and microphysics
+
+**What we do.** A diagnostic cloud fraction plus a choice of **single-moment** or
+**two-moment** microphysics:
+
+- **Cloud cover** (``jcm/physics/clouds/sundqvist.py::SundqvistCloudFraction``)
+  — ECHAM6.3's ``mo_cover.f90::cover``, the Sundqvist (1989) / Lohmann and
+  Roeckner (1996) relative-humidity closure, used by the 1M, the 2M and the
+  JAM configurations alike. The formulation is ECHAM's at every level (the T63
+  values of ``crt``, ``crs``, ``nex``, ``csatsc`` and ``cinv`` are jcm's
+  calibrated set, below):
+  ``q_s`` in ECHAM's form over ice or water by ECHAM's ``lo2`` switch; the
+  critical relative humidity ``crt + (crs − crt)·exp(1 − (p_s/p)^nex)``;
+  over ice-free ocean without convection (previous step's ``ktype``, as in
+  ECHAM), ECHAM's inversion search from the lowest level up to its level
+  ``jbmin``, which takes the level with the largest ``min(0, dT/dz)`` (the
+  lowest one on a tie), applies no enhancement if that level lies below
+  ``jbmax``, and otherwise divides ``q_s`` by
+  ``zsat = min(1, csatsc + max(0, −dT/dz·cp/g))`` there and ``nadd`` levels
+  below; ``b0 = (q/(q_s·zsat) − rhc)/(1 − rhc)`` clipped to ``[0, 1]`` and
+  ``cover = 1 − sqrt(1 − b0)``. The cover is therefore exactly 0 in every cell
+  at or below the critical humidity and exactly 1 at saturation, which the
+  microphysics' clear-cell rules read. There is no stratospheric cutoff:
+  ECHAM computes every level (``ktdia = 1``). ``jbmin``/``jbmax`` follow
+  ECHAM's ``sucloud`` rule (the first levels from the top below 2000 m and
+  500 m, heights ``(p_s − p)/(1.25 g)`` at a 101320 Pa surface) on the model's
+  own levels, 40/45 at L47 and 88/93 at L95, and ``dT/dz`` uses the model
+  geopotential, as ECHAM's uses ``pgeo``. Every column of the ECHAM Fortran
+  reference (``jcm/data/test/echam_cloud_reference/``) is reproduced at the
+  reference tolerance, at T31, T63, T127 and T255, with ECHAM's own constants
+  for each. It is a **pure diagnostic**
+  — the term emits zero T/q/qc/qi tendencies; condensation lives in each
+  microphysics scheme, as in ECHAM's ``cloud``. The humidity the closure sees,
+  ``q/q_s`` with ``q_s`` over ice where ``lo2`` selects it, is published as
+  ``cover_relative_humidity``. It is a scheme-internal closure variable — it
+  jumps by up to ~25 % across the cloud-ice threshold between adjacent cold
+  cells — so it is kept apart from the model's one public ``relative_humidity``,
+  which ``MoistAirColumnState`` computes with respect to liquid water at every
+  temperature (the WMO definition, written as CMIP ``hur``) and which no
+  composition changes the meaning of.
+- **Total cloud cover** (``jcm/physics/clouds/cloud_overlap.py``, saved as
+  ``clouds.total_cloud_cover``) — ECHAM6.3's ``aclcov`` (``mo_cloud.f90`` section
+  10.2): the maximum-random overlap of the step's *final* cloud fraction (the
+  post-microphysics write-back, which is where ECHAM computes it), every step,
+  with maximum overlap inside a vertically contiguous cloud and random overlap
+  across clear air. Under ``run.output_averages`` the saved frame is the mean of
+  this per-step value over the output interval, which is ECHAM's accumulation
+  (``paclcov = paclcov + zdtime*zclcov``) and not the overlap of the mean
+  profile; the release-validation ``cloud_cover`` gate scores it
+  ({doc}`../design/cloud_cover_gate`).
+- **ECHAM 1-moment microphysics**
+  (``jcm/physics/clouds/echam_1m.py::Echam1MMicrophysics``) — a transcription
+  of ECHAM6.3's ``mo_cloud.f90::cloud`` (Lohmann & Roeckner 1996; Roeckner et
+  al. 2003, §10): one top-down column sweep that runs ECHAM's sections in
+  ECHAM's order at every level, with the falling rain and snow, the
+  precipitating fraction and the sedimenting ice carried between levels within
+  the step. Melting of the incoming snow and of cloud ice above ``tmelt``,
+  sublimation of the incoming snow (Lin et al. 1983) and evaporation of the
+  incoming rain (Rotstayn 1997), all at the anchor state (below); ice
+  sedimentation; the ``lo2`` phase switch (ice below ``cthomi``, or below
+  ``tmelt`` where the cloud ice exceeds ``csecfrl``), which selects the latent
+  heat and ice or water saturation; the return of all condensate of a clear
+  cell to vapour; **tendency-driven condensation** in the cloudy part,
+  ``zqcdif = (Δq − Δq_sat)·paclc`` with the cloudy part saturated at the
+  anchor, followed by the whole-box 1 % supersaturation check and the
+  treatment of a clear cell that gained condensate as cloudy for the step;
+  homogeneous freezing below ``cthomi``, Bigg and contact freezing between
+  ``cthomi`` and ``tmelt``; Beheng (1994) autoconversion and accretion by rain;
+  Levkov et al. (1992) aggregation, accretion of ice and riming by snow; the
+  precipitating-fraction update with its reset to the local cover; and the
+  return of condensate below ``ccwmin`` to vapour with the cover write-back.
+  Every output, and every intermediate the Fortran harness exposes (under the
+  Sonntag variant at T63), is compared with the Fortran routine, whose code is
+  unmodified and whose saturation tables the harness evaluates analytically
+  (they agree to 3e-11), on 42 designed and sampled columns
+  (``echam_fortran_reference_test.py``). The anchor and the increments ``Δq``,
+  ``ΔT``, ``Δq_c``, ``Δq_i`` are the 2M's (``cloud_scheme_inputs``, below): the
+  previous step's post-physics state, and the dynamics since then plus ``dt``
+  times the running tendency of every physics term composed before the 1M term
+  (radiation, vertical diffusion with its condensate, the surface,
+  convection), with the convective detrainment passed separately as ECHAM's
+  ``pxtecl``/``pxteci``.
+  The saturation vapour pressure and its slope are ECHAM's Sonntag (1990) fit
+  of ``thermodynamics``, read through ``echam_saturation`` as the cover reads it. ``cvtfall``,
+  ``csecfrl`` and ``clwprat`` are ordinary tunable parameters whose defaults follow ECHAM's per-truncation
+  values (T63: 2.5, 5e-6, 4.0). The **droplet number** is ECHAM's prescribed
+  ``acdnc`` (``physc.f90`` §3.12; ICON-A ``mo_echam_phy_diag.f90::droplet_number``):
+  80 cm⁻³ over sea and 180 cm⁻³ over land that is not glacier from the surface
+  to 800 hPa, ``20 + (zn2 − 20)·exp(1 − min(8, 80000/p)²)`` cm⁻³ above,
+  continuous at 800 hPa and 20 cm⁻³ in the upper troposphere. ECHAM passes that
+  one field to ``cloud`` as ``pacdnc``, where it enters the Beheng
+  autoconversion and the Bigg and contact freezing. The radiation's droplet
+  number (``cloud_utils.prescribed_droplet_number``, published as
+  ``clouds.droplet_number``) is that profile times the MACv2-SP Twomey factor
+  ``cdnc_factor``. `science` (deliberate, documented) — the same factor scales
+  the autoconversion's droplet number (``autoconversion_twomey``, on by
+  default), so the aerosol-cloud interaction acts on precipitation formation
+  and not only on the radiation. MPI-ESM1.2 scales the radiation's droplet
+  number only (Mauritsen et al. 2019, *JAMES*, doi:10.1029/2018MS001400,
+  §2.2); the departure is the maintainer's choice, recorded in #932. The
+  freezing of section 6.2 reads ECHAM's unscaled profile. The jcm option
+  ``autoconversion_scheme="kk2000"`` (Khairoutdinov & Kogan 2000) is off by
+  default.
+- **Lohmann 2-moment microphysics**
+  (``jcm/physics/clouds/lohmann_2m/scheme.py``: ``cloud_microphysics_2m`` and its
+  ``Lohmann2MMicrophysics`` term) carries droplet and ice-crystal number as well
+  as mass. The process chain runs as one flux-coupled top-down ``lax.scan`` in
+  the section order of ECHAM's ``column_processes`` loop: ice sedimentation →
+  melt → sublimation/rain-evaporation → clear-sky evaporation → grid-scale
+  condensation and supersaturation corrections → in-cloud water update +
+  droplet activation / ICNC diagnosis → homogeneous freezing → mixed-phase
+  freezing + WBF → precipitation geometry → warm-rain (KK2000) and cold
+  precipitation formation. Before the sweep the scheme evaluates the ECHAM
+  section-1 fields the sweep needs: the crystal radius ``zrid``, the
+  detrainment phase criterion ``lo2_2d``, the detrained crystal number
+  ``znidetr``, and two droplet-number sources:
+
+  - **Stratiform activation at cloud base, copied to the cloud above it**
+    (``mo_cloud_micro_2m.f90`` lines 742–782;
+    ``cloud_utils.stratiform_activation_at_cloud_base``). At the base level of
+    each contiguous cloud run (ECHAM's ``get_cloud_bounds``,
+    ``cloud_utils.cloud_base_search``, warmer than ``cthomi``), CDNC is raised
+    to ``max(activated_cdnc, CDNC)`` whenever CDNC is at or below
+    ``cdnc_min``, the liquid is still growing, the cloud cover just grew, or
+    the air is supersaturated with respect to water — four parcel-theory
+    triggers, independent of and earlier than the ``CDNC <= cdnc_min``
+    re-activation ``update_in_cloud_water`` (section 5.5) already applies.
+    The result is copied, unchanged, to every level strictly above the base
+    in the same run, provided the base itself gained a strictly positive
+    number of droplets.
+  - **Droplet number of detrained convective liquid, ``zqlnuccv``**
+    (lines 889–941; ``cloud_utils.convective_detrainment_droplet_number``):
+    the lesser of the activated number at this level and at the convective
+    cloud base, blended into CDNC weighted by the stratiform and detrained
+    in-cloud liquid water contents, never allowed to lower CDNC. ECHAM-HAM
+    runs a second, convective-updraft activation call to fill ``cdncact_cv``
+    at every level (``mo_ham_activ.f90``/``mo_activ.f90``); jcm has no
+    second activation path, so the SAME ``activation_potential`` this
+    scheme already receives stands in, read at the convective base
+    (``TiedtkeConvection``'s ``cloud_base``/``ktype`` diagnostics) instead of
+    the stratiform one — a deliberate simplification, not a port of HAM's
+    separate convective ARG call (see {doc}`../design/lohmann_2m_column_processes`).
+    This source, the cloud-base one above, and the scan's own section-5.5
+    ``CDNC <= cdnc_min`` re-activation (``update_in_cloud_water``) all read
+    ``activation_potential``, never the cloud-fraction-weighted
+    ``activated_cdnc`` diagnostic: ECHAM's own ``zcdncact``/``cdncact_cv``
+    is never cover-weighted at any of its three Fortran read sites, so a
+    cell gets a droplet number from the aerosol actually available to it,
+    not a value masked by a DIFFERENT cell's stratiform cover (see
+    {doc}`../design/lohmann_2m_column_processes`).
+
+  The process formulas and constants are ECHAM-HAM's
+  (``mo_cloud_utils.f90`` / ``mo_echam_cloud_params.f90`` /
+  ``mo_cloud_micro_2m.f90``, collected in
+  ``jcm/physics/clouds/lohmann_2m_params.py::CloudParams2M``); no CAM
+  ``micro_mg`` / PUMAS ``qsmall`` / ``mincld`` / ``dcs`` constants enter. The
+  scheme is not a complete port of ECHAM-HAM. The cirrus-nucleation number
+  source is absent (below), the mixed-phase heterogeneous freezing is ECHAM-HAM's
+  only where a prognostic aerosol supplies its inputs (JAM) and a jcm closure
+  otherwise, and a small set of jcm-only bounds remains (the Koop
+  homogeneous-freezing floor -- ``nic_cirrus = 1`` only, see below -- the
+  ``icemax`` cap on the ICNC diagnosis and the falling-ice cover threshold). The
+  absent processes and the deliberate deviations are listed below. See
+  {doc}`../design/lohmann_2m_column_processes`.
+
+  **What drives its condensation.** The 2M is tendency-driven, as ECHAM's
+  ``cloud_micro_interface``: section 5 condenses ``zqcdif = (ztmst·pqte −
+  zdqsat)·paclc``, the humidity increment the saturation humidity does not
+  absorb, into the cloudy part of the cell, which is taken to be saturated at
+  the anchor. The term takes ECHAM's inputs from
+  ``jcm/physics/clouds/cloud_inputs.py::cloud_scheme_inputs``: the anchor
+  (``ptm1``, ``pqm1``, ``pxlm1``, ``pxim1`` and the number tracers) is the
+  previous step's post-physics state, carried by the model; the increments
+  are the dynamics of the last step plus every term upstream of the scheme —
+  radiation, vertical diffusion with its condensate change, the surface and
+  convection; and the convective detrainment arrives by itself as
+  ``detrained_qc``/``detrained_qi`` (``pxtecl``/``pxteci``), which the scheme
+  treats by ECHAM's rules for detrained condensate (below). So large-scale ascent and cloud-top radiative
+  cooling condense in a partly cloudy cell in the step they happen, without
+  waiting for the whole cell to saturate. Every quantity ECHAM evaluates at
+  the previous time level (the saturation humidities, the subsaturations for
+  evaporation and sublimation, the moist heat capacity) is evaluated at this
+  anchor. On a first step, after a restart from a checkpoint without the
+  carried state and in the single-column and RCE hosts, the anchor is the
+  step-start state and the dynamics increment is zero. See
+  {doc}`../design/operator_split_physics`.
+
+  **Published droplet number.** ``clouds.droplet_number`` (CF
+  ``number_concentration_of_cloud_liquid_water_particles_in_air``, m⁻³) is the
+  2M's resolved CDNC: the saved ``qnc`` tracer [kg⁻¹] times air density,
+  GRID-MEAN. This is ECHAM-HAM's own convention for the quantity —
+  ``pacdnc(:,jk) = zcdnc(:,jk)`` (``mo_cloud_micro_2m.f90:1710``), with
+  ``zcdnc`` the grid-mean ``ρ·(pxtm1 + ztmst·pxtte)`` (line 600) handed to its
+  radiation unmasked by cloud cover — not the 1M's prescribed-profile
+  convention (characteristic in-cloud, nonzero in clear sky; above). The two
+  schemes' Fortran sources differ, so the field means something different
+  depending which cloud scheme is composed; ``AerocomDiagnostics`` resolves
+  the difference into a single grid-mean/in-cloud pair for its own
+  consumers rather than reading this field.
+
+Both schemes convert a condensed/evaporated/frozen mixing-ratio increment to a
+temperature increment with ``L / cp`` where ``cp`` is the **moist** isobaric
+heat capacity ``cpd·(1 + vtmpc2·q)`` evaluated per-level at the step-start
+humidity — ECHAM's ``zlvdcp = alv/pcair`` / ``zlsdcp = als/pcair``
+(``mo_cloud.f90``, ``mo_cloud_micro_2m.f90``), shared through
+``cloud_utils.latent_heat_over_cp``. Dry ``cpd`` would over-heat every
+condensation event by ``vtmpc2·q`` (~1.5 % in the moist tropics); the column
+enthalpy budget closes against this same moist ``cp``.
+
+Saturation is Sonntag (1990), the formula ECHAM's lookup tables hold, from
+``jcm/physics/thermodynamics.py`` (see {doc}`constants`); the cover and the 1M
+read it through ``echam_saturation``. The cover's ``q_s`` and the 1M's
+condensation take the ice fit where ``lo2`` holds and the water fit elsewhere
+(``mo_cover.f90`` l.215-224; ``mo_cloud.f90`` l.697-699, and
+``lookup_ua_eor_uaw_spline`` for the whole-box check, l.763-765). The 1M's
+snow sublimation reads ECHAM's ``ua`` table (ice at and below ``tmelt``, water
+above; l.451) and its rain evaporation the ``uaw`` table (water at every
+temperature; l.520-522), both at the step-start temperature (l.392-394). The
+2M scheme reads ECHAM's ``uaw`` for its water saturations and the ``ua``
+table for its ice saturations, and picks between them with its own ``lo2`` in
+the condensation (``mo_cloud_micro_2m.f90``).
+
+The grid-mean-to-in-cloud conversion (``x / cloud_fraction``, zeroed where no
+cloud is present) is likewise one shared function,
+``jcm.physics.thermodynamics.grid_mean_to_in_cloud``: the 1M scheme's
+autoconversion/ice-aggregation in-cloud values and the radiation interface's
+``mcica.in_cloud_path`` (which adds ECHAM's stricter ``cloud_fraction <=
+2·eps`` zeroing, passed through as the helper's ``zero_threshold``) both call
+it rather than carrying their own copies of the division (pull request 1124). The 2M
+scheme (``lohmann_2m/``) still carries roughly ten of its own inline copies of
+the same division, several without the 1M/radiation where-zeroing structure, and
+one more lives in the aerosol aqueous chemistry
+(``aerosol/jam/chemistry/aqueous.py``); migrating them is deferred (#1137),
+since several of those forms would change the result (a presence/zeroing rule
+to decide, not a bit-identical refactor) and need measuring against the
+climate-impact gate above before they land.
+
+The 2M scheme's utility fields are ECHAM's, shared through ``cloud_utils``:
+
+- **Viscosity of air** in the snow Reynolds number of riming,
+  ``pviscos = (1.512 + 0.0052·(T − 233.15))·10⁻⁵`` kg m⁻¹ s⁻¹ at the step-start
+  temperature (``mo_cloud_utils.f90::get_util_var``, line 132;
+  ``air_dynamic_viscosity``). It puts the Reynolds number of the 447 µm planar
+  flake at about 15–30 through the troposphere, and the collection efficiency
+  of 10–20 µm droplets at about 0.8 (``precip.riming_collection_efficiency``,
+  ``mo_cloud_micro_2m.f90::precip_formation_cold``, lines 3198–3250; Lohmann
+  2004). The thermal conductivity of air ``zkair`` (line 715) is a different
+  quantity; it enters only the diffusional-growth factors.
+- **Ice fall-speed air-density factor**
+  ``paaa = (p/30000)^−0.178·(T/233)^−0.394`` (``get_util_var``, line 129;
+  Heymsfield & Iaquinta 2000; ``ice_fall_speed_air_density_factor``), 1 at
+  300 hPa and 233 K, scaling the sedimentation speed of ice mass and number
+  alike (``sedimentation_ice``, ``mo_cloud_micro_2m.f90`` line 2224).
+- **Updraft** of the phase choice ``lo2`` and the Wegener–Bergeron–Findeisen
+  gate, ECHAM's ``zvervx = −100·ω/(g·ρ) + 100·fact_tke·√TKE`` cm s⁻¹
+  (``mo_cloud_micro_2m.f90`` lines 814–816): the turbulent term, zero at the
+  lowest level (``turbulent_updraft_velocity``, ``fact_tke = 0.7``), plus the
+  large-scale pressure velocity ``ω`` (the host's dycore-supplied ``omega``
+  field, Pa/s, positive descending), read opportunistically from
+  ``diagnostics["_dycore_fields"]`` rather than declared a hard requirement
+  of the term — every shipped backend (dinosaur, pySES) can supply
+  ``omega``, but a composition can still choose not to require it: the only
+  existing 2M-on-pySES configurations (``ma-ne30-l47``/``ma-ne30-l95``) run
+  with ``cu_lmfmid`` (Tiedtke's own omega requirement) disabled pending
+  that campaign's own stability validation, so ``ω`` there is zero rather
+  than refusing to construct.
+- **Volume-mean ice radius of the WBF threshold** ``0.9·r_eff``
+  (``conv_effr2mvr``; ``effective_2_volmean_radius_param_Schuman_2011``, lines
+  4059–4085; ``ice_volume_mean_radius_schumann``), with ``r_eff`` the
+  Lohmann (2008) effective radius clipped to 10–150 µm. ECHAM uses it at every
+  threshold-velocity decision, and jcm ports all four: the phase of convective
+  detrainment before the level loop (``lo2_2d``, lines 872–885), section 4
+  (line 1288), the section-5 supersaturation correction (line 2374) and the
+  WBF gate (line 1582). Aggregation uses the plate radius
+  ``zrih = −2261 + √(5113188 + 2809·r_eff³)`` µm³ (``ice_volume_mean_radius``,
+  lines 3160–3166), as ECHAM does. The ICNC diagnosis uses the
+  temperature-parameterised radius ``zrid`` described next.
+
+``precip_formation_cold``'s two safety-floor divisions — the ice-number
+self-collection/break-up guard (``zsprn1``, ``mo_cloud_micro_2m.f90`` lines
+3401–3406) and the riming droplet-number-loss guard (``psacln``, same
+subroutine) — read their floor from the call's own working dtype
+(``jnp.finfo(dtype).eps``), reproducing r7492's ``eps``
+(``mo_cloud_utils.f90:27``, ``EPSILON(1._dp)``) exactly at float64, jcm's
+own precision. A float64 literal would not serve a float32-forward call:
+``EPSILON(1._dp)`` (~2.22e-16) is far below float32's own representable
+precision and would be absorbed as a no-op there, so the dtype-generic form
+is the correct floor at both precisions, not merely the float64 one. The
+ice-number guard also floors the pre-aggregation ice content (``zxibold``)
+at this same epsilon, matching r7492's own ``zxibold = MAX(pxib,eps)``.
+
+This DOES move float32 results for an ice/liquid content between
+``cqtmin`` (1e-12, the gate both guards sit behind) and float32's own
+epsilon (~1.19e-7) — caught in review, since an earlier draft of this note
+claimed float32 was unaffected. ``cqtmin`` sits far below float32's own
+epsilon but far above float64's (~2.2e-16), so only float32 ever has cells
+in that gap: there, ``max(ice, eps32)`` floors the pre-aggregation ice up
+to ``eps32`` where it previously held the (smaller) ice value itself,
+shrinking the guarded rate — e.g. ``in_cloud_ice = 1e-8`` moves ``psprn``
+by a factor of ``(1e-8 + eps32)/(2·eps32) ≈ 0.54``
+(``lohmann_2m_test.py::test_precip_formation_cold_eps_guards_track_working_dtype``).
+At float64 the floor never binds (``cqtmin ≫ eps64``), so that precision
+is unaffected: measured on a representative 6-column case away from this
+low-ice regime, the self-collection guard changes ``psprn`` by up to 0.24%
+(median 0.09%) and the riming guard changes ``psacln`` by up to 0.24%
+(median 0.12%).
+
+**Ice mass and number from convective detrainment.** Detrainment supplies most
+of the 2M scheme's cloud-ice mass. ECHAM gives that ice a crystal number and a
+phase by rules that need no aerosol, in section 1 before the level loop and in
+section 4 inside it (``mo_cloud_micro_2m.f90``). jcm applies them:
+
+- **Crystal radius** ``zrid`` (lines 945–956):
+  ``0.9·max(23.2·exp(0.015·min(T − tmelt, 0)), 1)`` µm at the step-start
+  temperature, with the 1 µm floor of the Schumann conversion (line 4083;
+  ``cloud_utils.effective_2_volmean_radius_param_Schuman_2011``). It falls
+  from about 21 µm at the melting point to about 9 µm at 220 K. It is the
+  radius of the crystals detrainment adds and of the ICNC diagnosis in
+  ``update_in_cloud_water`` (passed as ``prid``, line 1511; used at line
+  2616).
+- **Phase criterion of the detrained condensate** ``lo2_2d`` (lines 859–885):
+  the WBF test ``0.01·zvervx < zvervmax`` on the ice present before this
+  step's detrainment and on the incoming crystal number. It carries no
+  temperature test of its own; those enter through ``ll_cv`` below.
+- **Detrained crystal number** ``znidetr`` (lines 958–983). It is nonzero
+  where condensate detrains, the cover exceeds ``clc_min``, and the
+  step-start temperature is below ``cthomi``, or below ``tmelt`` with
+  ``lo2_2d`` true (``ll_cv``). There it is
+  ``conv_effr2mvr·(0.5·10⁻²)^pow_PK·1000/fact_PK · ρ·Δq_det / (max(cf, clc_min)·zrid^pow_PK)``,
+  floored at ``cqtmin``, with ``Δq_det`` the whole condensate detrained this
+  step in both phases (lines 970–972). The prefactor is ECHAM's as written:
+  ``conv_effr2mvr`` times the inverse of the plate mass–radius law at the
+  plate dimension ``2·zrid``, since ``(0.5·10⁻²/zrid)^pow_PK`` is that
+  dimension in centimetres to the power ``−pow_PK``.
+- **Sedimentation acts on the ice present before detrainment** (lines
+  1227–1248): ``pxim1 + ztmst·pxite``, the step-start ice plus the upstream
+  increments without the detrained part. Detrained ice joins the cell after
+  sedimentation (``zxidt``, lines 1316–1317), so it does not fall at the old
+  crystal number in the step it arrives.
+- **Crystal number after sedimentation** (lines 1251–1252):
+  ``ICNC = min(ICNC_sedimented + znidetr, icemax)``.
+- **Phase of the detrained condensate in section 4** (lines 1276–1316).
+  ``lo2``, evaluated on the post-sedimentation ice and the crystal number that
+  includes ``znidetr``, assigns the whole detrained condensate to ice where it
+  holds and to liquid elsewhere. The convection scheme has already heated the
+  column for its own split: Tiedtke counts detrained condensate as ice where
+  its environment temperature is at or below ``tmelt``. Where the 2M scheme
+  reassigns convective ice to liquid it removes the fusion heat, ``(Ls − Lv)/cp``
+  per unit mass (lines 1300–1308). Where it reassigns convective liquid to ice
+  it adds that heat. The reassigned condensate then enters the in-cloud state,
+  the clear-sky evaporation and the section-5 closure together with the other
+  increments (``zxidt``/``zxldt``, lines 1316–1317).
+- **Number tendencies are taken against the raw tracer** (the call at lines
+  1780–1781; lines 3625–3628). For its own arithmetic the scheme floors the
+  incoming number tracers at ``cqtmin`` (lines 600–605) and applies no upper
+  bound at entry: ICNC is capped at ``icemax`` only after ``znidetr`` joins
+  it (line 1252), and CDNC is not capped. The returned tendency is
+  ``(N_end/ρ − q_N)/Δt`` against the unclipped provisional tracer ``q_N``
+  (anchor plus increment), which the host adds it to. The tracer
+  therefore ends the step at the scheme's number, or at zero where the
+  negative-mass repair removed the condensate (lines 3641–3652), and an
+  out-of-range value does not persist from step to step.
+
+The Tiedtke term records the condensate it detrains each step as
+``clouds.conv_detrainment_qc`` and ``clouds.conv_detrainment_qi``
+[kg kg⁻¹ s⁻¹], its own split at ``tmelt``, alongside the ``clouds.qc`` /
+``clouds.qi`` it advances; the cover term resets them to zero every step.
+Both fields are written to the output. Both cloud schemes receive them
+through ``cloud_scheme_inputs``, separately from the other increments: the
+1M uses Tiedtke's split as ECHAM's ``cloud`` does, and the 2M re-splits their
+sum as described above.
+
+Cloud parameters are ``flax.struct.dataclass`` leaves (differentiable), threaded
+through the scheme via ``nnx.Param``; only genuine code-path switches
+(``nic_cirrus``, ``ldyn_cdnc_min``) are static aux.
+
+**What ECHAM/CAM does.** ECHAM6-HAM2.3 uses the **Sundqvist (1989)** statistical
+cloud cover (Lohmann & Roeckner 1996) in ``mo_cover.f90``, with **Lohmann et al.
+two-moment microphysics** (``mo_cloud_micro_2m.f90``; Lohmann et al. 2007, Lohmann
+& Hoose 2009; Roeckner et al. 2003 for the Marshall-Palmer precipitation
+inversion). CAM6 uses **MG2/PUMAS** two-moment microphysics (Gettelman & Morrison
+2015; ``micro_mg`` / ``micro_pumas_v1``). DeMott et al. (2010), *PNAS*
+doi:10.1073/pnas.0910818107 is the ice-nucleating-particle count. With
+prognostic HAM aerosol, ``cloud_subm_1`` calls ``mo_ham_freezing.f90::ham_IN_setup``,
+which reduces the M7 modes to the dust and black-carbon fractions and insoluble
+radii ``het_mxphase_freezing`` reads (mo_cloud_micro_2m.f90 lines 726–734,
+1552–1567). Without it, ECHAM's two-moment scheme takes its aerosol inputs
+from the ``lccnclim`` mode: ``ccnclim_IN_setup``
+(``mo_ccnclim.f90:524-583``) feeds the aerosol freezing routine
+``het_mxphase_freezing`` constant dust and black-carbon fractions (lines
+69–73) and fixed insoluble-mode radii (lines 74–77), and sets the cirrus
+soluble-aerosol number from a CCN climatology with a floor of 10⁷ kg⁻¹.
+
+**Why we differ.**
+- SPEEDY large-scale condensation
+  (``jcm/physics/clouds/speedy_condensation.py``), `differentiability` — the
+  boundary-layer threshold applies at the bottom level as
+  ``max(rhlsc − drhlsc·(1 − σ²), rhblsc)``, a selection on which the losing
+  side (``rhblsc``, or the profile's ``rhlsc`` and ``drhlsc``) has exactly
+  zero derivative (below the profile value ``rhblsc``
+  has no effect on the model at all, so a calibration that steps it there is
+  never pulled back); the value is the hard maximum and with
+  ``condensation.bl_threshold_smoothing`` > 0 (an RH fraction) it carries the
+  derivative of the hyperbolic smooth maximum, as the grid-point-storm
+  heating cap does with ``cap_smoothing``
+  ({doc}`../design/surrogate_gradients`).
+- Cover, `differentiability` — the cover's value is ECHAM's, but where its
+  derivative is useless the derivative is that of a named smooth surrogate
+  ({doc}`../design/surrogate_gradients`). The clip of ``b0`` has plateaux
+  with zero slope and the square root an unbounded slope at saturation; the
+  derivative is that of ``1 − sqrt(1 − b0_s)`` with the softplus clip
+  ``b0_s = w·softplus(b0/w) − w·softplus((b0 − 1)/w)``, width
+  ``smooth_b0 = 0.02``, whose slope is bounded by ``1/(2 sqrt(w ln 2))`` ≈ 4.2
+  and which lies within ``sqrt(w ln 2)`` ≈ 0.12 of the cover (at ``b0 = 1``).
+  The inversion search's stability test ``best > −cinv·g/cp`` is a threshold;
+  its derivative is that of the sigmoid ``σ((best + cinv·g/cp)/w)``, width
+  ``smooth_inv_thr = 2e-4`` K/m, which gives ``cinv`` and the chosen level's
+  lapse rate a gradient near the threshold. Which level the search chooses is
+  piecewise constant in the temperature and keeps its reference derivative,
+  zero: a smooth selection over levels would differ from the value by the
+  whole enhancement wherever two levels compete. The ``lo2`` phase switch
+  keeps its reference derivative (that of the branch in use). Widths of zero
+  select the reference derivatives.
+- Cover, saturation vapour pressure — ECHAM's: the Sonntag (1990) fit that
+  ECHAM's lookup tables hold (``mo_echam_convect_tables.f90``), evaluated
+  analytically rather than through the 0.025 K spline (they agree to 1e-10),
+  from ``jcm/physics/thermodynamics.py`` through
+  ``jcm/physics/clouds/echam_saturation.py``. With it the cover
+  reproduces every column of ECHAM's own reference.
+- Total cloud cover, `science` — ECHAM's, accumulated online. The cover is
+  computed from the instantaneous fraction each step and averaged in time, as
+  ECHAM does, rather than reconstructed from a saved mean profile: the overlap
+  product is non-linear, so the overlap of a mean usually reads lower than the
+  mean of the overlaps (wherever cloud moves between layers within the
+  interval), though not always. It is
+  deterministic and uses the full fraction with no optical-depth threshold, so
+  it is neither the McICA sub-column cover the flux solve integrates
+  (``radiation.total_cloud_cover``, sampled, and built from the fraction zeroed
+  below ``2·cld_frac_min``) nor the AeroCom cloud-top ``aerocom_clt`` (optically
+  visible cloud only). ``CloudData.copy`` recomputes it whenever the fraction is
+  replaced, so it is always the cover of the fraction beside it.
+- Total cloud cover, `compute` / `differentiability` — one recurrence serves the
+  jitted step and the offline scorer
+  (``cloud_overlap.max_random_cover``), so the two cannot differ. The
+  Fortran's denominator ``1 − min(c, 1 − 10⁻¹²)`` is written as the equal
+  ``max(1 − c, 10⁻¹²)``: ``1 − 10⁻¹²`` is exactly 1 in float32, where an overcast
+  layer's ``0 / 10⁻¹²`` would become ``0 / 0``: a NaN in the saved value and a NaN gradient wherever a
+  gradient path reaches the cover (a zero cotangent into it still gives
+  ``0·NaN``). Every local
+  derivative of the recurrence is finite, and the true one wherever adjacent layers
+  differ; at exactly tied layers (an exactly clear column) it is a subgradient
+  that leaves a cloud-free interior layer with zero sensitivity where the
+  one-sided derivative is +1. This is accepted rather than fixed: gradient-
+  based calibration targets the AeroCom cloud-optical-depth-thresholded
+  cover (`clt`) that satellite retrievals see, not this online, release-gate
+  `aclcov` (maintainer decision 2026-10-05, tracked by the now-closed issue
+  1013) — a fix would be warranted only if `clouds.total_cloud_cover`
+  itself enters a loss.
+- Radiation's cover, `science` — ECHAM's radiation uses the cover only where
+  the step-start grid-mean condensate it radiates is positive
+  (``mo_radiation.f90`` l.428-434, ``xq = MAX(xlm1, 0)``,
+  ``MERGE(cld_frc, 0, xq_liq > 0 .OR. xq_ice > 0)``), and hands the same
+  masked cover to COSP. jcm's radiation does the same in
+  ``cloud_data.radiation_cloud_fields``, which every radiation scheme reads.
+  jcm's COSP term applies the same mask to a different state: the
+  post-microphysics cover with the post-physics condensate and temperature it
+  simulates, where ECHAM's COSP reads the radiation's masked step-start
+  fields (``mo_psrad_interface.f90`` l.414; ``physc.f90`` l.1348-1356). A cell the
+  mask clears has no condensate and so no optical depth; under maximum-random
+  overlap it separates the cloud banks above and below it, as in ECHAM's
+  sampler. The mask's VALUE keeps the reference formula exactly
+  (`differentiability`): the cleared cell contributes nothing to any flux
+  through its own optics, bit for bit. Its DERIVATIVE does not keep the
+  reference's (which is uselessly zero, see below): in a cell with cover but
+  no condensate, ``mcica.in_cloud_condensate_with_mask_gradient`` and
+  ``mcica.effective_cloud_fraction_with_mask_gradient`` give the derivative
+  with respect to that cell's own condensate the one-sided value "a trace of
+  condensate would switch the optics on at the cell's full diagnosed cover"
+  (e.g. ``1/cf``), taking it from the RAW (pre-mask) cover rather than the
+  masked one a plain surrogate on the mask alone would still see as zero (the
+  masked cover's downstream consumers never see ``qc``/``qi`` as arguments, so
+  differentiating the mask in isolation cannot reach the condensate).
+  This reaches the in-cloud condensate and cover quantities themselves, which
+  feed the effective-radius law; it does NOT reach the actual McICA flux
+  through the same cell, because jax-rrtmgp's own cloud-optics presence gate
+  (a C1 smoothstep ramp, zero value AND zero slope at a zero cloud path by
+  construction) kills any tangent reaching it there regardless of what jcm's
+  own wiring carries — a library-side limitation, not jcm's, tracked
+  separately. The AeroCom diagnostics read the post-microphysics
+  cover, which is ECHAM's written-back ``aclc`` (zero where both condensates
+  are below ``ccwmin``), and are not masked again.
+- COSP satellite-simulator outputs under time averaging, `science` — three
+  product families from ``jcm/physics/diagnostics/cosp_cloudsat.py`` are
+  CONDITIONAL means, not plain per-step grid-box means, so
+  ``output_averages``'s plain arithmetic mean of the per-step field is the
+  wrong quantity unless divided by a matching companion the term emits
+  alongside it. CALIPSO's
+  ``cllcalipso``/``clmcalipso``/``clhcalipso``/``cltcalipso`` follow GOCCP
+  (Chepfer et al. 2010): a subcolumn with no usable signal (fully
+  attenuated from above) is excluded from the mean rather than counted as
+  clear, and GOCCP's own averaging POOLS the valid-subcolumn counts across
+  steps rather than plainly averaging each step's already-divided
+  fraction, so the field is stored pre-multiplied by that step's valid
+  fraction (of ``ncolumns``) and the same weight is emitted as the
+  ``<name>_n`` companion. MODIS/ISCCP products
+  (``cltmodis``/``clwmodis``/``climodis``/``cltisccp`` and their joint
+  histograms) are CFMIP-defined DAYTIME means, but the passive retrievals are
+  0 at night; a shared ``cosp_sunlit`` companion lets the post-processor
+  divide the all-steps mean by the sunlit fraction. The MODIS in-cloud means
+  (``tauwmodis``/``reffclwmodis``/``lwpmodis`` and the ice equivalents) are
+  CMIP-defined weighted by the matching cloud fraction so their RATIO is the
+  in-cloud mean; the term stores the pre-weighted product rather than the
+  bare mean so the same ratio recipe works under both time-averaged and
+  instantaneous output. ``tools/aerocom_cmor.py`` applies all three
+  corrections when building AeroCom submission files; a file from before
+  these companions existed is passed through with a warning rather than
+  refused.
+- Cover and radiation condensate, time level — the cover reads the state the
+  physics receives, which contains the step's dynamics, and so does the
+  radiation's condensate (``cloud_data.radiation_cloud_fields``); ECHAM's
+  cover reads the ``t − Δt`` fields (``physc.f90`` l.543-548) and its
+  radiation the ``xlm1``/``xim1`` of that time level (l.566-573), one
+  dynamics step earlier. The cloud schemes map ``xlm1`` to their anchor. The carry holds that
+  state's temperature, humidity and condensate (the cloud schemes' anchor)
+  but not its pressures or geopotential; the cover reads the received state
+  by the maintainer's decision. The cloud schemes' ``papm1`` (their air
+  density and saturation) is likewise the received state's pressure, one
+  dynamics step after the anchor: the difference is the surface-pressure
+  change of one step, about 3e-4 of the pressure for a cyclone deepening
+  1 hPa per hour in a 900 s step.
+- Resolution-dependent defaults, `science` — ECHAM sets ``crs``, ``crt``,
+  ``nex``, ``nadd``, ``csatsc``, ``cinv``, ``cvtfall``, ``csecfrl`` and
+  ``clwprat`` per truncation (``mo_echam_cloud_params.f90::sucloud``; the 2M
+  reads the same ``cvtfall``, ``mo_cloud_micro_2m.f90`` l.97, 536) and
+  defines them for T31, T63, T127 and T255 only; it has no T106
+  configuration. jcm builds these defaults for the run's truncation at physics
+  construction (``echam_physics(coords=...)``; the Hydra runner passes the
+  grid): the table's values at its four truncations (ECHAM's, with jcm's
+  calibrated T63 cover values below), linear interpolation in the truncation
+  number between them for the real-valued ones, and the nearer truncation's
+  value for the integers ``nex`` and ``nadd``. T106 therefore gets
+  ``crs = 0.966``, ``crt = 0.726``, ``csatsc = 0.712``, ``cinv = 0.258`` with
+  the prescribed-droplet cover and ``0.973``, ``0.742``, ``0.749``, ``0.255``
+  with the JAM cover, ``cvtfall = 2.836``, ``csecfrl = 8.36e-6``, ECHAM's
+  ``nex = 2`` and T63's (= T127's) ``nadd``, ``clwprat``. The interpolated values are jcm's
+  choice, made so that the resolution trend the table encodes is continued
+  rather than switched, and they are **untuned**. Outside T31–T255, and on a
+  grid with no spectral truncation, the nearest (or T63) values are used with
+  a warning. An explicit parameter object or a field override always wins
+  (``jcm/physics/resolution_defaults.py``).
+- Cover parameters at T63, `science` — the T63 values of ``crt``, ``crs``,
+  ``nex``, ``csatsc`` and ``cinv`` are jcm's, not ECHAM's (0.75, 0.975, 2, 0.7,
+  0.25), and there are two sets, by droplet-number source:
+  **0.677, 0.908, 1.01, 0.737 and 0.275** for a prescribed droplet number
+  (``JCM_CALIBRATED_COVER_T63``: the 1M host, and the 2M host with simple-plume
+  activation) and **0.727, 0.930, 1.14, 0.848 and 0.265** for droplets
+  activated from the JAM aerosol (``JCM_CALIBRATED_COVER_T63_JAM``, which
+  ``echam_physics`` takes for any JAM composition). Activated droplets make
+  wetter, brighter cloud than a prescribed number at the same cover, so one set
+  cannot serve both. Each set was fitted by derivative-free Gauss-Newton on
+  30-day January and July windows against the jcm-monitor climatologies (cloud
+  radiative effects, cover, liquid water path, precipitation; for the JAM hosts
+  also the total and dust AOD and the dust and sea-salt burdens), the
+  prescribed set on the 2M host with its ``ccraut``, the JAM set on JAM-MAM4
+  and JAM-M7 jointly with ``ccraut`` and each population's aerosol levers, and
+  confirmed in 365-day T63 L47 years (net TOA flux +3.3 W/m² on the 2M host,
+  -1.6 on JAM-MAM4, -2.7 on the 1M host; CERES +1.0; SW CRE -46.4, -48.7 and
+  -42.9 against -45.7). ``nex`` sits on its range's lower bound (1.0) in the
+  prescribed set, which the data do not bound from below; ``nex`` is an INTEGER
+  in ECHAM, but the closure needs none: the profile ``rhc`` has a base
+  ``p_s/p >= 1`` and so is continuous and differentiable in a real exponent,
+  equal to ``crs`` at the surface and tending to ``crt`` aloft. The 1M host,
+  T106 and the cubed sphere have no calibration of their own (#1014).
+  ECHAM's own row stays in ``ECHAM_CLOUD_DEFAULTS``, and the Fortran comparison
+  runs on the constants its reference data recorded. Evidence and the year
+  tables: {doc}`../design/jam_aerosol_retune` ("The v3.1 refit").
+- 2M warm autoconversion and droplet floor, `science` — ECHAM-HAM pairs its
+  floor ``cdnc_min_fixed`` with ``ccraut`` (``mo_activ.f90::activ_initialize``:
+  2.8 at 10 cm⁻³, 10.6 at 40, T63 L47 with AR&G activation). jcm's defaults are
+  the JAM-MAM4 calibration: a floor of **10 cm⁻³**, HAM's lower one, and
+  ``ccraut`` **30**, fitted with the JAM cover and on its range's upper bound
+  (the data do not bound it from above: the fit asked for faster
+  autoconversion still on MAM4's activated droplets, which outnumber M7's at
+  the same cloud levers, #1184). The ``echam-jam-m7``
+  preset sets **13**, which brings M7's net TOA flux to CERES at the shared
+  cover, at the cost of about 7 % more AOD from slower rain-out. A prescribed
+  droplet number (the simple-plume 2M presets, and ``echam_physics`` with any
+  ``aerosol_module`` but ``jam``) takes ``ccraut`` **12.5**, fitted with its
+  cover, and ECHAM's floor of **40** (``PRESCRIBED_DROPLET_WARM_RAIN_2M``),
+  picked by droplet source as the cover is: there the floor sets most of the droplet number, and
+  10 thins the January cloud from 42 to 16 g/m² of liquid water path. A
+  runaway check (KK2000 autoconversion grows without bound in clean air below
+  a floor) passed at 10 on the JAM host. Evidence:
+  {doc}`../design/jam_aerosol_retune` ("The v3.1 refit").
+- ``csecfrl`` and ``cthomi``, two copies — ECHAM has one ``csecfrl``
+  (``mo_echam_cloud_params.f90`` l.76, set per truncation) and one
+  ``cthomi`` (l.54), which its cover and its ``cloud`` both read. jcm holds
+  each twice: ``CloudParameters.csecfrl``/``t_ice`` for the cover and
+  ``MicrophysicsParameters.csecfrl``/``cthomi`` for the 1M (the 2M carries
+  its own ``cthomi``). The defaults agree. An override or a calibration of
+  one copy leaves the other scheme's value unchanged, and ``echam_physics()``
+  warns when the copies it builds differ.
+- `science` (deliberate, documented): the 2M column sweep uses **MG/PUMAS
+  sediment→melt ordering** (ice sedimentation before melt), *not* ECHAM's
+  melt→sediment. The melt acts on the post-sedimentation ice through the threaded
+  tendency so the two sinks cannot claim the same mass. This is the one intentional
+  cross-reference ordering deviation in the sweep; the process docstring in
+  ``scheme.py`` names it explicitly.
+- `science` (deliberate): the fusion-heat correction of the detrainment
+  re-split uses jcm's per-level moist ``cp`` and runs in both directions.
+  ECHAM divides by dry ``cpd`` and corrects only convective ice turned liquid
+  (``ztconv <= tmelt .AND. .NOT. lo2``, lines 1300–1308), so convective liquid
+  turned ice gains no fusion heat there. jcm's form keeps the column
+  moist-enthalpy identity exact, which the conservation tests pin.
+- `science` (deliberate): ECHAM floors the crystal number at ``icemin`` in
+  cold cloudy cells before the loop (lines 1127–1131) and after the section-4
+  additions (line 1253). jcm applies neither floor. A cell at or below
+  ``icemin`` is re-diagnosed from its ice mass in ``update_in_cloud_water``,
+  and the floor would inject ``icemin`` crystals per step into cells with no
+  ice.
+- `science` (deliberate): the ICNC diagnosis is capped at ``icemax``.
+  ECHAM's diagnosis (lines 2610–2624) is uncapped. jcm applies the bound
+  ECHAM puts on the section-1 additions (line 1252).
+- `differentiability`: activation, freezing and precipitation gates are
+  formulated to keep cloud parameters differentiable; there is no import-time
+  default parameter instance (that would sever gradients / overrides).
+- `differentiability` — the 1M scheme keeps ECHAM's values at every switch
+  and power law and gives six of them a surrogate derivative
+  ({doc}`../design/surrogate_gradients`): the ``lo2`` phase switch (logistic in
+  temperature, width ``phase_switch_width`` = 1 K, and in the cloud ice
+  relative to ``csecfrl``, width ``phase_switch_ice_width`` = 0.1 of
+  ``csecfrl``), the melt of all cloud ice above ``tmelt`` and the freezing of
+  all cloud water at or below ``cthomi`` (logistic in temperature, the same
+  1 K), the ice fall speed ``cvtfall·(ρ·q_i)^0.16`` (below
+  ``ice_fall_speed_gradient_cutoff`` = 1e-7 kg/m³ the derivative is that of a
+  parabola through the origin that matches the power law's value and slope at
+  the cutoff, and below zero, for negative provisional ice, that of the
+  parabola's tangent at the origin; thin cirrus holds 1e-6 to 1e-4 kg/m³, so
+  the cutoff lies below real cloud, and the largest slope is 1.4e6 for every
+  ice content), and the mean droplet radius of
+  contact freezing (the same parabola in the in-cloud liquid below
+  ``contact_freezing_liquid_cutoff`` = 1e-10 kg/kg, about a 0.08 µm droplet).
+  The sixth is the KK2000 option's threshold, a hard gate with a logistic
+  surrogate of width ``smooth_ccraut``. All widths are static fields; zero selects the
+  reference derivative. Switches whose value jumps but which keep their
+  reference derivative: the clear-cell criterion ``paclc > 0`` (its jump has
+  no smooth continuation without a model of partial-cell evaporation, which
+  ECHAM 6.3 comments out), the precipitating-fraction reset, the ``ccwmin``
+  correction and cover write-back (jumps of at most ``ccwmin``), and the
+  low-pressure ``ub`` branch of the supersaturation check.
+- `differentiability`: ``het_mxphase_freezing`` evaluates each singular
+  operation (the cube root of the droplet volume, ``√TKE``, the ``1/r`` of the
+  Brownian diffusivities, ``exp(tmelt − T)``) on a safe argument where ECHAM
+  discards the result, so its values are ECHAM's and its derivatives stay
+  finite at zero aerosol, TKE, radius or liquid and outside the gate. ECHAM's
+  caps on the frozen mass and number are kinks, kept as written.
+
+**Status & known limitations (stated openly).**
+- **Mixed-phase heterogeneous freezing** acts in cells with liquid between
+  ``cthomi`` and ``tmelt`` (ECHAM's gate ``ll_mxphase_frz``, lines 1541–1545).
+  Which formulation runs is set by the composition.
+  - **With JAM: ECHAM-HAM's rates.** ``het_mxphase_freezing``
+    (``jcm/physics/clouds/lohmann_2m/deposition_freezing.py``; lines
+    2675–2840; Lohmann & Diehl 2006, *J. Atmos. Sci.* 63, 968) freezes cloud
+    water over the step by Brownian contact freezing on insoluble dust and by
+    immersion freezing of droplets that hold dust or black carbon,
+    ``(32.3·f_du + 2.91·10⁻³·f_bc)·exp(tmelt − T)·(−min(ztte, 0))·V_drop``
+    per second, with the droplet volume ``V_drop = ρ·q_l/(ρ_w·N_l)``
+    (montmorillonite; the coefficients are the differentiable
+    ``CloudParams2M.immersion_coefficient_dust/_bc``). The frozen number is
+    capped at the droplets above ``cdnc_min``; mass, number and fusion heat
+    move together and the returned freezing is cover-weighted (line 2837).
+    The dust and BC fractions and the insoluble-mode radii are ECHAM-HAM's
+    ``ham_IN_setup`` fields, which JAM computes from its population (see
+    {doc}`aerosol`, *Aerosol inputs to ice formation*) and publishes as
+    ``freezing_aerosol``. With MAM4 there is no insoluble dust, and ECHAM
+    disables black-carbon contact freezing (line 2784), so contact freezing
+    is zero and the JAM mixed-phase freezing is immersion freezing.
+  - The immersion rate acts only while the air cools. ECHAM's cooling rate
+    ``ztte`` is the adiabatic cooling of the vertical motion,
+    ``(ω − fact_tke·√TKE·ρ·g)/(cpd·ρ)`` (lines 2800–2802), not the model's
+    temperature tendency — ``ω`` is the host's dycore-supplied large-scale
+    pressure velocity, read the same opportunistic way as the updraft's
+    (above). In 10-day T63 JAM runs the TKE updraft cools every gate cell,
+    and the dycore's ``ω`` changes the immersion rate (weighted by
+    ``exp(tmelt − T)`` and the droplet volume) by 0.5 % and turns it off in
+    no cell.
+  - **Without JAM: ECHAM's own aerosol-free mode, ``lccnclim``.**
+    ``ccnclim_freezing_aerosol`` (``jcm/physics/clouds/lohmann_2m/ccnclim.py``,
+    porting ``mo_ccnclim.f90::ccnclim_IN_setup``, lines 524–583) feeds
+    ``het_mxphase_freezing`` the SAME constant dust/black-carbon fractions and
+    insoluble-mode wet radii described in *What ECHAM/CAM does* above,
+    broadcast uniformly over every column and level — the mixed-phase block
+    of that routine has no spatial or temporal dependence at all, despite the
+    module's "CCN climatology" name (see ``ccnclim.py``'s module docstring for
+    the full argument: the actual CCN climatology file feeds only the
+    routine's separate cirrus-freezing outputs, which ``het_mxphase_freezing``
+    does not take). This is jcm's default
+    (``CloudParams2M.aerosol_free_freezing = AerosolFreeFreezing.LCCNCLIM``),
+    reached through exactly the same ``het_mxphase_freezing`` call a
+    prognostic aerosol's HAM inputs would use.
+
+    An explicit, non-default ``AerosolFreeFreezing.DEMOTT`` keeps jcm's older
+    closure: droplets of mean mass freeze until the crystal number reaches
+    the INP number ``n_inp``, the **DeMott et al. (2010)** parameterisation
+    (``deposition_freezing.py::demott2010_inp``) on a prescribed number of
+    particles larger than 0.5 µm, ``n_aer_coarse`` (0.5 cm⁻³ at standard
+    conditions, spatially constant). DeMott et al. report INP per standard
+    litre, at 273.15 K and about 1013 hPa, so the function converts to
+    ambient air by ``ρ/ρ_STP``. It applies only within the fitted range,
+    238–264 K. The droplets available cap the number frozen, the liquid
+    available caps the mass, and number, mass and fusion heat move together.
+    The droplet number is floored at ``cqtmin``; ECHAM's
+    ``het_mxphase_freezing`` instead caps the number frozen at the droplets
+    above ``cdnc_min`` (lines 2818–2820). This parameterisation appears in
+    neither the ECHAM nor the CAM source tree — kept only as the explicit
+    closure the compiled-ECHAM Fortran-reference harness
+    (``lohmann_2m_fortran_reference_test``, the 2M fidelity audit's
+    standalone ``mo_cloud_micro_2m.f90`` build) needs: that build is a
+    genuinely aerosol-free standalone compile (fed exactly-zero HAM inputs,
+    unlike ``lccnclim``'s nonzero climatological defaults), so its own
+    comparison needs a closure that goes to exactly zero at
+    ``n_aer_coarse = 0`` (``lohmann_2m_fortran_reference_test.echam_params``).
+  - Heterogeneous freezing is a second-order ice source in both. Detrained ice
+    carries its own crystal number, about 10⁵ crystals m⁻² s⁻¹ in T63 January
+    runs, against 10²–10³ from heterogeneous freezing, and the freezing itself
+    moves 0.01–0.04 g m⁻² d⁻¹ of a mixed-phase ice budget of about 500. Its
+    indirect effect is larger under JAM: where ECHAM's immersion rate
+    completes, at the cold end of the mixed phase, every frozen droplet
+    becomes a crystal, and those crystals seed the WBF transfer and
+    deposition. In 10-day T63 JAM runs with ``ccsaut = 900``, going from the
+    closure to ECHAM-HAM's rates raised the WBF transfer from 6.3 to 6.9 and the deposition from 252
+    to 271 g m⁻² d⁻¹, lowered the liquid water path from 45.6 to 43.1 g m⁻²
+    and the supercooled fraction at 238–243 K from 0.52 to 0.45, and changed
+    the ice water path by +0.2 g m⁻² (run-to-run noise: 0.75 g m⁻² in the liquid
+    path).
+  - ``ice_nuclei`` remains an optional input of the closure (an external INP
+    number, the larger of it and DeMott is used); no in-tree term publishes
+    it. ``ice_nuclei_deposition`` (ECHAM's deposition-INP slot) is likewise
+    unfed on every currently-mergeable composition: its one producer (a
+    Niemand 2012 deposition/immersion INP module) was removed by closed
+    issue 953 in favour of the ``freezing_aerosol`` contact + immersion path
+    above, and nothing has replaced it. It is read by ``update_in_cloud_water`` as
+    ``pnicex`` only when ``nic_cirrus != 2``, where it is unused today.
+    ``CloudParams2M``'s own default is ``nic_cirrus = 1`` and every preset
+    keeps it except ``echam-jam-m7.yaml``, whose ``nic_cirrus: 2`` pairs the
+    Kärcher-Lohmann cirrus path below with its M7 aerosol population
+    (pinned by ``configurations_test.py``'s
+    ``test_jam_m7_preset_carries_its_reference_settings``). At ``nic_cirrus = 2``,
+    ``pnicex`` instead comes from the Kärcher-Lohmann cirrus scheme below,
+    which is fed by M7's ``cirrus_aerosol_number``, not by
+    ``ice_nuclei_deposition``. A real HAM-faithful ``ice_nuclei_deposition``
+    producer is tracked under #1017, the active M7/HAM campaign, rather than
+    wired ahead of it.
+- **Absent by decision.** This ECHAM-HAM process is not in the 2M scheme:
+  - cirrus nucleation ``zninucl`` at ``nic_cirrus = 1`` (lines 986–999). Its
+    cap is the soluble-aerosol number ``zascs``, which the scheme does not
+    receive, and the ice budget stands without it (#1159).
+- **Known biases of the 2M ice.** Four biases remain, measured in 10-day T63
+  January runs from a spun-up state. No ice parameter is tuned to them. A
+  sweep of ``ccsaut`` and the three Tiedtke levers kept their defaults, because
+  its best arm sat on the lower edge of four of its five levers and bought SW
+  cloud effect with liquid water path, and the calibration's only
+  microphysics lever is the warm ``ccraut`` (see
+  {doc}`../design/jam_aerosol_retune`).
+  - Glaciation is too warm. The supercooled share of the condensate mass
+    falls to one half near −7 °C. CALIOP places the crossing near −20 °C, but
+    CALIOP's quantity is a cloud-top phase frequency, not a mass fraction, and
+    that figure comes from a secondary summary (Hu et al. 2010; Tan et al.
+    2016).
+  - Cold ice cloud holds too many crystals. In the daily-mean output, two
+    fifths of the mixed-phase and three fifths of the cold ice-containing
+    cells exceed 10⁶ crystals m⁻³, above the 90th percentile
+    of the in-situ cirrus climatology of Krämer et al. (2020, *ACP* 20,
+    12569). The cause is the small radius ``zrid`` gives at cirrus
+    temperatures, which makes ``znidetr`` large.
+  - Liquid water path lies below the observed range (50–84 g m⁻² over the
+    oceans; Lohmann et al. 2007, *ACP* 7, 3425, Table 2).
+  - Under JAM the mixed-phase condensate stays more liquid than in the non-JAM
+    member. Both aggregate ice with ECHAM's generic ``ccsaut = 95``
+    (``mo_echam_cloud_params.f90``, line 59). ECHAM-HAM retunes it to 900 in
+    ``mo_activ.f90`` at T63 L47 with prognostic CDNC, AR&G activation and
+    ``cdnc_min_fixed = 40`` (lines 392–408). That retune belongs with HAM's own
+    aerosol and its insoluble dust mode, which jcm's MAM4-based JAM does not
+    reproduce, so JAM keeps the generic value. ``ccsaut`` for JAM was one of the
+    retune's eight Stage-1 levers (0.5-2 times 95) and keeps 95: its
+    standardised effect on the loss was +0.05, against +3.21 for the dust scale.
+    In 10-day T63 January runs from a JAM state 10
+    days past a cold start, 95 gives an ice water path of 22.3 g m⁻² against
+    7.0 with 900. The supercooled mass fraction at 253–258 K is 0.48 against
+    0.83. The non-JAM member had 27.8 g m⁻² and 0.28, measured before the
+    Sonntag saturation. The aerosol–ice coupling does not explain the gap:
+    replacing JAM's INP by DeMott's in the closure changed the ice water path
+    by 0.05 g m⁻², and ECHAM-HAM's rates change it by +0.2 g m⁻² (above).
+- **Cirrus ICNC diagnosis (default ``nic_cirrus = 1``).** Where a cloudy cell
+  holds ice at or below ``icemin`` crystals, ``update_in_cloud_water``
+  diagnoses the number from the ice mass at the radius ``zrid``,
+  ``N = 0.75·ρ·q_i / (π·ρ_ice·zrid³)`` with ``q_i`` in-cloud
+  (``jcm/physics/clouds/lohmann_2m/assembly.py::update_in_cloud_water``;
+  ECHAM lines 2610–2624). The number is capped at ``icemax`` (10⁷ m⁻³; see
+  *Why we differ*). The radius floor ``cirrus_min_ice_radius`` (10⁻⁷ m)
+  remains a parameter but never binds, because ``zrid`` is at least 1 µm. The
+  inversion is non-dimensionalised by a static 1 µm scale, so no gradient
+  path, through the state or a parameter, divides by a tiny cube
+  (`differentiability`).
+- **Kärcher-Lohmann cirrus homogeneous nucleation (``nic_cirrus = 2``).**
+  ``jcm/physics/clouds/lohmann_2m/cirrus.py`` ports ``mo_cirrus.f90``'s
+  ``XFRZMSTR``/``XFRZHOM``/``XICEHOM`` (Kärcher & Lohmann 2002b; Lohmann et
+  al. 2004): a per-level gate (adiabatic cooling over the step reaches the
+  Koop (2000) homogeneous threshold ``SCRHOM(T)``), a discrete search for
+  the temperature at which the threshold is first crossed, and the
+  ice-crystal number/radius the freezing event leaves, relaxed toward
+  vapour equilibrium over the step. ``ham_cirrus_aerosol``
+  (``jam/ice_nucleation/ham_freezing.py``) supplies its aerosol-number
+  input ``papnx`` from a population's own
+  ``ModalAerosolSpec.cirrus_aerosol_modes`` (M7: the soluble Aitken,
+  accumulation and coarse modes, HAM's own ``pascs`` sum,
+  ``mo_ham_freezing.f90:122-134`` — every soluble mode except the
+  nucleation mode); ``None`` for every other population leaves
+  ``nic_cirrus = 2`` unwired, so this changes no existing preset's default.
+  Only the reachable path is ported: ``XFRZHET`` (heterogeneous freezing)
+  and every aerosol-size-effect branch of ``XICEHOM``/``XICEHET`` are
+  unreachable in any supported ECHAM-HAM build (``lhetfreeze`` is an
+  ``em_error`` unless compiled with ``-DWITH_LHET``, ``mo_ham.f90:616-622``;
+  ``nosize`` is ``mo_cloud_micro_2m.f90:446``'s compile-time
+  ``PARAMETER .true.``). The compiled-reference harness (24 designed
+  cells, ``hamcirrus.npz``) matches to 8.0e-15 relative (float64) and
+  8.8e-7 (float32).
+
+  The cap on the candidate is the available aerosol number, not pressure:
+  ``update_in_cloud_water``'s cap on
+  the ``nic_cirrus = 2`` candidate reads ``pap`` — but *this subroutine's
+  own* ``pap`` is declared "total number of aerosols available"
+  (``mo_cloud_micro_2m.f90:2520``), not the generic ECHAM pressure
+  convention the parameter's prior name assumed; the real call site feeds
+  it the per-level, mode-summed, ICNC-depleted aerosol number (``zap``,
+  ``mo_cloud_micro_2m.f90:1507``), never ``papm1``. jcm's argument is
+  ``aerosol_number_available``, fed from the same depleted quantity
+  ``xfrzmstr`` itself consumes.
+
+  **Deposition onto the newly nucleated crystals (``zqinucl``).**
+  ``cloud_utils.karcher_lohmann_deposition_rate`` ports ECHAM's own
+  section-1 deposition-growth formula (``mo_cloud_micro_2m.f90:1046-1102``,
+  distinct from ``mo_cirrus.f90`` -- this is ``cloud_micro_interface``'s own
+  code, not ``XFRZMSTR``'s): a Fuchs-corrected diffusional growth rate
+  (thermodynamic term ``zastbsti``, molecular speed ``zvth``, transition
+  regime correction ``zfuchs``) times a Reynolds-number ventilation factor
+  (built from a mean-crystal-mass fall speed sharing ``sedimentation_ice``'s
+  size-regime piecewise fall-speed coefficients, evaluated on the
+  step-start ice rather than ``sedimentation_ice``'s own carried state),
+  clamped to the available vapour above and ice below. ``scheme.py`` calls
+  it immediately after ``xfrzmstr`` (same step-start inputs, before
+  sedimentation/melting/section 4, matching the Fortran's own placement)
+  and feeds its result into section 5 as the ``nic_cirrus = 2`` deposition
+  leg ``zdep`` (ECHAM 1449-1458: ``zqinucl`` stands in for ``zqcdif`` under
+  the SAME dissipation/ice-fraction/``lo2`` dispatch the condensation leg
+  ``zcnd`` already used, which is itself unaffected). ``zvth``'s molecular
+  constants (Boltzmann's constant, the mass of one H2O molecule) use
+  ECHAM's own 3-significant-figure literals (``mo_cloud_utils.f90``), not
+  jcm's higher-precision physical constants, since reproducing that
+  rounding -- not the CODATA value -- is what matches the compiled
+  reference. Against the end-to-end harness
+  (``cloud2m_cirrus_T63L47.npz``, which records ``zqinucl``/``zri_cirrus``/
+  ``icncq_qd``): it matches to float64 round-off on
+  4 of 5 designed columns, 9.3e-15 absolute on the 5th (a zero-aerosol
+  control cell with a near-cancelling subtraction); the ``zdep`` dispatch
+  formula matches the compiled ``zdep`` exactly.
+
+  Two further choices follow the reference at ``nic_cirrus = 2``. jcm's
+  Koop homogeneous-freezing floor (section 12b of
+  ``deposition_freezing.py``) is a stand-in for the homogeneous-nucleation
+  deposition sink that ``nic_cirrus = 1`` lacks; at ``nic_cirrus = 2``
+  ``zqinucl`` is that sink and r7492 has no such floor, so the floor runs
+  only at ``nic_cirrus = 1`` (*science*: running both would deposit vapour
+  twice). ``mixed_phase_deposition_and_corrections``'s ``ll_het`` is
+  ``False``, as ECHAM's ``ll_het`` (``mo_ham_freezing.f90:156``,
+  ``ld_het = lhetfreeze``) is in every supported build, the same fact the
+  paragraph above records for ``XFRZHET``.
+
+  End to end, the ICNC tracer tendency matches the compiled reference's
+  ``pxtte_icnc`` to <=3.2e-7 relative on the five designed T63L47 columns
+  (see ``cirrus_end_to_end_reference_test.py``). The
+  comparison is against the tracer tendency, not the same-step ``picnc``
+  diagnostic, which the ccwmin mass-consistency repair does not
+  touch in a near-zero-ice-mass cell.
+- Neither microphysics scheme publishes the radiative effective radii: as in
+  ECHAM, the radiation forms them inside its own call from the step's
+  condensate and droplet/crystal number (``mo_cloud_optics.f90::cloud_optics``;
+  see {doc}`radiation`), from the laws in ``cloud_utils`` that the 2M scheme
+  also evaluates for its own ``preffl``/``preffi``. The 1M radiation and the
+  1M autoconversion read the prescribed droplet number times the Twomey
+  factor, and the 1M's Bigg and contact freezing the unscaled ``acdnc``
+  (above). The
+  radiative **ice** radius on the 2M path follows the crystal number the
+  scheme carries, which comes mainly from ``znidetr`` and the ``zrid``
+  diagnosis of the ice-number sources above.
+- Clear-sky evaporation of decorrelated condensate (the radiation-side contract in
+  ``mcica.in_cloud_path``) is owned by the 2M scheme's clear-sky evaporation step.
+- **1M: gravity-wave and orographic drag heating** reach the cloud scheme one
+  step late: those terms run after it (≤ 0.03 K/day in the troposphere).
+- **1M: the ``lonacc`` zeroing of the local-rain factor** applies at the
+  cover's diagnosed inversion level (``knvb``, published by
+  ``SundqvistCloudFraction`` as ``"inversion_level"``) and the level below
+  it, under subsidence (the large-scale vertical velocity) — the same gate
+  the 2M's matching ``zauloc`` exception now applies too. It is inert at
+  ECHAM6.3, which fixes ``cauloc = 0`` as a parameter
+  (``mo_echam_cloud_params.f90`` l.71), as are the local-rain accretion and
+  the in-layer snow, which the Fortran comparison therefore does not
+  exercise (unit tests pin their formulas). **Unlike the 1M, the 2M's own
+  ``cauloc`` default is ECHAM-HAM's 3.0** (``mo_cloud_micro_2m.f90``), so
+  this gate is live in every 2M configuration, not merely a dormant hook.
+  ``knvb`` itself is published only where the cover's stratocumulus search
+  runs at all: ECHAM scans for the inversion exclusively over ``loidx``
+  columns (water fraction > 0.5, ice fraction < 1e-12, no prior-step
+  convection — the cover's own ``enhance_allowed``, ``mo_cover.f90``
+  l.178-203) and leaves every other column at the "no level found" sentinel
+  regardless of its temperature profile; ``inversion_level_index`` applies
+  that same gate before returning a level, so a land, sea-ice or
+  prior-convection column never feeds a stray index into the ``lonacc``
+  exception of either scheme.
+
+**Code pointers.**
+- ``jcm/physics/clouds/sundqvist.py`` — ``SundqvistCloudFraction``,
+  ``calculate_cloud_fraction``, ``inversion_level_index`` (ECHAM's knvb,
+  spelled out in prose above).
+- ``jcm/physics/clouds/echam_saturation.py`` — ``es_water``, ``es_ice``,
+  ``lo2_ice_phase``, ``qsat_from_es``: the Sonntag functions of
+  thermodynamics.py under the default formula.
+- ``jcm/physics/clouds/cloud_data.py`` — ``radiation_cloud_fields``,
+  ``condensate_masked_cover``.
+- ``jcm/physics/clouds/echam_cloud_defaults.py`` — ``echam_cloud_defaults``,
+  ``ECHAM_CLOUD_DEFAULTS``, ``JCM_CALIBRATED_COVER_T63``,
+  ``JCM_CLOUD_DEFAULTS``, ``inversion_levels``.
+- ``jcm/physics/resolution_defaults.py`` — ``resolution_defaults``.
+- ``jcm/physics/clouds/echam_1m.py`` — ``Echam1MMicrophysics``,
+  ``cloud_microphysics_column_sweep``.
+- ``jcm/physics/clouds/lohmann_2m/`` — ``scheme.py`` (``cloud_microphysics_2m``,
+  ``Lohmann2MMicrophysics``, process-order docstring, the section-1 fields),
+  ``deposition_freezing.py``
+  (``het_mxphase_freezing``, ECHAM-HAM's rates under JAM; ``demott2010_inp``,
+  the aerosol-free closure's INP),
+  ``sedimentation_melt.py``, ``precip.py``, ``assembly.py``,
+  ``jcm/physics/clouds/lohmann_2m/types.py`` (``HeterogeneousFreezingAerosol``,
+  the HAM freezing inputs);
+  ``jcm/physics/clouds/lohmann_2m_params.py`` (``CloudParams2M``);
+  ``jcm/physics/clouds/cloud_utils.py``
+  (``effective_2_volmean_radius_param_Schuman_2011``);
+  ``jcm/physics/clouds/cloud_data.py`` (``CloudData``, including
+  ``conv_detrainment_qc`` / ``conv_detrainment_qi``).
+
+**Validation evidence.** ``jcm/physics/clouds/echam_fortran_reference_test.py``
+(the cover and 1M against the ECHAM6.3 Fortran, column by column, with
+``jcm/data/test/echam_cloud_reference/``),
+``sundqvist_test.py`` (designed points, the Fortran columns at ECHAM's four
+truncations, the surrogates), ``cloud_data_test.py`` (radiation's condensate
+mask and its effect on McICA overlap), ``echam_cloud_defaults_test.py``,
+``echam_saturation_test.py``, ``echam_1m_test.py``,
+``lohmann_2m_test.py``, ``cloud_utils_test.py``.
+The ECHAM-HAM comparisons: ``lohmann_2m_fortran_reference_test.py`` (the ice
+sources against the compiled ECHAM6.3-HAM2.3 ``cloud_micro_interface``, building
+block by building block and end to end: the crystal radius, both ``lo2``
+criteria, the sedimentation of the pre-detrainment ice, the ICNC diagnosis, the
+detrained crystal number and the number tendencies) and
+``lohmann_2m_freezing_reference_test.py`` (heterogeneous
+mixed-phase freezing against the compiled ``cloud_micro_interface`` with the HAM
+freezing inputs set: ``het_mxphase_freezing`` agrees to round-off on every
+freezing column, the large-scale-``ω`` column included);
+``lohmann_2m_freezing_test.py`` (gradients, and the aerosol-free path pinned to
+its output before the ECHAM-HAM rates). Design
+reference: {doc}`../design/lohmann_2m_column_processes`.

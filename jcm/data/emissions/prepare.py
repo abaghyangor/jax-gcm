@@ -39,15 +39,16 @@ import jcm.constants as _const
 from jcm.data.emissions.regrid import build_regridder, model_grid
 from jcm.physics.aerosol.jam.emissions.sectors import OM_OC_RATIO
 
-_AVOGADRO = _const.physical_constants.avogadro  # molec / mol
-
 
 def molec_flux_to_mass_flux(molar_mass_g_per_mol: float) -> float:
     """Factor converting ``molecules cm⁻² s⁻¹`` → ``kg m⁻² s⁻¹``.
 
     ``(MW/N_A) g/molec · 1e-3 kg/g · 1e4 cm²/m² = MW·10/N_A``.
+
+    N_A is read here rather than captured at import so a ``set_constants``
+    override reaches it (#772).
     """
-    return molar_mass_g_per_mol * 10.0 / _AVOGADRO
+    return molar_mass_g_per_mol * 10.0 / _const.avogadro
 
 
 @dataclass(frozen=True)
@@ -226,6 +227,8 @@ class SpeciatedChannel:
             model layer(s), so this is near-exact; the
             :class:`PreSpeciatedEmissions` 3-D path remains for genuinely
             high-resolution elevated injection.
+        molar_mass: override the source's molecular_weight in g/mol when its
+            tracer convention differs from the rounded inventory attribute.
 
     Number emissions need no special casing: CESM encodes them so the same
     ``molecular_weight``-based molec→mass conversion yields ``#/m²/s`` directly.
@@ -236,6 +239,7 @@ class SpeciatedChannel:
     source: str
     var: str = "emiss"
     elevated: bool = False
+    molar_mass: float | None = None
 
 
 def cesm_mam4_speciated(directory: str, *, suffix: str =
@@ -315,16 +319,30 @@ def prepare_speciated_emissions(
             dz_cm = np.abs(np.diff(ds["altitude_int"].values)) * 1.0e5  # km→cm
             alt_axis = da.dims.index("altitude")
             values = np.tensordot(values, dz_cm, axes=([alt_axis], [0]))
-        # Same molec→mass(/number) conversion CAM applies; reads the file's MW.
-        values = values * molec_flux_to_mass_flux(float(da.attrs["molecular_weight"]))
+        # CAM uses the destination tracer's molecular weight. A channel can
+        # override a rounded source attribute (SOAG is emitted as carbon
+        # equivalents, 12.011 g/mol; the core's local molecular basis and
+        # 250-g/mol equilibrium convention do not set emission mass).
+        mw = ch.molar_mass
+        if mw is None:
+            mw = float(da.attrs["molecular_weight"])
+        values = values * molec_flux_to_mass_flux(mw)
 
         slon = ds[lon_name].values
         slat = ds[lat_name].values
         gkey = (slon.shape, float(slon[0]), float(slat[0]), float(slat[-1]))
         regridder = regridder_cache.get(gkey)
         if regridder is None:
-            regridder = build_regridder(slon, slat, ds[area_name].values,
-                                        dst_lon, dst_lat)
+            if area_name in ds:
+                area = ds[area_name].values
+            elif da.dims[-2:] == (lat_name, lon_name):
+                # Regular CAM6 SOAG inventories omit an area field. Exact
+                # spherical overlap uses the axes; this array only declares
+                # the latitude-major layout to the shared remapper.
+                area = np.ones((len(slat), len(slon)))
+            else:
+                raise ValueError("Unstructured emission input requires cell area")
+            regridder = build_regridder(slon, slat, area, dst_lon, dst_lat)
             regridder_cache[gkey] = regridder
 
         gridded = regridder(values)  # (..., nlon, nlat)
@@ -342,8 +360,12 @@ def prepare_speciated_emissions(
                             lat=("lat", np.rad2deg(dst_lat)))
     if time_coord is not None:
         out = out.assign_coords(time=("time", np.atleast_1d(time_coord.values)))
+        out["time"].attrs.update(time_coord.attrs)
     out.attrs["title"] = (
         "jax-gcm prescribed pre-speciated aerosol emissions (per-tracer surface "
         "flux; mass kg/m2/s, number #/m2/s) — CAM6/MAM4-faithful path"
     )
+    for tracer in fields:
+        out[f"aero_emis_{tracer}"].attrs["units"] = (
+            "m-2 s-1" if tracer.startswith("n_") else "kg m-2 s-1")
     return out

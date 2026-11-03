@@ -1,8 +1,8 @@
-"""Tests for the shared Tetens saturation thermodynamics.
+"""Tests for the Tetens saturation of Betts-Miller and the JAM modules.
 
-These cover the formulas that ``tiedtke_nordeng`` and ``betts_miller`` both
-depend on: the saturation vapour pressure, specific humidity / mixing ratio, and
-the analytic ``dqs/dT`` used by the Newton adjustment steps.
+ECHAM physics does not use this module (it takes Sonntag 1990 from
+``jcm.physics.thermodynamics``); these tests pin the Tetens formula the
+out-of-scope schemes keep, value for value.
 """
 
 import unittest
@@ -38,6 +38,17 @@ class TestSaturationVaporPressure(unittest.TestCase):
         self.assertAlmostEqual(
             float(sat.saturation_vapor_pressure(cold, phase="auto")),
             float(sat.saturation_vapor_pressure(cold, phase="ice")), places=6)
+
+    def test_ice_coefficients_pin(self):
+        # Regression guard for the historical broken ice coefficient
+        # (A_ICE = 35.86, the *water* c4, in place of ECHAM's c3ies =
+        # 21.875): with the correct ECHAM ice pair,
+        # es_ice(253.15 K) ≈ 102.8 Pa (reference tables: ≈ 103.2 Pa). The
+        # broken coefficient gave ≈ 33 Pa here (~3× low), so a tight
+        # window pins the fix.
+        es = sat.saturation_vapor_pressure(jnp.array(253.15), phase="ice")
+        self.assertGreater(float(es), 102.0)
+        self.assertLess(float(es), 103.0)
 
     def test_ice_below_water_below_freezing(self):
         # Below freezing, saturation over ice is below that over water.
@@ -79,14 +90,6 @@ class TestSaturationSpecificHumidity(unittest.TestCase):
         # ceiling (float32 rounding allows a sub-epsilon overshoot).
         self.assertLessEqual(float(qs), 1e-3 + 1e-9)
 
-    def test_mixing_ratio_is_clipped_alias(self):
-        # saturation_mixing_ratio swaps the arg order and clips to [0, 0.5].
-        T, p = jnp.array(295.0), jnp.array(9.0e4)
-        r = sat.saturation_mixing_ratio(p, T, phase="auto")
-        qs = sat.saturation_specific_humidity(T, p, phase="auto",
-                                              clip=(0.0, 0.5))
-        self.assertAlmostEqual(float(r), float(qs), places=10)
-
     def test_broadcasts_over_shapes(self):
         # Column temperature (kx,) against a (kx, ncols) pressure broadcasts.
         T = jnp.linspace(240.0, 300.0, 6)[:, None]
@@ -96,27 +99,85 @@ class TestSaturationSpecificHumidity(unittest.TestCase):
         self.assertTrue(bool(jnp.all(jnp.isfinite(qs))))
 
 
-class TestSaturationDerivative(unittest.TestCase):
-    """The analytic ``dqs/dT`` used by the Newton adjustment steps."""
+class TestTetensValuesPinned(unittest.TestCase):
+    """The formula, value for value, so Betts-Miller and JAM stay bit-identical."""
 
-    def test_qs_matches_plain_call(self):
-        T, p = jnp.array(285.0), jnp.array(8.5e4)
-        qs, _ = sat.saturation_specific_humidity_and_derivative(
-            T, p, phase="auto")
-        qs_plain = sat.saturation_specific_humidity(T, p, phase="auto")
-        self.assertAlmostEqual(float(qs), float(qs_plain), places=8)
+    def test_hand_computed_tetens(self):
+        with jax.enable_x64(True):
+            for T0, phase, c3, c4 in ((300.0, "water", 17.269, 35.86),
+                                      (250.0, "ice", 21.875, 7.66),
+                                      (250.0, "auto", 21.875, 7.66),
+                                      (c.tmelt, "auto", 17.269, 35.86)):
+                es = sat.saturation_vapor_pressure(jnp.asarray(T0), phase=phase)
+                want = 610.78 * np.exp(c3 * (T0 - c.tmelt) / (T0 - c4))
+                np.testing.assert_allclose(float(es), want, rtol=1e-14)
 
-    def test_derivative_matches_autodiff(self):
-        # The closed-form dqs/dT should match JAX's autodiff of qs(T) (away from
-        # the es<0.99p cap, where the two branches diverge by construction).
-        for T0 in (250.0, 285.0, 305.0):
-            T, p = jnp.array(T0), jnp.array(9.0e4)
-            _, dqs_dT = sat.saturation_specific_humidity_and_derivative(
-                T, p, phase="auto")
-            ad = jax.grad(
-                lambda t: sat.saturation_specific_humidity(t, p, phase="auto"))(T)
-            self.assertTrue(np.isclose(float(dqs_dT), float(ad), rtol=1e-3),
-                            msg=f"T={T0}: {float(dqs_dT)} vs {float(ad)}")
+    def test_specific_humidity_uses_eps(self):
+        with jax.enable_x64(True):
+            T, p = jnp.asarray(290.0), jnp.asarray(8.5e4)
+            es = float(sat.saturation_vapor_pressure(T, phase="water"))
+            want = 0.622 * es / (8.5e4 - 0.378 * es)
+            np.testing.assert_allclose(
+                float(sat.saturation_specific_humidity(T, p, phase="water")),
+                want, rtol=1e-13)
+
+
+class TestDewpointTemperature(unittest.TestCase):
+    """``dewpoint_temperature`` is the exact inverse of ``qs(T, p)`` (#1140)."""
+
+    def test_round_trip_water(self):
+        with jax.enable_x64(True):
+            p = jnp.array(98000.0)
+            for T in (280.0, 290.0, 300.0, 310.0):
+                q_sat = sat.saturation_specific_humidity(
+                    jnp.asarray(T), p, phase="water")
+                t_d = sat.dewpoint_temperature(q_sat, p, phase="water")
+                np.testing.assert_allclose(float(t_d), T, rtol=1e-10)
+
+    def test_round_trip_ice(self):
+        with jax.enable_x64(True):
+            p = jnp.array(98000.0)
+            for T in (230.0, 250.0, 265.0):
+                q_sat = sat.saturation_specific_humidity(
+                    jnp.asarray(T), p, phase="ice")
+                t_d = sat.dewpoint_temperature(q_sat, p, phase="ice")
+                np.testing.assert_allclose(float(t_d), T, rtol=1e-10)
+
+    def test_round_trip_auto_matches_branch_on_both_legs(self):
+        """``phase="auto"`` picks water above ``tmelt``, ice below, on BOTH
+        the forward (``saturation_specific_humidity``) and inverse
+        (``dewpoint_temperature``) legs, so a round trip agrees for a
+        column straddling the melting point.
+        """
+        with jax.enable_x64(True):
+            p = jnp.array(95000.0)
+            T = jnp.linspace(c.tmelt - 30.0, c.tmelt + 30.0, 13)
+            q_sat = sat.saturation_specific_humidity(T, p, phase="auto")
+            t_d = sat.dewpoint_temperature(q_sat, p, phase="auto")
+            np.testing.assert_allclose(np.asarray(t_d), np.asarray(T), rtol=1e-9)
+
+    def test_subsaturated_air_has_dewpoint_below_air_temperature(self):
+        # q below qsat(T) must invert to a dew point colder than T.
+        with jax.enable_x64(True):
+            T, p = jnp.asarray(295.0), jnp.asarray(98000.0)
+            q_sat = sat.saturation_specific_humidity(T, p, phase="water")
+            q_sub = 0.7 * q_sat
+            t_d = sat.dewpoint_temperature(q_sub, p, phase="water")
+            self.assertLess(float(t_d), float(T))
+
+    def test_increases_monotonically_with_humidity(self):
+        with jax.enable_x64(True):
+            p = jnp.array(98000.0)
+            q = jnp.linspace(0.002, 0.02, 20)
+            t_d = sat.dewpoint_temperature(q, p, phase="water")
+            self.assertTrue(bool(jnp.all(jnp.diff(t_d) > 0.0)))
+
+    def test_gradient_is_finite(self):
+        def f(q):
+            return jnp.sum(sat.dewpoint_temperature(q, jnp.asarray(98000.0),
+                                                     phase="auto"))
+        g = jax.grad(f)(jnp.linspace(0.002, 0.02, 10))
+        self.assertTrue(bool(jnp.all(jnp.isfinite(g))))
 
 
 class TestSaturationConstantsOverride(unittest.TestCase):

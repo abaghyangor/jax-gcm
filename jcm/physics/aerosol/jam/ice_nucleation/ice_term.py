@@ -1,13 +1,17 @@
-"""``IceNucleation`` — heterogeneous freezing term writing ``ice_nuclei`` (#494).
+"""``IceNucleation``: ECHAM-HAM's aerosol inputs to mixed-phase freezing (#953).
 
-Computes the dust/BC IN populations from the prognostic aerosol, the ambient
-temperature and ice saturation ratio, and (for the rate-based scheme) a
-characteristic cooling rate from the TTE-TKE updraft; applies the selected
-freezing parameterization (:mod:`niemand` or :mod:`lohmann_diehl`); and writes
-the heterogeneous ice-crystal number ``ice_nuclei`` [m⁻³]. The 2-moment cloud
-scheme reads it (like ARG's ``activated_cdnc``) to set the het ICNC.
+Computes, from the prognostic JAM population, the eight fields
+``mo_ham_freezing.f90::ham_IN_setup`` hands to the two-moment cloud scheme's
+heterogeneous mixed-phase freezing (``het_mxphase_freezing``): the dust and
+black-carbon fractions of the activated droplets (immersion) and of the
+insoluble aerosol (contact), and the insoluble-mode wet radii. They are
+published as ``freezing_aerosol``; the 2M scheme then freezes supercooled
+cloud water at ECHAM-HAM's contact and immersion rates instead of its
+aerosol-free DeMott (2010) closure. The partition and the MAM4 -> HAM class
+mapping are in :mod:`jcm.physics.aerosol.jam.ice_nucleation.ham_freezing`.
 
-Runs in the JAM pre-cloud block, before the cloud microphysics.
+Runs after ``ArgActivation`` (its per-mode activated fraction gives HAM's
+``nact_strat``) in the JAM block ahead of the cloud microphysics.
 """
 
 from __future__ import annotations
@@ -15,83 +19,144 @@ from __future__ import annotations
 from typing import ClassVar
 
 import jax.numpy as jnp
-from flax import nnx
 
-from jcm.constants import cpd as _CPD
-from jcm.constants import grav as _G
-from jcm.physics.aerosol.jam.ice_nucleation.in_populations import in_populations
-from jcm.physics.aerosol.jam.ice_nucleation.lohmann_diehl import (
-    lohmann_diehl_inp,
+from jcm.physics.aerosol.jam.removal_split import split_view
+from jcm.physics.aerosol.jam.ice_nucleation.ham_freezing import (
+    MAM4_FREEZING_CLASSES,
+    HamFreezingClasses,
+    ham_cirrus_aerosol,
+    ham_freezing_aerosol,
 )
-from jcm.physics.aerosol.jam.ice_nucleation.niemand import niemand_inp
-from jcm.physics.aerosol.jam.ice_nucleation.params import IceNucleationParameters
 from jcm.physics.aerosol.jam.microphysics.mam4_data import MAM4_SPEC
 from jcm.physics.aerosol.jam.population import ModalAerosolSpec
-from jcm.physics.convection.saturation import saturation_specific_humidity
+from jcm.physics.aerosol.jam.tracer_layout import mass_name, number_name
 from jcm.physics.physics_term import PhysicsTerm
 from jcm.physics_interface import PhysicsTendency
 
-_W_MIN = 0.01      # m/s — floor on the characteristic updraft
-_W_DEFAULT = 0.1   # m/s — fallback updraft when TKE is unavailable (step 1)
+_FRACTION = {"units": "1"}
+FREEZING_AEROSOL_OUTPUT_ATTRS: dict[str, dict[str, str]] = {
+    "freezing_aerosol.dust_soluble": {
+        **_FRACTION,
+        "long_name": "dust fraction of activated droplets (immersion freezing, HAM pfracdusol)"},
+    "freezing_aerosol.dust_insoluble_accumulation": {
+        **_FRACTION,
+        "long_name": "insoluble accumulation dust fraction of insoluble aerosol (HAM pfracduai)"},
+    "freezing_aerosol.dust_insoluble_coarse": {
+        **_FRACTION,
+        "long_name": "insoluble coarse dust fraction of insoluble aerosol (HAM pfracduci)"},
+    "freezing_aerosol.bc_soluble": {
+        **_FRACTION,
+        "long_name": "black-carbon fraction of activated droplets (immersion freezing, HAM pfracbcsol)"},
+    "freezing_aerosol.bc_insoluble": {
+        **_FRACTION,
+        "long_name": "black-carbon fraction of insoluble aerosol (HAM pfracbcinsol)"},
+    "freezing_aerosol.wet_radius_insoluble_aitken": {
+        "units": "m", "long_name": "wet radius of the insoluble Aitken class (HAM prwetki)"},
+    "freezing_aerosol.wet_radius_insoluble_accumulation": {
+        "units": "m", "long_name": "wet radius of the insoluble accumulation class (HAM prwetai)"},
+    "freezing_aerosol.wet_radius_insoluble_coarse": {
+        "units": "m", "long_name": "wet radius of the insoluble coarse class (HAM prwetci)"},
+}
 
 
 class IceNucleation(PhysicsTerm):
-    """Heterogeneous (immersion+deposition) freezing on dust + BC."""
+    """HAM's mixed-phase freezing inputs from the JAM population."""
 
     name: ClassVar[str] = "jam_ice_nucleation"
     category: ClassVar[str] = "aerosol_ice_nucleation"
-    requires: ClassVar[tuple[str, ...]] = ("pressure_full", "air_density")
-    provides: ClassVar[tuple[str, ...]] = ("ice_nuclei", "ice_nuclei_deposition")
+    requires: ClassVar[tuple[str, ...]] = (
+        "air_density", "_jam_state", "_jam_activation", "activated_cdnc",
+    )
+    provides: ClassVar[tuple[str, ...]] = ("freezing_aerosol",)
+    output_attrs: ClassVar[dict[str, dict[str, str]]] = FREEZING_AEROSOL_OUTPUT_ATTRS
 
     def __init__(
         self,
-        params: IceNucleationParameters | None = None,
         *,
         spec: ModalAerosolSpec | None = None,
-        scheme: str = "niemand",
+        classes: HamFreezingClasses | None = None,
     ):
-        """Hold params, the population, and the freezing scheme."""
-        self.params = nnx.Param(params or IceNucleationParameters.default())
-        self._spec = spec or MAM4_SPEC
-        if scheme not in ("niemand", "lohmann_diehl"):
-            raise ValueError(
-                f"Unknown ice scheme {scheme!r}; choose 'niemand' or "
-                "'lohmann_diehl'."
-            )
-        self._scheme = scheme
+        """Hold the population and its HAM freezing-class mapping.
 
-    def _cooling_rate(self, diagnostics, temperature):
-        """Characteristic cooling rate [K/s] from the TKE updraft (ascent)."""
-        vd = diagnostics.get("vertical_diffusion")
-        if vd is not None:
-            w = jnp.sqrt(jnp.maximum(2.0 / 3.0 * vd.tke, 0.0))
-        else:
-            w = jnp.full_like(temperature, _W_DEFAULT)
-        return jnp.maximum(w, _W_MIN) * _G / _CPD
+        ``classes`` defaults to the population's own ``spec.freezing_roles``
+        when it sets one (M7), else the MAM4 mapping; a population with other
+        class names and no ``freezing_roles`` of its own must say explicitly
+        which of its classes play HAM's roles.
+        """
+        self._spec = spec or MAM4_SPEC
+        self._classes = classes or self._spec.freezing_roles or MAM4_FREEZING_CLASSES
+        known = set(self._spec.mode_shorts)
+        named = set(self._classes.soluble) | {
+            s for s in (self._classes.insoluble_aitken,
+                        self._classes.insoluble_accumulation,
+                        self._classes.insoluble_coarse) if s is not None}
+        if not named <= known:
+            raise ValueError(
+                f"HAM freezing classes {sorted(named - known)} are not classes of "
+                f"the population {sorted(known)}; pass classes= to name the "
+                "population's own classes.")
+        self._classes.validate(self._spec)
 
     def __call__(self, state, diagnostics, forcing, terrain):
-        p = self.params.get_value()
+        spec = self._spec
         rho = diagnostics["air_density"]
-        pressure = diagnostics["pressure_full"]
-        t = state.temperature
+        aer = diagnostics["_jam_state"]
+        act = diagnostics["_jam_activation"]
+        view = split_view(spec, state, diagnostics)
+        zeros = jnp.zeros_like(rho)
 
-        pops = in_populations(self._spec, state.tracers, rho, p.frac_du_soluble)
-        qsat_ice = saturation_specific_humidity(t, pressure, phase="ice")
-        s_ice = state.specific_humidity / jnp.maximum(qsat_ice, 1.0e-30)
+        def tracer(name):
+            return view.get(name, zeros)
 
-        if self._scheme == "niemand":
-            inp_imm, inp_dep = niemand_inp(pops, t, s_ice, p)
-        else:
-            dt = jnp.asarray(diagnostics["_dt_seconds"], t.dtype)
-            cooling = self._cooling_rate(diagnostics, t)
-            inp_imm, inp_dep = lohmann_diehl_inp(pops, t, s_ice, cooling, dt, p)
+        classes = self._classes
+        named = set(classes.soluble) | {
+            s for s in (classes.insoluble_aitken, classes.insoluble_accumulation,
+                        classes.insoluble_coarse) if s is not None}
+        # Composition of a class: its interstitial plus cloud-borne mass,
+        # floored at zero. HAM takes the composition, the activation and the
+        # insoluble number from one time level (pxtm1). Here the composition
+        # and the insoluble number are the step-start tracers, while the
+        # activated number and the wet radii are the core's post-step state
+        # that ARG activates from (``_jam_state``), so the activated classes
+        # sum to the ``activated_cdnc`` the 2M scheme receives. The core's
+        # aging and condensation within the step shift the ratios by that
+        # step's increment only.
+        masses = {}
+        for short in named:
+            for sp in spec.mode(short).species:
+                masses[(sp, short)] = jnp.maximum(
+                    tracer(mass_name(sp, short))
+                    + tracer(mass_name(sp, short, cloud_borne=True)), 0.0)
+        cirrus_modes = spec.cirrus_aerosol_modes or ()
+        number, wet_radius, activated, cirrus_number = {}, {}, {}, {}
+        for i, mode in enumerate(spec.modes):
+            if not mode.soluble:
+                number[mode.short] = jnp.maximum(
+                    tracer(number_name(mode.short))
+                    + tracer(number_name(mode.short, cloud_borne=True)), 0.0)
+            wet_radius[mode.short] = aer.r_wet[i]
+            # HAM's nact_strat: ARG's activated fraction of the class times the
+            # number ARG activated it from (floored at 0 as ARG floors it), so
+            # the classes sum to ``activated_cdnc``.
+            activated[mode.short] = (
+                act.number_frac[i] * jnp.maximum(aer.number[i], 0.0) * rho)
+            if mode.short in cirrus_modes:
+                # ham_cirrus_aerosol's pascs wants HAM's own post-step value
+                # (pxtm1 + pxtte*ztmst, mo_ham_freezing.f90:130) -- the SAME
+                # core post-step number ``activated`` above already uses, not
+                # the step-start interstitial tracer ``number`` (above) uses
+                # for the mixed-phase fractions (see ham_cirrus_aerosol's
+                # docstring).
+                cirrus_number[mode.short] = jnp.maximum(aer.number[i], 0.0)
 
-        # Immersion feeds the 2M mixed-phase het freezing; deposition feeds the
-        # cirrus nucleation hook (newly_formed_ice). Splitting them avoids
-        # double-counting where the regimes overlap.
-        tendency = PhysicsTendency.zeros(t.shape)
-        return tendency, {
-            **diagnostics,
-            "ice_nuclei": jnp.maximum(inp_imm, 0.0),
-            "ice_nuclei_deposition": jnp.maximum(inp_dep, 0.0),
-        }
+        freezing = ham_freezing_aerosol(
+            spec, classes, masses, number, activated, wet_radius, rho,
+            diagnostics["activated_cdnc"],
+        )
+        tendency = PhysicsTendency.zeros(state.temperature.shape)
+        diagnostics = {**diagnostics, "freezing_aerosol": freezing}
+        if spec.cirrus_aerosol_modes is not None:
+            _pascs, papnx, _paprx = ham_cirrus_aerosol(
+                spec, cirrus_number, wet_radius[spec.accumulation_mode], rho)
+            diagnostics = {**diagnostics, "cirrus_aerosol_number": papnx}
+        return tendency, diagnostics

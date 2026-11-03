@@ -51,7 +51,7 @@ from jcm.forcing import ForcingData
 from jcm.model import Model
 from jcm.physics.echam.echam_levels import get_echam_levels
 from jcm.physics.echam.echam_terms import echam_physics
-from jcm.runners import inject_balanced_isothermal_profile
+from jcm.initial_states import balanced_isothermal_state
 from jcm.terrain import TerrainData
 from jcm.utils import get_coords
 
@@ -76,6 +76,7 @@ def _t31l47_forcing():
     data_dir = resources.files("jcm.data.bc.t30.clim")
     return ForcingData.from_file(
         Path(data_dir / "forcing.nc"), coords=_t31l47_coords(),
+        align_mode="wrap_year",
     )
 
 
@@ -100,23 +101,38 @@ def _run_one_step(physics, terrain):
     model = Model(
         coords=coords, terrain=terrain, physics=physics, time_step=12,
     )
-    model._final_dycore_state = model._prepare_initial_dycore_state()
-    inject_balanced_isothermal_profile(model)
     dt_days = 12.0 / (60.0 * 24.0)
-    model.resume(forcing=forcing, save_interval=dt_days, total_time=dt_days)
+    model.run(
+        initial_state=balanced_isothermal_state(model),
+        forcing=forcing, save_interval=dt_days, total_time=dt_days,
+    )
     return model._final_dycore_state
 
 
 @pytest.mark.slow
 class TestEchamLandT31L47Hybrid(unittest.TestCase):
-    """Cheap-CPU control: T31L47 hybrid does NOT reproduce the T63 failure."""
+    """Cheap-CPU control: T31L47 hybrid does NOT reproduce the T63 failure.
+
+    Both tests already run the minimum that exercises this bisection point:
+    one 12-minute step (no multi-step integration needed — the production
+    failure reproduces by step 34, so step 1 alone already distinguishes
+    "NaNs immediately" from "stays finite"), at the specific resolution
+    (T31L47 hybrid) the bisection record above states does NOT reproduce the
+    T63 failure. Lowering the resolution further or dropping physics terms
+    would test a different, undocumented bisection point, not this one, so
+    neither is a valid way to shrink it. What is left — compiling the full
+    ``echam_physics()`` stack (RRTMGP + 1M microphysics + TTE-TKE, ...) at
+    T31L47 — is compile-bound (~95% of wall time is `jit` tracing/lowering,
+    not the single step's execution) and irreducible without changing the
+    code under test.
+    """
 
     def test_aquaplanet_baseline(self):
         """Sanity: aquaplanet T31L47 hybrid + balanced_isothermal must
         succeed (otherwise the test harness itself is broken).
         """
         final = _run_one_step(
-            echam_physics(radiation_scheme="grey"),
+            echam_physics(),
             _t31l47_terrain_aqua(),
         )
         self.assertTrue(_state_is_finite(final))
@@ -129,7 +145,7 @@ class TestEchamLandT31L47Hybrid(unittest.TestCase):
         in ``echam_t63_land_repro_test.py``.
         """
         final = _run_one_step(
-            echam_physics(radiation_scheme="grey"),
+            echam_physics(),
             _t31l47_terrain_real(),
         )
         self.assertTrue(_state_is_finite(final))

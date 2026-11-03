@@ -1,9 +1,19 @@
-"""``PrescribedOxidants`` — interim oxidant fields for the JAM sulfur chemistry.
+"""``PrescribedOxidants`` — prescribed oxidant fields for the JAM sulfur chemistry.
 
 The gas-phase (DMS+OH/NO₃, SO₂+OH) and aqueous (SO₂+H₂O₂/O₃) sulfur oxidation
-need OH, NO₃, O₃ and H₂O₂. A full implementation reads a monthly oxidant
-climatology; **as an interim** (issue #496) these are *derived from fields jcm
-already carries* so the chain runs and is testable without new input data:
+need OH, NO₃, O₃ and H₂O₂. Two sources are supported:
+
+**File-based climatology** (preferred): when ``forcing.oxidant_vmr`` is
+populated (``forcing.oxidants_file`` in the Hydra config, loaded by
+``jcm.forcing.read_oxidant_vmr`` — e.g. the HAMMOZ/MACC
+``ham_oxidants_monthly_T63L47_macc.nc``), the four species arrive as monthly
+mole-fraction fields already on the model levels. The VMR → molec cm⁻³
+conversion needs the instantaneous T and p, which only this term has, so the
+forcing keeps VMR and :func:`oxidant_field_from_vmr` converts here.
+
+**Analytic interim proxies** (fallback, issue #496): when no climatology is
+supplied the fields are *derived from fields jcm already carries* so the chain
+runs and is testable without new input data:
 
 * **O₃** — reused from ``diagnostics["chemistry"].ozone_vmr`` (the
   ``SimpleChemistry`` ozone field; mole-fraction = ``ozone_vmr·1e-6``, matching
@@ -73,8 +83,22 @@ class OxidantParameters:
 
 def air_number_density(temperature: jnp.ndarray,
                        pressure: jnp.ndarray) -> jnp.ndarray:
-    """Air number density [molec cm⁻³] from the ideal gas law ``n = P/(k_B T)``."""
-    return pressure / (c.ak * temperature) * 1.0e-6
+    """Air number density [molec cm⁻³] from the ideal gas law ``n = P/(k_B T)``.
+
+    Written as ``(P * (1e-6/k_B)) / T`` rather than ``P / (k_B T) * 1e-6``
+    (#971, found while fixing an unrelated DMS gradient that turned out to
+    trace here): the reverse pass of a division by ``k_B·T`` needs
+    ``(k_B·T)**2``, and ``k_B·T`` is ~1e-21 to ~4e-21 over the *entire*
+    atmospheric temperature range (200-320 K), so its square is always
+    below float32's smallest normal and XLA flushes it to 0 -- this is
+    `JAX_gotchas.md` class 4's own canonical example
+    (``(h·c)/(k·T)``), transplanted to a quantity every JAM gas-phase rate
+    reads. ``d(n_air)/dT`` was therefore ``-inf`` at *every* ordinary
+    temperature, not an edge case. Folding ``1e-6/k_B`` into the numerator
+    makes the differentiated denominator ``T`` itself (``T**2`` ~ 1e4-1e5,
+    nowhere near underflow); the value is unchanged to float32 rounding.
+    """
+    return (pressure * (1.0e-6 / c.ak)) / temperature
 
 
 def oxidant_field(
@@ -119,13 +143,60 @@ def oxidant_field(
     )
 
 
+def oxidant_field_from_vmr(
+    temperature: jnp.ndarray,
+    pressure: jnp.ndarray,
+    vmr: dict,
+) -> OxidantField:
+    """Build oxidant number densities from prescribed mole fractions.
+
+    Args:
+        temperature: ``(nlev, ncols)`` [K].
+        pressure: ``(nlev, ncols)`` [Pa].
+        vmr: mapping with keys ``oh``/``no3``/``o3``/``h2o2`` of mole-fraction
+            fields [mole/mole] on the model levels (``forcing.oxidant_vmr``
+            after ``select(date)``). Each field may arrive as ``(nlev, ncols)``
+            or ``(nlev, lon, lat)`` depending on whether the physics host runs
+            column-vectorized; it is reshaped to ``temperature``'s shape, which
+            raises at trace time on a size mismatch (the loader validates the
+            grid, so a mismatch is a wiring bug — never silently zero).
+
+    Returns:
+        :class:`OxidantField` in molec cm⁻³ (the unit the gas-kinetic and
+        aqueous rate expressions consume).
+
+    """
+    n_air = air_number_density(temperature, pressure)
+
+    def n_of(name):
+        v = jnp.reshape(jnp.asarray(vmr[name]), temperature.shape)
+        return jnp.maximum(v, 0.0) * n_air
+
+    return OxidantField(
+        oh=n_of("oh"), no3=n_of("no3"), o3=n_of("o3"), h2o2=n_of("h2o2"),
+    )
+
+
 class PrescribedOxidants(PhysicsTerm):
-    """Write the interim ``oxidants`` diagnostic for the sulfur chemistry."""
+    """Write the ``oxidants`` diagnostic for the sulfur chemistry.
+
+    Uses the prescribed climatology from ``forcing.oxidant_vmr`` when present;
+    otherwise falls back to the analytic interim proxies (module docstring).
+    """
 
     name: ClassVar[str] = "jam_prescribed_oxidants"
     category: ClassVar[str] = "aerosol_oxidants"
     requires: ClassVar[tuple[str, ...]] = ("pressure_full",)
     provides: ClassVar[tuple[str, ...]] = ("oxidants",)
+    # ``"chemistry"`` (real O3) and ``"radiation"`` (real cos(SZA)) are read
+    # OPTIONALLY (module docstring): this term runs before both in the
+    # default ``echam_physics`` order, so when they ARE present the value
+    # is last step's, which is fine for a slowly-varying climatological
+    # input; when a composition carries neither (or on the first step) the
+    # ``o3_fallback_vmr``/``cos_zenith_fallback`` params take over. Both
+    # patterns (cross-step lag and composition-optional) are deliberate,
+    # not an accidental stale read (jax-gcm#673).
+    optional_requires: ClassVar[tuple[str, ...]] = ("chemistry", "radiation")
 
     def __init__(self, params: OxidantParameters | None = None):
         """Hold the (differentiable) oxidant scales."""
@@ -135,6 +206,18 @@ class PrescribedOxidants(PhysicsTerm):
         params = self.params.get_value()
         temperature = state.temperature
         pressure = diagnostics["pressure_full"]
+
+        # Prefer the prescribed climatology. Presence of ``oxidant_vmr`` is
+        # pytree *structure* (set once at forcing build time), so this Python
+        # branch is resolved at trace time — no lax.cond needed.
+        ox_vmr = (
+            getattr(forcing, "oxidant_vmr", None) if forcing is not None
+            else None
+        )
+        if ox_vmr is not None:
+            field = oxidant_field_from_vmr(temperature, pressure, ox_vmr)
+            tendency = PhysicsTendency.zeros(temperature.shape)
+            return tendency, {**diagnostics, "oxidants": field}
 
         # O₃ and solar geometry are produced *after* the aerosol block, so read
         # them from the previous-step carry; fall back on step 1 / the probe.

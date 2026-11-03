@@ -8,6 +8,7 @@ import unittest
 
 import numpy as np
 import jax
+import pytest
 import jax.numpy as jnp
 from flax import nnx
 
@@ -87,8 +88,9 @@ class TestEchamComposablePhysics(unittest.TestCase):
         physics = echam_physics(checkpoint_terms=False)
         # Cloud fraction and microphysics are separate terms; the GWD
         # category split adds Hines + SSO (the simple-GWD scheme is kept
-        # available but excluded from the default factory).
-        self.assertEqual(len(physics.terms), 12)
+        # available but excluded from the default factory); the terminal
+        # EchamSurfaceExchange publishes the #754 coupling struct.
+        self.assertEqual(len(physics.terms), 13)
         categories = [t.category for t in physics.terms]
         self.assertIn("radiation", categories)
         self.assertIn("convection", categories)
@@ -110,9 +112,958 @@ class TestEchamComposablePhysics(unittest.TestCase):
             categories.index("cloud_fraction"),
             categories.index("radiation"),
         )
+        # ECHAM physc ordering (radheat → vdiff → cucall → cloud): vertical
+        # diffusion and the surface term that republishes its delivered
+        # fluxes must precede convection, so the Tiedtke zdqpbl closure
+        # reads the SAME-STEP vdiff moisture tendency and evaporation. A
+        # convection-first ordering forces a one-step-lagged supply, which
+        # compounds the convergence→convection feedback (onset7 NaN).
+        self.assertLess(
+            categories.index("radiation"),
+            categories.index("vertical_diffusion"),
+        )
+        self.assertLess(
+            categories.index("vertical_diffusion"),
+            categories.index("surface"),
+        )
+        self.assertLess(
+            categories.index("surface"),
+            categories.index("convection"),
+        )
+        self.assertLess(
+            categories.index("convection"),
+            categories.index("clouds"),
+        )
+
+    def test_cu_lmfmid_flag_toggles_the_omega_requirement(self):
+        """The scalar cu_lmfmid knob controls the dycore omega contract.
+
+        With the mid-level trigger on (the default) TiedtkeConvection
+        declares an ``omega`` dycore requirement, which both shipped
+        backends can supply (jax-gcm#698). Setting cu_lmfmid=False drops
+        that requirement so the ne30 presets compose without it, pending
+        that campaign's own stability validation (#715).
+        """
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        on = echam_physics(checkpoint_terms=False)
+        self.assertIn("omega", on.required_dycore_fields())
+
+        off = echam_physics(checkpoint_terms=False, cu_lmfmid=False)
+        self.assertNotIn("omega", off.required_dycore_fields())
+
+    def test_updraft_precip_cover_follows_the_ham_submodel(self):
+        """The sub-cloud rain-evaporation cover tracks the JAM chain (#812).
+
+        ECHAM keys ``zcucov`` on ``lham`` (mo_cufluxdts.f90:414-420); jcm's
+        ``lham`` is "the JAM aerosol chain is composed", so the convection
+        term takes the updraft-area cover for a JAM run and the constant 0.05
+        otherwise. An explicit ``convective_updraft_precip_cover`` pins it.
+        """
+        from jcm.physics.echam.echam_terms import echam_physics
+        from jcm.physics.convection.tiedtke_nordeng.tiedtke_nordeng import (
+            TiedtkeConvection,
+        )
+
+        def cover_flag(physics):
+            (conv,) = (t for t in physics.terms
+                       if isinstance(t, TiedtkeConvection))
+            return conv._updraft_precip_cover
+
+        # Non-JAM ECHAM: the constant 0.05 (flag off).
+        self.assertFalse(cover_flag(echam_physics(checkpoint_terms=False)))
+        # Pinned on without JAM (the A/B escape hatch).
+        self.assertTrue(cover_flag(echam_physics(
+            checkpoint_terms=False, convective_updraft_precip_cover=True)))
+        # A JAM run defaults the flag on; pinning it off recovers 0.05. Build
+        # only the convection term list cheaply via the placeholder core.
+        jam_on = echam_physics(
+            checkpoint_terms=False, aerosol_module="jam", cloud_scheme="2m",
+            jam_microphysics="placeholder")
+        self.assertTrue(cover_flag(jam_on))
+        jam_off = echam_physics(
+            checkpoint_terms=False, aerosol_module="jam", cloud_scheme="2m",
+            jam_microphysics="placeholder",
+            convective_updraft_precip_cover=False)
+        self.assertFalse(cover_flag(jam_off))
+
+    def test_jam_wetdep_scheme_wires_precip_cover_and_the_term_flag(self):
+        """``jam_wetdep_scheme="ham_below_cloud"`` (#1017) turns on the 2M
+        scheme's ``precip_cover``/``pfrain``/``pfsnow`` publication and the
+        wetdep term's own selector together; the default leaves both off/"jcm".
+        """
+        from jcm.physics.aerosol.jam.wetdep.wetdep_term import WetScavenging
+        from jcm.physics.clouds.lohmann_2m import Lohmann2MMicrophysics
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        def parts(physics):
+            micro = next(t for t in physics.terms
+                        if isinstance(t, Lohmann2MMicrophysics))
+            wetdep = next(t for t in physics.terms
+                          if isinstance(t, WetScavenging))
+            return micro, wetdep
+
+        default = echam_physics(
+            checkpoint_terms=False, aerosol_module="jam", cloud_scheme="2m",
+            jam_microphysics="placeholder")
+        micro, wetdep = parts(default)
+        self.assertFalse(micro._publish_wetdep_hydro)
+        for key in ("precip_cover", "pfrain", "pfsnow"):
+            self.assertNotIn(key, micro.provides)
+        self.assertEqual(wetdep.scheme, "jcm")
+        self.assertNotIn("precip_cover", wetdep.requires)
+
+        ham_bc = echam_physics(
+            checkpoint_terms=False, aerosol_module="jam", cloud_scheme="2m",
+            jam_microphysics="placeholder", jam_wetdep_scheme="ham_below_cloud")
+        micro, wetdep = parts(ham_bc)
+        self.assertTrue(micro._publish_wetdep_hydro)
+        for key in ("precip_cover", "pfrain", "pfsnow"):
+            self.assertIn(key, micro.provides)
+        self.assertEqual(wetdep.scheme, "ham_below_cloud")
+        self.assertIn("precip_cover", wetdep.requires)
+
+    def test_jam_below_cloud_lookup_reaches_the_wetdep_term(self):
+        from jcm.physics.aerosol.jam.wetdep.wetdep_term import WetScavenging
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        physics = echam_physics(
+            checkpoint_terms=False, aerosol_module="jam", cloud_scheme="2m",
+            jam_microphysics="placeholder", jam_wetdep_scheme="ham_below_cloud",
+            jam_below_cloud_lookup="ham_r7492")
+        wetdep = next(t for t in physics.terms if isinstance(t, WetScavenging))
+        self.assertEqual(wetdep._below_cloud_lookup, "ham_r7492")
+
+    def test_jam_wetdep_scheme_ham_below_cloud_requires_2m(self):
+        """A clear, scheme-specific error, not the generic ordering-validator
+        one that would otherwise fire deep inside ComposablePhysics.
+        """
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        with self.assertRaises(ValueError):
+            echam_physics(
+                checkpoint_terms=False, aerosol_module="jam", cloud_scheme="1m",
+                jam_microphysics="placeholder", jam_wetdep_scheme="ham_below_cloud")
+
+    def test_jam_wetdep_scheme_ham_wires_through(self):
+        """``jam_wetdep_scheme="ham"`` (#1017) turns on the 2M hydro
+        diagnostics and sets the wetdep term's scheme and
+        nucleation_activation; in-cloud impaction reads the radii every 2M
+        run publishes.
+
+        Needs an M7-shaped population: ``scheme="ham"`` requires HAM's own
+        KS/AS/CS activating modes (``WetScavenging.__init__``), which the
+        MAM4 ``"placeholder"`` core does not have -- use
+        ``"m7_placeholder"`` (M7_SPEC) instead, matching the ``echam-jam-m7``
+        preset's own chain-test vehicle.
+        """
+        from jcm.physics.aerosol.jam.wetdep.wetdep_term import WetScavenging
+        from jcm.physics.clouds.lohmann_2m import Lohmann2MMicrophysics
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        physics = echam_physics(
+            checkpoint_terms=False, aerosol_module="jam", cloud_scheme="2m",
+            jam_microphysics="m7_placeholder", jam_cloud_borne=False,
+            jam_wetdep_scheme="ham",
+            jam_nucleation_activation="ham_lin_leaitch",
+            jam_activation_scheme="ham_lin_leaitch")
+        micro = next(t for t in physics.terms if isinstance(t, Lohmann2MMicrophysics))
+        wetdep = next(t for t in physics.terms if isinstance(t, WetScavenging))
+        self.assertTrue(micro._publish_wetdep_hydro)
+        self.assertEqual(wetdep.scheme, "ham")
+        self.assertEqual(wetdep._nucleation_activation, "ham_lin_leaitch")
+        for key in ("precip_cover", "pfrain", "pfsnow", "reffl", "reffi"):
+            self.assertIn(key, wetdep.requires)
+            self.assertIn(key, micro.provides)
+
+    def test_jam_wetdep_scheme_ham_rejects_an_explicit_cloud_borne_phase(self):
+        """``ic_scav_nuc`` acts on an implicit population; with the explicit
+        phase (``echam_physics``'s default ``jam_cloud_borne=True``) the
+        exchange would fill the in-cloud aerosol instead, so composing it
+        raises.
+        """
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        with self.assertRaisesRegex(ValueError, "cloud-borne"):
+            echam_physics(
+                checkpoint_terms=False, aerosol_module="jam", cloud_scheme="2m",
+                jam_microphysics="m7_placeholder", jam_wetdep_scheme="ham",
+                jam_activation_scheme="ham_arg")
+
+    def test_jam_long_seasalt_mapping_applies_on_the_native_scale(self):
+        """A ``seasalt`` mapping under ``jam_seasalt_scheme="long"`` lands on
+        Long's default (scale 1), not Gong's calibration.
+        """
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        physics = echam_physics(
+            checkpoint_terms=False, aerosol_module="jam", cloud_scheme="2m",
+            jam_microphysics="m7_placeholder", jam_cloud_borne=False,
+            jam_seasalt_scheme="long", seasalt={"wind_exponent_long": 3.5})
+        term = next(t for t in physics.terms if t.name == "jam_seasalt_emissions")
+        params = term.params.get_value()
+        self.assertEqual(float(params.scale), 1.0)
+        self.assertAlmostEqual(float(params.wind_exponent_long), 3.5)
+
+    def test_jam_wetdep_scheme_ham_requires_2m(self):
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        with self.assertRaises(ValueError):
+            echam_physics(
+                checkpoint_terms=False, aerosol_module="jam", cloud_scheme="1m",
+                jam_microphysics="m7_placeholder", jam_wetdep_scheme="ham",
+                jam_activation_scheme="ham_arg")
+
+    def test_jam_wetdep_scheme_ham_rejects_a_non_m7_population(self):
+        """The documented default population (MAM4, via
+
+        ``jam_microphysics="placeholder"``) cannot support
+        ``jam_wetdep_scheme="ham"`` -- it lacks HAM's own KS/AS/CS
+        activating modes -- so composing it must raise rather than
+        silently run with in-cloud nucleation permanently off.
+
+        ``jam_activation_scheme="ham_arg"`` is passed explicitly to isolate
+        THIS rejection from the separate activation_scheme/
+        nucleation_activation consistency check (also enforced for
+        ``jam_wetdep_scheme="ham"``, jax-gcm#1045 review comment
+        4197639949): leaving ``jam_activation_scheme`` at its own default
+        ("arg", CAM's own) would raise that other error first, since it is
+        checked before the population is even resolved.
+        """
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        with self.assertRaisesRegex(ValueError, "activating modes"):
+            echam_physics(
+                checkpoint_terms=False, aerosol_module="jam", cloud_scheme="2m",
+                jam_microphysics="placeholder", jam_wetdep_scheme="ham",
+                jam_activation_scheme="ham_arg")
+
+    def test_jam_incloud_impaction_door(self):
+        """``jam_incloud_impaction`` reaches the wet-scavenging term (#1067).
+
+        The default is HAM's corrected lookup, which reads the 2M radii the
+        microphysics publishes; ``none`` drops the requirement.
+        """
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        def wetdep(physics):
+            return next(t for t in physics.terms
+                        if t.name == "jam_wet_deposition")
+
+        jam = dict(checkpoint_terms=False, aerosol_module="jam",
+                   cloud_scheme="2m", jam_microphysics="placeholder")
+        default = wetdep(echam_physics(**jam))
+        self.assertEqual(default._incloud_impaction, "ham")
+        self.assertIn("reffl", default.requires)
+        for choice in ("ham_r7492", "none"):
+            term = wetdep(echam_physics(**jam, jam_incloud_impaction=choice))
+            self.assertEqual(term._incloud_impaction, choice)
+        self.assertNotIn("reffl", term.requires)
+
+    def test_jam_stratiform_nucleation_door(self):
+        """``jam_stratiform_nucleation`` reaches the wet-scavenging term (#1080)."""
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        def wetdep(physics):
+            return next(t for t in physics.terms
+                        if t.name == "jam_wet_deposition")
+
+        jam = dict(checkpoint_terms=False, aerosol_module="jam",
+                   cloud_scheme="2m", jam_microphysics="placeholder")
+        default = wetdep(echam_physics(**jam))
+        self.assertEqual(default._stratiform_nucleation, "ham")
+        term = wetdep(echam_physics(
+            **jam, jam_stratiform_nucleation="activated_fraction"))
+        self.assertEqual(term._stratiform_nucleation, "activated_fraction")
+
+    def test_jam_takes_ham_ice_inhomogeneity(self):
+        """JAM (2M + ARG) defaults to ECHAM-HAM's ``zinhomi = 0.7``; every
+        other stack keeps ECHAM6's 0.8, and an explicit override wins.
+        """
+        from jcm.physics.echam.echam_terms import echam_physics
+        from jcm.physics.radiation.radiation_types import RadiationParameters
+
+        def zinhomi(physics):
+            rad = next(t for t in physics.terms if t.category == "radiation")
+            return float(rad.params.get_value().cloud_inhomogeneity_ice)
+
+        jam = dict(checkpoint_terms=False, aerosol_module="jam",
+                   cloud_scheme="2m", jam_microphysics="placeholder")
+        self.assertAlmostEqual(zinhomi(echam_physics(**jam)), 0.7, places=6)
+        self.assertAlmostEqual(
+            zinhomi(echam_physics(checkpoint_terms=False)), 0.8, places=6)
+        self.assertAlmostEqual(zinhomi(echam_physics(
+            checkpoint_terms=False, cloud_scheme="2m")), 0.8, places=6)
+        explicit = RadiationParameters.default(cloud_inhomogeneity_ice=0.9)
+        self.assertAlmostEqual(
+            zinhomi(echam_physics(**jam, radiation=explicit)), 0.9, places=6)
+
+    def test_jam_microphysics_options_reach_the_core(self):
+        """``jam_microphysics_options`` reaches the string-named core's own
+        constructor through ``jam_aerosol_physics`` (jax-gcm#1017 task 6):
+        an unknown key still raises (naming the core, as the placeholder
+        core takes none), and the error surfaces all the way up through
+        ``echam_physics``.
+        """
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        with self.assertRaises(ValueError) as ctx:
+            echam_physics(
+                checkpoint_terms=False, aerosol_module="jam",
+                cloud_scheme="2m", jam_microphysics="placeholder",
+                jam_microphysics_options={"nucleation_scheme": 2},
+            )
+        message = str(ctx.exception)
+        self.assertIn("placeholder", message)
+        self.assertIn("nucleation_scheme", message)
+
+    def test_cu_lmfmid_rejects_a_simultaneous_convection_override(self):
+        """cu_lmfmid and an explicit convection Parameters are exclusive."""
+        from jcm.physics.convection.tiedtke_nordeng import ConvectionParameters
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            echam_physics(
+                checkpoint_terms=False,
+                cu_lmfmid=False,
+                convection=ConvectionParameters.default(),
+            )
+
+    def test_field_override_mapping_for_a_scheme_not_composed_is_rejected(self):
+        """A mapping the composition would ignore is an error (#933)."""
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        for kwargs, name in (
+                (dict(radiation_scheme=DummyRadiationTerm(),
+                      radiation={"solar_constant": 1360.0}), "radiation"),
+                (dict(gw_scheme="none", hines={"rmscon": 1.0}), "hines"),
+                (dict(cloud_scheme="1m", microphysics_2m={"ccraut": 5.0}),
+                 "microphysics_2m"),
+                (dict(aerosol_module="jam", cloud_scheme="2m",
+                      jam_microphysics="placeholder",
+                      aerosol={"spa_exponent": 0.4}), "aerosol")):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(
+                        ValueError, rf"\['{name}'\] would be ignored"):
+                    echam_physics(checkpoint_terms=False, **kwargs)
+
+    def test_jam_natural_emission_parameters_reach_their_terms(self):
+        """``seasalt`` / ``dms`` set the JAM emission terms' parameters.
+
+        A mapping is applied on top of the class default and keeps the
+        fields it does not name; a Parameters object is used as given; with
+        neither, the terms keep the defaults.
+        """
+        from jcm.physics.aerosol.jam.emissions.dms import DmsParameters
+        from jcm.physics.aerosol.jam.emissions.seasalt import SeaSaltParameters
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        jam = dict(checkpoint_terms=False, aerosol_module="jam",
+                   cloud_scheme="2m", jam_microphysics="placeholder")
+
+        def emission_params(physics):
+            by_name = {t.name: t.params.get_value() for t in physics.terms
+                       if t.name in ("jam_seasalt_emissions",
+                                     "jam_dms_emissions")}
+            return by_name["jam_seasalt_emissions"], by_name["jam_dms_emissions"]
+
+        default_ss, default_dms = SeaSaltParameters.default(), DmsParameters.default()
+        ss, dms = emission_params(echam_physics(**jam))
+        self.assertEqual(float(ss.scale), float(default_ss.scale))
+        self.assertEqual(float(dms.flux_scale), float(default_dms.flux_scale))
+
+        # Mappings: only the named field moves.
+        ss, dms = emission_params(echam_physics(
+            **jam, seasalt={"scale": 1.7}, dms={"flux_scale": 0.6}))
+        self.assertAlmostEqual(float(ss.scale), 1.7)
+        self.assertEqual(float(ss.wind_exponent),
+                         float(default_ss.wind_exponent))
+        self.assertAlmostEqual(float(dms.flux_scale), 0.6)
+        # Each mapping reaches its own term only.
+        ss, dms = emission_params(echam_physics(**jam, dms={"flux_scale": 0.6}))
+        self.assertEqual(float(ss.scale), float(default_ss.scale))
+        ss, dms = emission_params(echam_physics(**jam, seasalt={"scale": 1.7}))
+        self.assertEqual(float(dms.flux_scale), float(default_dms.flux_scale))
+
+        # Objects are used as given (the Python-API form of the same door).
+        ss, dms = emission_params(echam_physics(
+            **jam, seasalt=SeaSaltParameters(
+                scale=2.5, wind_exponent=3.0),
+            dms=DmsParameters(flux_scale=0.4)))
+        self.assertAlmostEqual(float(ss.scale), 2.5)
+        self.assertAlmostEqual(float(ss.wind_exponent), 3.0)
+        self.assertAlmostEqual(float(dms.flux_scale), 0.4)
+
+    def test_2m_warm_rain_defaults_follow_the_droplet_source(self):
+        """The factory picks the 2M ``ccraut`` and droplet floor as it picks
+        the cover: the class defaults for JAM, the prescribed-droplet pair
+        otherwise, with a field override applied on top of either.
+        """
+        from jcm.physics.clouds.lohmann_2m import Lohmann2MMicrophysics
+        from jcm.physics.clouds.lohmann_2m_params import (
+            PRESCRIBED_DROPLET_WARM_RAIN_2M,
+            CloudParams2M,
+        )
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        def warm_rain(physics):
+            micro = next(t for t in physics.terms
+                         if isinstance(t, Lohmann2MMicrophysics))
+            p = micro.params.get_value()
+            return float(p.ccraut), float(p.cdnc_min_fixed)
+
+        prescribed = (PRESCRIBED_DROPLET_WARM_RAIN_2M["ccraut"],
+                      PRESCRIBED_DROPLET_WARM_RAIN_2M["cdnc_min_fixed"])
+        self.assertEqual(warm_rain(echam_physics(
+            checkpoint_terms=False, cloud_scheme="2m")), prescribed)
+        jam = CloudParams2M.default()
+        self.assertEqual(warm_rain(echam_physics(
+            checkpoint_terms=False, aerosol_module="jam", cloud_scheme="2m",
+            jam_microphysics="placeholder")),
+            (float(jam.ccraut), float(jam.cdnc_min_fixed)))
+        self.assertNotEqual(prescribed,
+                            (float(jam.ccraut), float(jam.cdnc_min_fixed)))
+        self.assertEqual(warm_rain(echam_physics(
+            checkpoint_terms=False, cloud_scheme="2m",
+            microphysics_2m={"ccraut": 5.0})), (5.0, prescribed[1]))
+
+    def test_jam_factory_ships_the_retuned_aerosol_defaults(self):
+        """The JAM factory carries the calibrated emission scales as defaults.
+
+        Sea-salt scale 1.53 and the dust threshold scale 0.720 on HAM's T63
+        regional vector (the v3.1 refit); DMS and the three wet-removal scales
+        stay at 1 in the factory (the ``echam-jam`` preset sets the latter). A
+        mapping or an explicit scale wins over the shipped value.
+        """
+        import numpy as np
+
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        jam = dict(checkpoint_terms=False, aerosol_module="jam",
+                   cloud_scheme="2m", jam_microphysics="placeholder")
+        ham_t63 = np.array([1.05, 1.45, 1.45, 1.05, 1.05, 1.05, 1.45, 1.05])
+
+        def params(physics, name):
+            return next(t for t in physics.terms
+                        if t.name == name).params.get_value()
+
+        physics = echam_physics(**jam)
+        self.assertAlmostEqual(
+            float(params(physics, "jam_seasalt_emissions").scale), 1.53,
+            places=6)
+        np.testing.assert_allclose(
+            np.asarray(params(physics, "jam_dust_emissions").nduscale_reg),
+            ham_t63 * 0.720)
+        self.assertEqual(
+            float(params(physics, "jam_dms_emissions").flux_scale), 1.0)
+        wet = params(physics, "jam_wet_deposition")
+        self.assertEqual((float(wet.incloud_scale), float(wet.impact_scale)),
+                         (1.0, 1.0))
+        self.assertEqual(float(params(
+            physics, "convective_tracer_transport").conv_scav_scale), 1.0)
+
+        tuned = echam_physics(**jam, seasalt={"scale": 1.0},
+                              jam_dust_nduscale_scale=0.5)
+        self.assertEqual(float(params(tuned, "jam_seasalt_emissions").scale),
+                         1.0)
+        np.testing.assert_allclose(
+            np.asarray(params(tuned, "jam_dust_emissions").nduscale_reg),
+            ham_t63 * 0.5)
+
+    def test_jam_dust_mapping_applies_on_the_truncation_aware_preset(self):
+        """``dust`` is layered on ``DustParameters.preset(...)``, not a bare default.
+
+        Unlike the other JAM doors, ``dust``'s base object depends on the
+        ``jam_dust_*`` flags and the run's truncation (jax-gcm#995), so a
+        mapping must combine with those flags rather than override them:
+        the regional vector a mapping does not touch keeps the flag-scaled
+        value, not the unscaled class default. An explicit ``DustParameters``
+        object is used as given, flags and all, same as every other door's
+        Python-API form.
+        """
+        from jcm.physics.aerosol.jam.emissions.dust import DustParameters
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        jam = dict(checkpoint_terms=False, aerosol_module="jam",
+                   cloud_scheme="2m", jam_microphysics="placeholder")
+        ham_t63 = np.array([1.05, 1.45, 1.45, 1.05, 1.05, 1.05, 1.45, 1.05])
+
+        def dust_params(physics):
+            return next(t for t in physics.terms
+                        if t.name == "jam_dust_emissions").params.get_value()
+
+        # No override: unchanged (bit-identical with the pre-#995 behaviour).
+        default = dust_params(echam_physics(**jam))
+        np.testing.assert_allclose(np.asarray(default.nduscale_reg),
+                                   ham_t63 * 0.720)
+
+        # A mapping composes with jam_dust_nduscale_scale: the field it names
+        # moves, the regional vector it doesn't name keeps the flag's scale
+        # (0.5), not the class default's.
+        tuned = dust_params(echam_physics(
+            **jam, jam_dust_nduscale_scale=0.5,
+            dust={"r_dust_umin": 50.0}))
+        np.testing.assert_allclose(np.asarray(tuned.nduscale_reg),
+                                   ham_t63 * 0.5)
+        self.assertAlmostEqual(float(tuned.r_dust_umin), 50.0)
+        self.assertNotAlmostEqual(float(default.r_dust_umin), 50.0)
+
+        # A mapping with the default flags is layered on the T63 ndust=4
+        # calibrated preset, same as the no-override case above.
+        mapped = dust_params(echam_physics(**jam, dust={"r_dust_umin": 55.0}))
+        np.testing.assert_allclose(np.asarray(mapped.nduscale_reg),
+                                   ham_t63 * 0.720)
+        self.assertAlmostEqual(float(mapped.r_dust_umin), 55.0)
+
+        # An object is used as given: the flags (including the retuned
+        # nduscale default) have no effect once an explicit object is passed.
+        obj = DustParameters.preset(ndust=2)
+        explicit = dust_params(echam_physics(
+            **jam, jam_dust_nduscale_scale=0.9, dust=obj))
+        np.testing.assert_array_equal(np.asarray(explicit.nduscale_reg),
+                                      np.asarray(obj.nduscale_reg))
+
+        with self.assertRaisesRegex(
+                ValueError, r"dust: unknown DustParameters field\(s\) "
+                r"\['r_dust_umin_typo'\].*Valid fields: .*'r_dust_umin'"):
+            echam_physics(**jam, dust={"r_dust_umin_typo": 50.0})
+
+    def test_jam_dust_mapping_tracks_the_real_grid_not_the_fallback(self):
+        """A ``dust`` mapping must not freeze at the factory's fallback T63
+        truncation (Codex review, jax-gcm#1123): the grid-resolved
+        ``nduscale_reg`` has to track whatever grid the term's
+        ``cache_coords`` is actually run against (as it does without a
+        mapping), while the overridden field stays put.
+        """
+        from jcm.physics.echam.echam_levels import get_echam_levels
+        from jcm.physics.echam.echam_terms import echam_physics
+        from jcm.physics.aerosol.jam.emissions.dust import DustParameters
+        from jcm.utils import get_coords
+
+        jam = dict(checkpoint_terms=False, aerosol_module="jam",
+                   cloud_scheme="2m", jam_microphysics="placeholder")
+        coords_t42 = get_coords(vertical_coords=get_echam_levels(47),
+                                spectral_truncation=42)
+        coords_t63 = get_coords(vertical_coords=get_echam_levels(47),
+                                spectral_truncation=63)
+
+        def dust_term(physics):
+            return next(t for t in physics.terms
+                        if t.name == "jam_dust_emissions")
+
+        # (a) coords=None at the factory call (the common case — a Model
+        # supplies the real grid later), then cache_coords(T42), must equal
+        # coords=T42 given to the factory up front and then cache_coords(T42)
+        # again (what the real pipeline always does): the FACTORY'S coords
+        # argument must not matter once cache_coords runs.
+        term_deferred = dust_term(echam_physics(
+            **jam, dust={"r_dust_umin": 50.0}))
+        term_deferred.cache_coords(coords_t42)
+        v_deferred = term_deferred.params.get_value()
+
+        term_upfront = dust_term(echam_physics(
+            **jam, dust={"r_dust_umin": 50.0}, coords=coords_t42))
+        term_upfront.cache_coords(coords_t42)
+        v_upfront = term_upfront.params.get_value()
+
+        np.testing.assert_allclose(np.asarray(v_deferred.nduscale_reg),
+                                   np.asarray(v_upfront.nduscale_reg))
+        self.assertEqual(float(v_deferred.r_dust_umin),
+                         float(v_upfront.r_dust_umin))
+
+        # (b) T42 vs T63, same mapping: the grid-resolved field differs
+        # (T42 has no ndust=4 regional vector, so it takes HAM's untuned
+        # 0.86); the overridden field agrees.
+        term_t63 = dust_term(echam_physics(**jam, dust={"r_dust_umin": 50.0}))
+        term_t63.cache_coords(coords_t63)
+        v_t63 = term_t63.params.get_value()
+        self.assertFalse(np.allclose(np.asarray(v_deferred.nduscale_reg),
+                                     np.asarray(v_t63.nduscale_reg)))
+        np.testing.assert_allclose(np.asarray(v_t63.nduscale_reg),
+                                   np.array([1.05, 1.45, 1.45, 1.05, 1.05,
+                                             1.05, 1.45, 1.05]) * 0.720)
+        self.assertEqual(float(v_deferred.r_dust_umin),
+                         float(v_t63.r_dust_umin), 50.0)
+
+        # (c) An explicit object is unaffected by cache_coords, mapping
+        # plumbing or not.
+        obj = DustParameters.preset(ndust=2)
+        term_obj = dust_term(echam_physics(**jam, dust=obj))
+        term_obj.cache_coords(coords_t42)
+        np.testing.assert_array_equal(
+            np.asarray(term_obj.params.get_value().nduscale_reg),
+            np.asarray(obj.nduscale_reg))
+
+    def test_jam_dust_parameters_without_jam_are_rejected(self):
+        """``dust`` belongs to the JAM chain, mapping or object alike."""
+        from jcm.physics.aerosol.jam.emissions.dust import DustParameters
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        for given in ({"r_dust_umin": 50.0}, DustParameters.preset()):
+            with self.subTest(given=given):
+                with self.assertRaisesRegex(
+                        ValueError, r"\['dust'\] would be ignored"):
+                    echam_physics(checkpoint_terms=False, dust=given)
+
+    def test_jam_natural_emission_override_rejects_unknown_fields(self):
+        """A typo'd field is an error naming the scheme and the valid fields."""
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        jam = dict(checkpoint_terms=False, aerosol_module="jam",
+                   cloud_scheme="2m", jam_microphysics="placeholder")
+        with self.assertRaisesRegex(
+                ValueError, r"seasalt: unknown SeaSaltParameters field\(s\) "
+                r"\['scal'\].*Valid fields: .*'scale'"):
+            echam_physics(**jam, seasalt={"scal": 1.7})
+        with self.assertRaisesRegex(
+                ValueError, r"dms: unknown DmsParameters field\(s\) "
+                r"\['flux_scal'\].*Valid fields: \['flux_scale'\]"):
+            echam_physics(**jam, dms={"flux_scal": 0.6})
+
+    def test_jam_natural_emission_parameters_without_jam_are_rejected(self):
+        """The emission parameters need the JAM chain, mapping or object.
+
+        MACv2-SP composes no sea-salt or DMS emission, so either form would
+        be dropped without a trace.
+        """
+        from jcm.physics.aerosol.jam.emissions.dms import DmsParameters
+        from jcm.physics.aerosol.jam.emissions.seasalt import SeaSaltParameters
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        for kwargs, names in (
+                (dict(seasalt={"scale": 1.7}), "seasalt"),
+                (dict(dms={"flux_scale": 0.6}), "dms"),
+                (dict(seasalt=SeaSaltParameters.default()), "seasalt"),
+                (dict(dms=DmsParameters.default()), "dms"),
+                (dict(seasalt={"scale": 1.7}, dms={"flux_scale": 0.6}),
+                 "seasalt', 'dms")):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaisesRegex(
+                        ValueError, rf"\['{names}'\] would be ignored"):
+                    echam_physics(checkpoint_terms=False, **kwargs)
+
+    #: The JAM process schemes behind ``echam_physics``'s mapping door beyond
+    #: sea salt and DMS: argument -> (term name, one field, a value for it).
+    _JAM_DOORS = {
+        "anthropogenic_params": ("jam_anthropogenic_emissions", "scale", 1.2),
+        "oxidants": ("jam_prescribed_oxidants", "oh_ref", 3.0e6),
+        "sulfur_gas": ("jam_sulfur_gas_chemistry", "soag_production", 1.0e-16),
+        "aqueous": ("jam_aqueous_sulfur", "rate_scale", 0.8),
+        "activation": ("arg_activation", "w_min", 0.2),
+        "cloud_borne_exchange": ("jam_cloud_borne_exchange",
+                                 "activation_timescale", 600.0),
+        "sedimentation": ("jam_sedimentation", "velocity_scale", 0.9),
+        "drydep": ("jam_dry_deposition", "z0", 2.0e-4),
+        "wetdep": ("jam_wet_deposition", "incloud_scale", 0.5),
+        "tracer_diffusion": ("tracer_vertical_diffusion", "diffusion_scale",
+                             0.7),
+        "conv_transport": ("convective_tracer_transport", "conv_scav_scale",
+                           0.5),
+    }
+    #: Doors whose parameters are held by more than one term: argument ->
+    #: the other terms that must carry the same value.
+    _JAM_ALSO = {"tracer_diffusion": ("jam_cloud_borne_store",)}
+    #: Field names, per door argument, that the term fills in from its own
+    #: mode layout rather than the class's bare ``default()`` — "the term's
+    #: own fractions" (``ConvTransportParameters.default``,
+    #: ``WetDepParameters.default``): ``conv_transport``'s ``csr_conv`` and
+    #: ``wetdep``'s ``csr_strat_wat``/``mix``/``ice`` (#1080) are both empty
+    #: on the bare class default and filled from the composition's spec at
+    #: term construction, so they never equal ``JAM_PARAMETER_CLASSES[arg].
+    #: default()`` the way every other untouched field does.
+    _SPEC_FILLED_FIELDS = {
+        "conv_transport": ("csr_conv",),
+        "wetdep": ("csr_strat_wat", "csr_strat_mix", "csr_strat_ice"),
+    }
+    _JAM_KWARGS = dict(checkpoint_terms=False, aerosol_module="jam",
+                       cloud_scheme="2m", jam_microphysics="placeholder",
+                       jam_anthropogenic=True)
+
+    @staticmethod
+    def _jam_term_params(physics, term):
+        return next(t for t in physics.terms
+                    if t.name == term).params.get_value()
+
+    def test_jam_door_table_covers_the_factory_arguments(self):
+        """The door lists every JAM scheme the JAM factory takes ``Parameters`` for.
+
+        A scheme added to ``jam_aerosol_physics`` must either join
+        ``JAM_PARAMETER_CLASSES`` (and so gain the door) or be named here as
+        one without a mapping door yet (#995); it cannot be left out silently.
+        """
+        import inspect
+        import typing
+
+        from jcm.physics.aerosol.jam.jam_terms import (
+            JAM_PARAMETER_CLASSES, jam_aerosol_physics)
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        hints = typing.get_type_hints(jam_aerosol_physics)
+        parameter_args = {
+            name for name in inspect.signature(jam_aerosol_physics).parameters
+            if name in hints and any(
+                getattr(a, "__name__", "").endswith("Parameters")
+                for a in typing.get_args(hints[name]))}
+        self.assertEqual(parameter_args, set(JAM_PARAMETER_CLASSES) | {"dust"})
+        self.assertLessEqual(set(JAM_PARAMETER_CLASSES),
+                             set(inspect.signature(echam_physics).parameters))
+        for name, cls in JAM_PARAMETER_CLASSES.items():
+            self.assertIs(typing.get_args(hints[name])[0], cls, name)
+        # This test file exercises every door but sea salt and DMS (above).
+        self.assertEqual(set(self._JAM_DOORS),
+                         set(JAM_PARAMETER_CLASSES) - {"seasalt", "dms"})
+
+    def test_jam_scheme_mappings_reach_their_terms_only(self):
+        """Each mapping sets its own scheme's field and nothing else.
+
+        Every other field of that scheme keeps its default, and no other
+        term's parameters move.
+        """
+        import dataclasses
+
+        from jcm.physics.aerosol.jam.jam_terms import JAM_PARAMETER_CLASSES
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        baseline = echam_physics(**self._JAM_KWARGS)
+        for arg, (term, field, value) in self._JAM_DOORS.items():
+            with self.subTest(door=arg):
+                tuned = echam_physics(**self._JAM_KWARGS, **{arg: {field: value}})
+                got = self._jam_term_params(tuned, term)
+                self.assertAlmostEqual(float(getattr(got, field)) / value, 1.0,
+                                       places=5)
+                # Every other field is what the composition holds without the
+                # override (the class default, but for the per-mode
+                # fractions in ``_SPEC_FILLED_FIELDS``, which the term takes
+                # from its own mode layout instead).
+                untuned = self._jam_term_params(baseline, term)
+                spec_filled = self._SPEC_FILLED_FIELDS.get(arg, ())
+                for f in dataclasses.fields(untuned):
+                    if f.name != field:
+                        np.testing.assert_array_equal(
+                            np.asarray(getattr(got, f.name)),
+                            np.asarray(getattr(untuned, f.name)),
+                            err_msg=f.name)
+                    if f.name != field and f.name not in spec_filled:
+                        np.testing.assert_array_equal(
+                            np.asarray(getattr(got, f.name)),
+                            np.asarray(getattr(
+                                JAM_PARAMETER_CLASSES[arg].default(), f.name)),
+                            err_msg=f.name)
+                self.assertEqual([t.name for t in baseline.terms],
+                                 [t.name for t in tuned.terms])
+                for other in self._JAM_ALSO.get(arg, ()):
+                    shared = self._jam_term_params(tuned, other)
+                    self.assertAlmostEqual(
+                        float(getattr(shared, field)) / value, 1.0, places=5,
+                        msg=other)
+                for before, after in zip(baseline.terms, tuned.terms):
+                    if (after.name == term
+                            or after.name in self._JAM_ALSO.get(arg, ())
+                            or not hasattr(after, "params")):
+                        continue
+                    for a, b in zip(
+                            jax.tree_util.tree_leaves(before.params.get_value()),
+                            jax.tree_util.tree_leaves(after.params.get_value())):
+                        np.testing.assert_array_equal(
+                            np.asarray(a), np.asarray(b), err_msg=after.name)
+
+    def test_tracer_diffusion_without_the_cloud_borne_phase(self):
+        """With ``jam_cloud_borne=False`` there is no carry store to set.
+
+        The advected tracers' mixing term takes the override alone.
+        """
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        physics = echam_physics(**{**self._JAM_KWARGS, "jam_cloud_borne": False},
+                                tracer_diffusion={"diffusion_scale": 0.7})
+        self.assertNotIn("jam_cloud_borne_store",
+                         [t.name for t in physics.terms])
+        mixing = self._jam_term_params(physics, "tracer_vertical_diffusion")
+        self.assertAlmostEqual(float(mixing.diffusion_scale), 0.7)
+
+    def test_conv_transport_mapping_keeps_the_layout_fractions(self):
+        """The mapping sets scalars; the per-tracer fractions stay the layout's.
+
+        ``csr_conv`` is one fraction per transported tracer, built from the
+        population's mode layout, so a mapping is applied on a default that
+        leaves it to the term. It is not itself overridable.
+        """
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        base = self._jam_term_params(
+            echam_physics(**self._JAM_KWARGS), "convective_tracer_transport")
+        tuned = self._jam_term_params(
+            echam_physics(**self._JAM_KWARGS, conv_transport={
+                "conv_scav_scale": 0.4, "transport_scale": 0.8}),
+            "convective_tracer_transport")
+        self.assertGreater(base.csr_conv.shape[0], 1)
+        self.assertGreater(float(base.csr_conv.max()), 0.0)
+        np.testing.assert_array_equal(np.asarray(tuned.csr_conv),
+                                      np.asarray(base.csr_conv))
+        self.assertAlmostEqual(float(tuned.conv_scav_scale), 0.4)
+        self.assertAlmostEqual(float(tuned.transport_scale), 0.8)
+        self.assertEqual(float(base.conv_scav_scale), 1.0)
+        with self.assertRaisesRegex(ValueError, "conv_transport.csr_conv"):
+            echam_physics(**self._JAM_KWARGS,
+                          conv_transport={"csr_conv": [0.5]})
+
+    def test_wetdep_mapping_and_object_forms(self):
+        """The wet-removal levers: mapping on the default, object as given."""
+        from jcm.physics.aerosol.jam.wetdep.wetdep_term import WetDepParameters
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        default = WetDepParameters.default()
+        wet = self._jam_term_params(
+            echam_physics(**self._JAM_KWARGS,
+                          wetdep={"incloud_scale": 0.5, "impact_scale": 0.25}),
+            "jam_wet_deposition")
+        self.assertAlmostEqual(float(wet.incloud_scale), 0.5)
+        self.assertAlmostEqual(float(wet.impact_scale), 0.25)
+        self.assertEqual(float(wet.sol_factb), float(default.sol_factb))
+        # Not given: the scheme's default, scales of one.
+        wet = self._jam_term_params(
+            echam_physics(**self._JAM_KWARGS), "jam_wet_deposition")
+        self.assertEqual(float(wet.incloud_scale), 1.0)
+        self.assertEqual(float(wet.impact_scale), 1.0)
+        # An object is used as given, unscaled fields included.
+        obj = WetDepParameters(
+            incloud_scale=jnp.asarray(0.3), sol_factb=jnp.asarray(0.2),
+            mu_water_air=default.mu_water_air,
+            impact_scale=jnp.asarray(0.4),
+            conv_scav_ratio=default.conv_scav_ratio,
+            conv_updraft_velocity=default.conv_updraft_velocity)
+        wet = self._jam_term_params(
+            echam_physics(**self._JAM_KWARGS, wetdep=obj), "jam_wet_deposition")
+        self.assertAlmostEqual(float(wet.incloud_scale), 0.3)
+        self.assertAlmostEqual(float(wet.sol_factb), 0.2)
+        self.assertAlmostEqual(float(wet.impact_scale), 0.4)
+
+    def test_override_of_a_field_no_run_reads_warns(self):
+        """A valid override that cannot move the run is flagged.
+
+        ``conv_scav_ratio`` is read only without convective tracer transport
+        (the in-plume scavenging then belongs to the transport term); the
+        oxidant ozone and solar-geometry fallbacks, ARG's default updraft and
+        the dry-deposition default friction velocity are never read here
+        because the boundary conditions and the vertical-diffusion carry
+        supply what they stand in for. A sweep over any of them would run
+        identical arms. The live fields never warn.
+        """
+        import warnings
+
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        for kwargs in (dict(wetdep={"conv_scav_ratio": 0.5}),
+                       dict(oxidants={"o3_fallback_vmr": 5e-8}),
+                       dict(oxidants={"cos_zenith_fallback": 0.5}),
+                       dict(activation={"updraft_default": 0.5}),
+                       dict(drydep={"u_star_default": 0.5})):
+            with self.subTest(kwargs=kwargs):
+                (scheme, fields), = kwargs.items()
+                with self.assertWarnsRegex(
+                        UserWarning, rf"{scheme}\.{next(iter(fields))} has no effect"):
+                    echam_physics(**self._JAM_KWARGS, **kwargs)
+        for kwargs in (
+                dict(wetdep={"conv_scav_ratio": 0.5},
+                     jam_convective_transport=False),
+                dict(wetdep={"incloud_scale": 0.5, "impact_scale": 0.5}),
+                dict(oxidants={"oh_ref": 3.0e6, "h2o2_ref_vmr": 4e-10,
+                               "no3_ref_vmr": 2e-12}),
+                dict(activation={"tke_factor": 0.5, "w_min": 0.2},
+                     drydep={"z_ref": 12.0, "z0": 2e-4})):
+            with self.subTest(kwargs=kwargs):
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error")
+                    echam_physics(**self._JAM_KWARGS, **kwargs)
+
+    def test_ham_activation_flags_the_updraft_tunables_its_path_never_reads(self):
+        """HAM's updraft PDF reads only ``w_sigma_min``; the single updraft
+        reads ``w_min`` with ARG's ``fact_tke`` or Lin & Leaitch's own
+        prefactor. Each path flags the others' tunables and applies its own.
+        """
+        import warnings
+
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        m7 = dict(checkpoint_terms=False, aerosol_module="jam",
+                  cloud_scheme="2m", jam_microphysics="m7_placeholder",
+                  jam_cloud_borne=False)
+        pdf = dict(m7, jam_activation_scheme="ham_arg", jam_nactivpdf=1)
+        single = dict(m7, jam_activation_scheme="ham_arg")
+        lin = dict(m7, jam_activation_scheme="ham_lin_leaitch")
+        inert = ((pdf, "w_min"), (pdf, "fact_tke"),
+                 (pdf, "fact_tke_lin_leaitch"), (single, "w_sigma_min"),
+                 (single, "fact_tke_lin_leaitch"), (lin, "fact_tke"),
+                 (lin, "w_sigma_min"))
+        for kwargs, field in inert:
+            with self.subTest(path=kwargs["jam_activation_scheme"],
+                              pdf=kwargs.get("jam_nactivpdf", 0), field=field):
+                with self.assertWarnsRegex(
+                        UserWarning, rf"activation\.{field} has no effect"):
+                    echam_physics(**kwargs, activation={field: 0.3})
+        live = ((pdf, "w_sigma_min"), (single, "w_min"), (single, "fact_tke"),
+                (lin, "w_min"), (lin, "fact_tke_lin_leaitch"))
+        for kwargs, field in live:
+            with self.subTest(path=kwargs["jam_activation_scheme"],
+                              pdf=kwargs.get("jam_nactivpdf", 0), field=field):
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error")
+                    physics = echam_physics(**kwargs, activation={field: 0.3})
+                params = self._jam_term_params(physics, "ham_activation")
+                self.assertAlmostEqual(float(getattr(params, field)), 0.3)
+
+    def test_jam_scheme_mappings_reject_unknown_fields(self):
+        """A typo'd field names the scheme and lists the valid fields."""
+        from jcm.physics.aerosol.jam.jam_terms import JAM_PARAMETER_CLASSES
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        for arg, (_, field, value) in self._JAM_DOORS.items():
+            with self.subTest(door=arg):
+                cls = JAM_PARAMETER_CLASSES[arg].__name__
+                with self.assertRaisesRegex(
+                        ValueError,
+                        rf"{arg}: unknown {cls} field\(s\) \['{field}_typo'\]"
+                        rf".*Valid fields: .*'{field}'"):
+                    echam_physics(**self._JAM_KWARGS,
+                                  **{arg: {f"{field}_typo": value}})
+
+    def test_jam_scheme_parameters_without_their_scheme_are_rejected(self):
+        """A scheme the composition lacks would drop its parameters silently.
+
+        MACv2-SP composes none of the JAM schemes; the anthropogenic emission
+        and the cloud-borne exchange are composed only with their flag. A
+        mapping and an object are refused alike.
+        """
+        from jcm.physics.aerosol.jam.jam_terms import JAM_PARAMETER_CLASSES
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        for arg, (_, field, value) in self._JAM_DOORS.items():
+            for form, given in (
+                    ("mapping", {field: value}),
+                    ("object", JAM_PARAMETER_CLASSES[arg].default())):
+                with self.subTest(door=arg, form=form):
+                    with self.assertRaisesRegex(
+                            ValueError, rf"\['{arg}'\] would be ignored"):
+                        echam_physics(checkpoint_terms=False, **{arg: given})
+        jam = dict(self._JAM_KWARGS)
+        for flag, arg in (("jam_anthropogenic", "anthropogenic_params"),
+                          ("jam_cloud_borne", "cloud_borne_exchange"),
+                          ("jam_convective_transport", "conv_transport")):
+            with self.subTest(flag=flag):
+                with self.assertRaisesRegex(
+                        ValueError, rf"\['{arg}'\] would be ignored"):
+                    echam_physics(**{**jam, flag: False},
+                                  **{arg: {self._JAM_DOORS[arg][1]: 1.5}})
 
     def test_echam_physics_accepts_custom_radiation_term(self):
-        """A radiation PhysicsTerm can be passed directly."""
+        """A radiation PhysicsTerm can be passed directly.
+
+        ``echam_physics`` composes it through the raw ``ComposablePhysics``
+        constructor, which clones every term it is handed for ownership
+        (jax-gcm#1106) — the composed term is a DISTINCT object of the
+        same type, not ``custom_rad`` itself, and ``custom_rad`` stays
+        unmodified and usable by the caller afterward.
+        """
         from jcm.physics.echam.echam_terms import echam_physics
 
         custom_rad = DummyRadiationTerm()
@@ -122,7 +1073,124 @@ class TestEchamComposablePhysics(unittest.TestCase):
         )
 
         rad_term = next(t for t in physics.terms if t.category == "radiation")
-        self.assertIs(rad_term, custom_rad)
+        self.assertIsInstance(rad_term, DummyRadiationTerm)
+        self.assertIsNot(rad_term, custom_rad)
+
+    def test_default_radiation_is_rrtmgp(self):
+        """The ECHAM factory composes RRTMGP unless told otherwise."""
+        from jcm.physics.echam.echam_terms import echam_physics
+        from jcm.physics.radiation.rrtmgp import RRTMGPRadiation
+
+        physics = echam_physics(checkpoint_terms=False)
+        (rad,) = (t for t in physics.terms if t.category == "radiation")
+        self.assertIsInstance(rad, RRTMGPRadiation)
+
+    def test_grey_is_rejected_with_the_composition_route(self):
+        """``radiation_scheme="grey"`` is not an ECHAM option (#918).
+
+        The message must name the scheme as idealized and show the explicit
+        composition route, and it must win over any other validation the
+        call would also trip.
+        """
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        for extra in ({}, {"aerosol_free_interval": 1},
+                      {"emulator_weights_file": "x.nc"}):
+            with self.assertRaises(ValueError) as cm:
+                echam_physics(radiation_scheme="grey", **extra)
+            msg = str(cm.exception)
+            self.assertIn("idealized scheme, not ECHAM physics", msg)
+            self.assertIn(
+                "from jcm.physics.radiation.grey_two_stream import "
+                "GreyTwoStreamRadiation", msg)
+            self.assertIn(
+                "echam_physics(radiation_scheme=GreyTwoStreamRadiation())",
+                msg)
+            # The message shows the factory route only, for building a
+            # fresh idealized composition from scratch — `replace` also
+            # re-derives the band config and JAM optics cadence correctly,
+            # but is not the simplest way to attach grey from nothing.
+            self.assertNotIn("replace", msg)
+
+    def test_unknown_radiation_string_lists_only_echam_options(self):
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        with self.assertRaises(ValueError) as cm:
+            echam_physics(radiation_scheme="bogus")
+        msg = str(cm.exception)
+        self.assertIn("'rrtmgp'", msg)
+        self.assertIn("'emulated'", msg)
+        self.assertNotIn("grey", msg)
+
+    def test_grey_instance_route_composes_the_idealized_stack(self):
+        """The explicit grey composition the rejection message shows works.
+
+        The instance is composed as given — cloned for ownership
+        (jax-gcm#1106), so the composed term is a DISTINCT object from
+        ``grey`` with the same configuration, and ``grey`` itself stays
+        usable afterward — the composition carries the broadband band
+        config the grey scheme needs, and the rest of the stack keys on
+        the instance's own radiation parameters (the JAM optics gate
+        follows its ``radiation_interval``).
+        """
+        from jcm.physics.echam.echam_terms import echam_physics
+        from jcm.physics.radiation.band_config import RadiationBandConfig
+        from jcm.physics.radiation.grey_two_stream import (
+            GreyTwoStreamRadiation,
+        )
+        from jcm.physics.radiation.radiation_types import RadiationParameters
+
+        grey = GreyTwoStreamRadiation(params=RadiationParameters.default(
+            radiation_interval=3600.0))
+        physics = echam_physics(
+            checkpoint_terms=False, radiation_scheme=grey,
+            aerosol_module="jam", cloud_scheme="2m",
+            jam_microphysics="placeholder")
+        (rad,) = (t for t in physics.terms if t.category == "radiation")
+        self.assertIsInstance(rad, GreyTwoStreamRadiation)
+        self.assertIsNot(rad, grey)
+        self.assertEqual(
+            rad.params.get_value().radiation_interval,
+            grey.params.get_value().radiation_interval)
+        # band_config/the gate cadence are resolved lazily now, by
+        # cache_coords() (jax-gcm#926's final design) -- echam_physics()
+        # itself leaves band_config unset (None, pending).
+        self.assertIsNone(physics.band_config)
+        physics.cache_coords(self.coords)
+        self.assertEqual(physics.band_config, RadiationBandConfig.broadband())
+        (optics,) = (t for t in physics.terms
+                     if hasattr(t, "configure_radiation_gate"))
+        self.assertEqual(optics._radiation_interval_s, 3600.0)
+
+    def test_jam_rejects_a_radiation_term_without_readable_params(self):
+        """JAM's optics follow the radiation cadence, read from ``.params``.
+
+        A term that exposes none is rejected where the JAM optics are
+        composed rather than silently given the default cadence, and accepted
+        where no sibling needs it: without JAM, and with JAM but no optics.
+        """
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        jam = dict(checkpoint_terms=False, aerosol_module="jam",
+                   cloud_scheme="2m", jam_microphysics="placeholder")
+        with self.assertRaisesRegex(ValueError, r"\.params"):
+            echam_physics(radiation_scheme=DummyRadiationTerm(), **jam)
+        echam_physics(checkpoint_terms=False,
+                      radiation_scheme=DummyRadiationTerm())  # no raise
+        echam_physics(radiation_scheme=DummyRadiationTerm(),
+                      jam_optics=False, **jam)  # no raise
+
+    def test_radiation_params_rejected_alongside_an_instance(self):
+        """``radiation=`` would be silently ignored next to a term instance."""
+        from jcm.physics.echam.echam_terms import echam_physics
+        from jcm.physics.radiation.grey_two_stream import (
+            GreyTwoStreamRadiation,
+        )
+        from jcm.physics.radiation.radiation_types import RadiationParameters
+
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            echam_physics(radiation_scheme=GreyTwoStreamRadiation(),
+                          radiation=RadiationParameters.default())
 
     def test_echam_physics_rejects_non_radiation_custom_term(self):
         """Custom radiation terms must declare the radiation category."""
@@ -147,11 +1215,14 @@ class TestEchamComposablePhysics(unittest.TestCase):
         )
 
     def test_composable_with_model(self):
-        """Composable ECHAM physics works with Model."""
-        from jcm.model import Model
-        from jcm.physics.echam.echam_terms import echam_physics
+        """The composed ECHAM term stack runs inside Model.
 
-        composable = echam_physics()
+        Machinery only, so the idealized composition keeps it cheap.
+        """
+        from jcm.model import Model
+        from jcm.physics.echam.testing import idealized_echam_physics
+
+        composable = idealized_echam_physics()
         model = Model(
             coords=self.coords,
             terrain=self.terrain,
@@ -167,16 +1238,29 @@ class TestEchamComposablePhysics(unittest.TestCase):
     def test_replace_radiation(self):
         """Can replace radiation with a different scheme."""
         from jcm.physics.echam.echam_terms import echam_physics
+        from jcm.physics.echam.testing import idealized_echam_physics
         from jcm.physics.radiation.grey_two_stream import (
             GreyTwoStreamRadiation,
         )
 
-        composable = echam_physics(checkpoint_terms=False)
-        composable.cache_coords(self.coords)
-
-        # Replace radiation with a fresh instance
+        # ``replace`` puts the new term in the radiation slot in place.
+        real = echam_physics(checkpoint_terms=False)
         new_rad = GreyTwoStreamRadiation()
-        replaced = composable.replace("radiation", new_rad)
+        swapped = real.replace("radiation", new_rad)
+        self.assertEqual([t.category for t in swapped.terms],
+                         [t.category for t in real.terms])
+        # A CLONE of `new_rad` joins, not `new_rad` itself (jax-gcm#926's
+        # final design: `replace` clones every term for ownership, since
+        # `real` remains an independently live, usable composition).
+        swapped_rad = next(t for t in swapped.terms
+                            if t.category == "radiation")
+        self.assertIsInstance(swapped_rad, GreyTwoStreamRadiation)
+        self.assertIsNot(swapped_rad, new_rad)
+
+        # And a replaced composition still computes (cheap idealized stack).
+        composable = idealized_echam_physics(checkpoint_terms=False)
+        composable.cache_coords(self.coords)
+        replaced = composable.replace("radiation", GreyTwoStreamRadiation())
         replaced.cache_coords(self.coords)
 
         tend, _ = replaced.compute_tendencies(self.state, self.forcing, self.terrain,
@@ -185,6 +1269,147 @@ class TestEchamComposablePhysics(unittest.TestCase):
         self.assertEqual(
             tend.temperature.shape, self.state.temperature.shape,
         )
+
+    def test_replace_radiation_matches_the_factory_route(self):
+        """``replace('radiation', ...)`` must match ``radiation_scheme=<term>`` (#926).
+
+        Reproduces the issue's measurement: an RRTMGP + JAM + 2M composition
+        swapped to a grey broadband term (``radiation_interval=3600``) kept
+        RRTMGP's 14 SW / 16 LW ``band_config`` and the JAM optics gate at
+        RRTMGP's default 7200 s cadence, rather than grey's broadband
+        band_config and 3600 s. Compared here against the one documented
+        supported route (#925) for a different radiation term — passing the
+        instance to the factory directly — which must be indistinguishable
+        once ``cache_coords()`` resolves both (jax-gcm#926's final design:
+        neither ``echam_physics()`` nor ``replace`` compute/derive
+        ``band_config``/the gate cadence any more — both are ``None``
+        (pending) immediately after either route, and only
+        ``ComposablePhysics._finalize``, called from ``cache_coords()``,
+        actually resolves them, from whichever radiation term ends up in
+        the FINAL term set).
+        """
+        from jcm.physics.echam.echam_terms import echam_physics
+        from jcm.physics.radiation.band_config import RadiationBandConfig
+        from jcm.physics.radiation.grey_two_stream import (
+            GreyTwoStreamRadiation,
+        )
+        from jcm.physics.radiation.radiation_types import RadiationParameters
+
+        jam_kwargs = dict(checkpoint_terms=False, aerosol_module="jam",
+                           cloud_scheme="2m", jam_microphysics="placeholder")
+
+        def grey():
+            return GreyTwoStreamRadiation(params=RadiationParameters.default(
+                radiation_interval=3600.0))
+
+        def optics_gate(physics):
+            (optics,) = (t for t in physics.terms
+                         if hasattr(t, "configure_radiation_gate"))
+            return optics._radiation_interval_s
+
+        built_fresh = echam_physics(radiation_scheme=grey(), **jam_kwargs)
+        replaced = echam_physics(**jam_kwargs).replace("radiation", grey())
+        built_fresh.cache_coords(self.coords)
+        replaced.cache_coords(self.coords)
+
+        # Before the fix this was SW 14 / LW 16 (RRTMGP's) on `replaced`.
+        self.assertEqual(replaced.band_config, RadiationBandConfig.broadband())
+        self.assertEqual(replaced.band_config, built_fresh.band_config)
+
+        # Before the fix this was 7200.0 (RRTMGP's default) on `replaced`.
+        self.assertEqual(optics_gate(replaced), 3600.0)
+        self.assertEqual(optics_gate(replaced), optics_gate(built_fresh))
+
+    @pytest.mark.slow
+    def test_replace_radiation_matches_the_factory_route_end_to_end(self):
+        """One-step tendencies must match between the ``replace`` and factory
+        routes on the real stack, not just the config this fix touches.
+
+        Config-level parity (band_config, the JAM optics gate) is covered by
+        the fast ``test_replace_radiation_matches_the_factory_route``; this
+        exercises the full pipeline (``cache_coords`` -> per-band carry ->
+        one ``compute_tendencies`` call) so a residual shape mismatch in a
+        per-band carry slot (sized for RRTMGP's 14/16 bands rather than
+        grey's broadband 1/0) would also be caught. Slow: building the
+        RRTMGP gas-optics tables and the JAM chain twice is expensive even
+        though each `compute_tendencies` call is only one step.
+
+        2026-10 shrink pass (#1143): already at the floor. The "fresh" leg
+        passes ``radiation_scheme=grey()`` directly so it never builds
+        RRTMGP; the "replaced" leg's whole point is the ``echam_physics()``
+        default (RRTMGP) THEN ``.replace("radiation", grey())`` -- it is
+        the RRTMGP-sized carry being swapped for grey's broadband one that
+        the shape-mismatch bug this test guards against needs, so the
+        RRTMGP gas-optics construction it pays for cannot be skipped
+        without losing the thing under test. ~104s locally, confirmed to
+        match the ~135s CI figure (no scheduling-artifact inflation here,
+        unlike this PR's other measurements).
+        """
+        from jcm.model import Model
+        from jcm.physics.echam.echam_terms import echam_physics
+        from jcm.physics.radiation.grey_two_stream import (
+            GreyTwoStreamRadiation,
+        )
+        from jcm.physics.radiation.radiation_types import RadiationParameters
+
+        jam_kwargs = dict(checkpoint_terms=False, aerosol_module="jam",
+                           cloud_scheme="2m", jam_microphysics="placeholder")
+
+        def grey():
+            return GreyTwoStreamRadiation(params=RadiationParameters.default(
+                radiation_interval=3600.0))
+
+        coords = get_coords(np.linspace(0, 1, 9), spectral_truncation=21)
+        terrain = TerrainData.aquaplanet(coords)
+
+        def one_step_tendencies(physics):
+            # Model() wires cache_coords / carry setup exactly as a real run
+            # would, so this exercises the same path a production run takes.
+            model = Model(coords=coords, time_step=30, terrain=terrain,
+                          physics=physics)
+            wired = model.physics
+            nodal = coords.horizontal.nodal_shape
+            shape_3d = (coords.nodal_shape[0],) + nodal
+            state = PhysicsState.zeros(shape_3d).copy(
+                temperature=jnp.full(shape_3d, 288.0),
+                normalized_surface_pressure=jnp.ones(nodal),
+                tracers={spec.name: jnp.zeros(shape_3d)
+                         for spec in wired.required_tracers()},
+            )
+            forcing = ForcingData.zeros(nodal)
+            for term in wired.terms:
+                forcing = term.augment_probe_forcing(forcing)
+            tend, _ = wired.compute_tendencies(state, forcing, model.terrain)
+            return tend
+
+        tend_fresh = one_step_tendencies(
+            echam_physics(radiation_scheme=grey(), **jam_kwargs))
+        tend_replaced = one_step_tendencies(
+            echam_physics(**jam_kwargs).replace("radiation", grey()))
+        np.testing.assert_allclose(
+            tend_fresh.temperature, tend_replaced.temperature, equal_nan=True)
+        np.testing.assert_allclose(
+            tend_fresh.specific_humidity, tend_replaced.specific_humidity,
+            equal_nan=True)
+
+    def test_replace_radiation_rejects_an_unreadable_term_when_jam_gated(self):
+        """A replacement the JAM gate cannot read a cadence from must error.
+
+        Mirrors ``test_jam_rejects_a_radiation_term_without_readable_params``
+        (the same check at factory-build time) for the ``replace`` path.
+        ``replace`` itself never raises any more (jax-gcm#926's final
+        design: it is a pure term-list operation) — the error now comes
+        from ``cache_coords()`` (via ``ComposablePhysics._finalize``), the
+        single point that validates the final term set.
+        """
+        from jcm.physics.echam.echam_terms import echam_physics
+
+        jam = dict(checkpoint_terms=False, aerosol_module="jam",
+                   cloud_scheme="2m", jam_microphysics="placeholder")
+        physics = echam_physics(**jam)
+        replaced = physics.replace("radiation", DummyRadiationTerm())
+        with self.assertRaisesRegex(ValueError, "radiation cadence"):
+            replaced.cache_coords(self.coords)
 
     def test_nnx_split_merge(self):
         """nnx.split/merge works for ECHAM composable physics."""
@@ -196,8 +1421,460 @@ class TestEchamComposablePhysics(unittest.TestCase):
         # Verify split/merge roundtrip works
         graphdef, state = nnx.split(composable)
         restored = nnx.merge(graphdef, state)
-        self.assertEqual(len(restored.terms), 12)
+        self.assertEqual(len(restored.terms), 13)
+
+class TestAerosolFreeValidation(unittest.TestCase):
+    """The mode/interval contract must hold for every radiation scheme.
+
+    The guard cannot live only in ``RRTMGPRadiation.__init__``: the emulated
+    branch and a custom radiation term never construct it, so a nonsensical
+    interval would be accepted in silence on exactly the paths that cannot
+    produce *noa fluxes at all.
+    """
+
+    def setUp(self):
+        from jcm.physics.echam.echam_terms import echam_physics
+        self.echam_physics = echam_physics
+
+    def test_interval_is_rejected_on_non_rrtmgp_schemes(self):
+        from jcm.physics.radiation.grey_two_stream import (
+            GreyTwoStreamRadiation,
+        )
+        for scheme in ("emulated", GreyTwoStreamRadiation()):
+            with self.assertRaises(ValueError) as cm:
+                self.echam_physics(radiation_scheme=scheme,
+                                   aerosol_free_interval=1)
+            self.assertIn("radiation_scheme='rrtmgp'", str(cm.exception))
+
+    def test_emulated_composition_carries_the_rrtmgp_bands(self):
+        # The per-band emulator expects the RRTMGP band structure
+        # (14 SW / 16 LW); the broadband 1-SW/0-LW layout passes
+        # composition and then fails the emulator's band-count check at
+        # first compute (PR #730 review). Only the Hydra runner path had
+        # the emulator in its band selection; the Python factory must too.
+        physics = self.echam_physics(radiation_scheme="emulated")
+        # band_config is resolved lazily now, by cache_coords() (jax-gcm#926's
+        # final design) -- echam_physics() itself leaves it unset (None).
+        # The emulator's trained weights are 47-level, so cache_coords()
+        # needs a matching grid here (unlike other tests in this file,
+        # which only exercise untrained-weight-agnostic config).
+        coords47, _, _, _ = _make_echam_test_setup(nlev=47)
+        physics.cache_coords(coords47)
+        bc = physics.band_config
+        self.assertEqual(len(bc.sw_band_centers_nm), 14)
+        self.assertEqual(len(bc.lw_band_centers_nm), 16)
+
+    def test_nonsensical_interval_is_rejected_before_the_scheme_check(self):
+        # A meaningless spacing must name the real problem rather than
+        # complain about the radiation scheme, which would send the reader
+        # down a blind alley.
+        with self.assertRaises(ValueError) as cm:
+            self.echam_physics(radiation_scheme="emulated",
+                               aerosol_free_interval=0)
+        self.assertIn("must be >= 1", str(cm.exception))
+
+
+class TestHostEffectiveRadiiValidation(unittest.TestCase):
+    """``radiation_use_host_effective_radii`` forwarding and its guard (#1135).
+
+    Same contract as ``aerosol_free_interval``/``TestAerosolFreeValidation``:
+    the flag only means anything for RRTMGPRadiation, so pairing it with any
+    other scheme must be rejected, not silently ignored.
+    """
+
+    def setUp(self):
+        from jcm.physics.echam.echam_terms import echam_physics
+        self.echam_physics = echam_physics
+
+    def test_rejected_on_non_rrtmgp_schemes(self):
+        from jcm.physics.radiation.grey_two_stream import GreyTwoStreamRadiation
+
+        for scheme in ("emulated", GreyTwoStreamRadiation()):
+            with self.assertRaises(ValueError) as cm:
+                self.echam_physics(radiation_scheme=scheme,
+                                   radiation_use_host_effective_radii=True)
+            self.assertIn("radiation_scheme='rrtmgp'", str(cm.exception))
+
+    def test_default_false_leaves_the_rrtmgp_term_unchanged(self):
+        physics = self.echam_physics(radiation_scheme="rrtmgp")
+        term = next(t for t in physics.terms
+                    if getattr(t, "name", "") == "rrtmgp_radiation")
+        self.assertFalse(term._use_host_effective_radii)
+
+    def test_true_reaches_the_rrtmgp_term(self):
+        physics = self.echam_physics(
+            radiation_scheme="rrtmgp", radiation_use_host_effective_radii=True)
+        term = next(t for t in physics.terms
+                    if getattr(t, "name", "") == "rrtmgp_radiation")
+        self.assertTrue(term._use_host_effective_radii)
+
+
+class TestEmulatorWeightsFile(unittest.TestCase):
+    """The factory must load TRAINED emulator weights by default (#640 trap).
+
+    ``echam_physics(radiation_scheme="emulated")`` used to build the term with
+    random untrained weights, which the scheme's own docs say NaN within a step;
+    it now defaults to the packaged trained checkpoint.
+    """
+
+    def setUp(self):
+        from jcm.physics.echam.echam_terms import echam_physics
+        self.echam_physics = echam_physics
+
+    def _rad_term(self, physics):
+        return next(t for t in physics.terms
+                    if getattr(t, "name", "") == "nn_emulator_radiation")
+
+    def test_default_loads_packaged_trained_weights(self):
+        term = self._rad_term(self.echam_physics(radiation_scheme="emulated"))
+        # ``_weights_file`` is set only on the load-from-file path (the random
+        # init leaves it None), and the packaged default is the u64 checkpoint.
+        self.assertIsNotNone(term._weights_file)
+        self.assertTrue(
+            str(term._weights_file).endswith(
+                "emulator_weights_per_band_u64.nc"))
+
+    def test_random_reaches_the_random_init_path(self):
+        # The explicit "random" sentinel is the train-from-scratch value:
+        # weights_file=None on the term (``_weights_file`` stays None).
+        term = self._rad_term(
+            self.echam_physics(radiation_scheme="emulated",
+                               emulator_weights_file="random"))
+        self.assertIsNone(term._weights_file)
+
+    def test_none_falls_back_to_auto(self):
+        # None is treated as the "auto" default (an omitted/null config key,
+        # which the Hydra builder strips, must NOT reach random init) — it
+        # loads the packaged trained checkpoint, exactly like the default.
+        term = self._rad_term(
+            self.echam_physics(radiation_scheme="emulated",
+                               emulator_weights_file=None))
+        self.assertIsNotNone(term._weights_file)
+        self.assertTrue(
+            str(term._weights_file).endswith(
+                "emulator_weights_per_band_u64.nc"))
+
+    def test_rejected_on_non_emulated_scheme(self):
+        # An explicit value with rrtmgp is a silently-ignored argument —
+        # the factory rejects it (same contract as aerosol_free_interval).
+        with self.assertRaises(ValueError) as cm:
+            self.echam_physics(radiation_scheme="rrtmgp",
+                               emulator_weights_file="some_ckpt.nc")
+        self.assertIn("radiation_scheme='emulated'", str(cm.exception))
+
+    def test_auto_default_does_not_trip_non_emulated_schemes(self):
+        # The "auto" default must stay silent for other schemes (it is the
+        # unset state, not a user choice).
+        self.echam_physics(radiation_scheme="rrtmgp")  # no raise
+
+
+@pytest.mark.slow
+class TestRadiationReadsLaggedConvectionType(unittest.TestCase):
+    """End to end through the composed ECHAM stack, RRTMGP radiation (#870).
+
+    Slow: two full RRTMGP solves over a T21 grid (~2 min on CPU). The
+    scheme-level ``liquid_inhomogeneity`` / ktype checks in
+    ``rrtmgp_test.py`` stay in the fast suite.
+
+    Step 1 publishes a ``convection`` carry; the radiation term, run on that
+    carry with ``ktype`` forced per column to 0 / 2 / 4, must thin the liquid
+    cloud only in the ktype-4 columns — the carry → term → scheme path the
+    scheme-level tests do not exercise.
+
+    2026-10 shrink pass (#1143): already at the T21L8 floor (``get_speedy_
+    coords(layers=8, spectral_truncation=21)`` is this codebase's smallest
+    standard real grid). Profiled locally: the one setup
+    ``compute_tendencies`` call (the full composed ECHAM stack, needed to
+    get a self-consistent ``diag`` for every OTHER term's output besides
+    radiation -- aerosol optics, surface fields, etc. -- that
+    ``rad._compute_full`` reads) is ~77s of the ~122s total; the two
+    deliberate ktype-comparison RRTMGP solves are ~30s and ~14s. Building
+    the setup diag with a cheaper radiation substitute was considered and
+    rejected: it would stop this test being "end to end through the
+    composed ECHAM stack" (the point #870 needed), and nothing here
+    establishes that the downstream terms are insensitive to which
+    radiation term ran alongside them in that one-shot evaluation.
+    """
+
+    def test_only_shallow_liquid_columns_change(self):
+        from jcm.physics.echam.echam_terms import echam_physics
+        from jcm.physics.speedy.speedy_coords import get_speedy_coords
+
+        physics = echam_physics(checkpoint_terms=False)
+        coords = get_speedy_coords(layers=8, spectral_truncation=21)
+        physics.cache_coords(coords)
+        nlev = 8
+        nlon, nlat = coords.horizontal.nodal_shape
+        ncols = nlon * nlat
+        qc = jnp.zeros((nlev, nlon, nlat)).at[5:7].set(2e-4)
+        state = PhysicsState.zeros(
+            (nlev, nlon, nlat),
+            temperature=jnp.full((nlev, nlon, nlat), 285.0),
+            specific_humidity=jnp.full((nlev, nlon, nlat), 8e-3),
+            normalized_surface_pressure=jnp.ones((nlon, nlat)),
+            tracers={**{spec.name: jnp.zeros((nlev, nlon, nlat))
+                        for spec in physics.required_tracers()}, "qc": qc},
+        )
+        forcing = ForcingData.zeros((nlon, nlat))
+        _, diag = physics.compute_tendencies(
+            state, forcing, TerrainData.aquaplanet(coords))
+
+        # Column view of the state and a fixed half-cover liquid cloud where
+        # qc sits, so every column carries the same optically thick liquid.
+        cols = lambda a: jnp.reshape(a, a.shape[:1] + (ncols,))  # noqa: E731
+        state_cols = PhysicsState.zeros(
+            (nlev, ncols),
+            temperature=cols(state.temperature),
+            specific_humidity=cols(state.specific_humidity),
+            normalized_surface_pressure=jnp.ones(ncols),
+            tracers={"qc": cols(qc), "qi": jnp.zeros((nlev, ncols))},
+        )
+        clouds = diag["clouds"].copy(
+            cloud_fraction=jnp.where(cols(qc) > 0, 0.5, 0.0))
+        pattern = jnp.tile(jnp.array([0, 2, 4], jnp.int32),
+                           ncols // 3 + 1)[:ncols]
+        rad = next(t for t in physics.terms if t.category == "radiation")
+        params = rad.params.get_value()
+
+        def solve(ktype):
+            d = {**diag, "clouds": clouds,
+                 "convection": diag["convection"].replace(ktype=ktype)}
+            _, out, _radii = rad._compute_full(state_cols, d, forcing, None, params)
+            return (np.asarray(out.sw_heating_rate),        # (nlev, ncols)
+                    np.asarray(out.toa_sw_up), np.asarray(out.cos_zenith))
+
+        base, base_up, mu0 = solve(jnp.zeros(ncols, jnp.int32))
+        mixed, mixed_up, _ = solve(pattern)
+        pattern = np.asarray(pattern)
+        self.assertTrue(np.all(np.isfinite(mixed)))
+        # 0 and 2 share the 0.8 liquid factor: bit-identical columns.
+        np.testing.assert_array_equal(mixed[:, pattern != 4],
+                                      base[:, pattern != 4])
+        # ktype 4 in daylight: the 0.4 liquid factor thins the cloud, so the
+        # column's SW heating changes and less SW is reflected on average.
+        # (The LW is saturated by this much liquid, hence the SW check; a
+        # few columns are float32-insensitive to the change.)
+        lit4 = (pattern == 4) & (mu0 > 0.1)
+        self.assertGreater(int(lit4.sum()), 0)
+        changed = np.abs(mixed[:, lit4] - base[:, lit4]).max(axis=0) > 0.0
+        self.assertGreater(float(changed.mean()), 0.9)
+        self.assertLess(float(mixed_up[lit4].mean()),
+                        float(base_up[lit4].mean()))
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _integer_leaves(tree):
+    """``{path: dtype}`` of every non-float array leaf of ``tree``."""
+    return {
+        jax.tree_util.keystr(path): leaf.dtype
+        for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]
+        if hasattr(leaf, "dtype") and not jnp.issubdtype(leaf.dtype, jnp.floating)
+    }
+
+
+class TestSixtyFourBitMode(unittest.TestCase):
+    """The composed ECHAM package traces and steps with x64 on (#945).
+
+    ``jax_enable_x64`` is on whenever ``mam4_jax`` has been imported, and
+    pySES runs float32 physics under it. Every ``lax.cond`` / ``lax.switch``
+    / ``lax.scan`` in the package must then return identical dtypes from its
+    branches, which untyped literals (int64 / float64 under x64) break. The
+    flag is flipped only through the ``jax.enable_x64`` context manager, so
+    the process-global setting is left as found; ``mam4_jax`` is not
+    imported, so this runs in CI without the optional extra.
+    """
+
+    def _model(self, **physics_kwargs):
+        from jcm.model import Model
+        from jcm.physics.echam.echam_terms import echam_physics
+        coords = get_coords(np.linspace(0, 1, 9), spectral_truncation=21)
+        return Model(coords=coords, time_step=30,
+                     terrain=TerrainData.aquaplanet(coords),
+                     physics=echam_physics(**physics_kwargs))
+
+    def test_default_package_steps_with_int32_carry_indices(self):
+        with jax.enable_x64(True):
+            model = self._model()
+            pred = model.run(save_interval=1 / 48, total_time=1 / 48)
+            self.assertTrue(bool(jnp.all(jnp.isfinite(pred.dynamics.temperature))))
+            carry = model._final_physics_state
+            for leaf in jax.tree.leaves(carry):
+                if hasattr(leaf, "dtype") and jnp.issubdtype(leaf.dtype, jnp.inexact):
+                    self.assertTrue(bool(jnp.all(jnp.isfinite(leaf))))
+            ints = _integer_leaves(carry)
+            # The convection ktype / cloud_base / cloud_top and the
+            # radiation sub-cycle counter.
+            self.assertGreaterEqual(len(ints), 4)
+            for path, dtype in ints.items():
+                self.assertEqual(dtype, jnp.int32, path)
+
+    def _trace(self, state_dtype, **physics_kwargs):
+        """Trace one physics step at ``state_dtype`` with x64 on."""
+        with jax.enable_x64(True):
+            model = self._model(**physics_kwargs)
+            physics = model.physics
+            coords = model.coords
+            nodal = coords.horizontal.nodal_shape
+            shape_3d = (coords.nodal_shape[0],) + nodal
+            state = PhysicsState.zeros(shape_3d).copy(
+                temperature=jnp.full(shape_3d, 288.0),
+                normalized_surface_pressure=jnp.ones(nodal),
+                tracers={spec.name: jnp.zeros(shape_3d)
+                         for spec in physics.required_tracers()},
+            )
+            forcing = ForcingData.zeros(nodal)
+            for term in physics.terms:
+                forcing = term.augment_probe_forcing(forcing)
+
+            def cast(tree):
+                return jax.tree.map(
+                    lambda x: x.astype(state_dtype)
+                    if hasattr(x, "dtype") and jnp.issubdtype(x.dtype, jnp.floating)
+                    else x, tree)
+
+            return jax.eval_shape(physics.compute_tendencies, cast(state),
+                                  cast(forcing), cast(model.terrain))
+
+    def _assert_traced(self, out, state_dtype):
+        for path, dtype in _integer_leaves(out).items():
+            self.assertEqual(dtype, jnp.int32, path)
+        # No float leaf escapes the working precision.
+        for leaf in jax.tree.leaves(out):
+            if jnp.issubdtype(leaf.dtype, jnp.floating):
+                self.assertEqual(leaf.dtype, state_dtype)
+
+    def test_float32_physics_under_x64_traces(self):
+        # pySES's physics_dtype=float32 mode.
+        self._assert_traced(self._trace(jnp.float32), jnp.float32)
+
+    def test_rrtmgp_aerosol_free_companion_traces_under_x64(self):
+        # The held-vs-solved ``*noa`` cond (aerosol_free_interval > 1).
+        for dtype in (jnp.float32, jnp.float64):
+            with self.subTest(dtype=dtype):
+                out = self._trace(dtype, radiation_scheme="rrtmgp",
+                                  aerosol_free_interval=2)
+                self._assert_traced(out, dtype)
+
+
+class TestConvectiveDetrainmentCarry(unittest.TestCase):
+    """``clouds.conv_detrainment_*`` hold THIS step's detrainment, composed.
+
+    The ``clouds`` struct rides the cross-step carry, so a step starts from
+    the previous step's detrainment fields. Through the whole ECHAM stack
+    (grey radiation, for cost) a carry holding a stale value must come out
+    as zero when no convection term is composed, and as exactly this step's
+    applied detrainment when one is — under both cloud schemes, whose
+    microphysics terms copy the struct through.
+    """
+
+    _STALE_QC, _STALE_QI = 1.0e-3, 2.0e-3
+
+    def _run(self, physics):
+        from jcm.physics.speedy.speedy_coords import get_speedy_coords
+
+        coords = get_speedy_coords(layers=8, spectral_truncation=21)
+        physics.cache_coords(coords)
+        nlev = 8
+        nlon, nlat = coords.horizontal.nodal_shape
+        ncols = nlon * nlat
+        shape = (nlev, nlon, nlat)
+        state = PhysicsState.zeros(
+            shape,
+            temperature=jnp.full(shape, 280.0),
+            specific_humidity=jnp.full(shape, 4e-3),
+            normalized_surface_pressure=jnp.ones((nlon, nlat)),
+            tracers={spec.name: jnp.zeros(shape)
+                     for spec in physics.required_tracers()},
+        )
+        carry = physics.initial_carry_state(coords)
+        carry["clouds"] = carry["clouds"].copy(
+            conv_detrainment_qc=jnp.full((nlev, ncols), self._STALE_QC),
+            conv_detrainment_qi=jnp.full((nlev, ncols), self._STALE_QI),
+        )
+        _, diag = jax.jit(physics.compute_tendencies)(
+            state, ForcingData.zeros((nlon, nlat)),
+            TerrainData.aquaplanet(coords), carry,
+        )
+        return diag["clouds"]
+
+    def test_zero_without_a_convection_term(self):
+        from jcm.physics.echam.testing import idealized_echam_physics
+
+        for scheme in ("1m", "2m"):
+            with self.subTest(cloud_scheme=scheme):
+                physics = idealized_echam_physics(
+                    cloud_scheme=scheme).remove("convection")
+                self.assertFalse(
+                    [t for t in physics.terms if t.category == "convection"])
+                clouds = self._run(physics)
+                np.testing.assert_array_equal(
+                    np.asarray(clouds.conv_detrainment_qc), 0.0)
+                np.testing.assert_array_equal(
+                    np.asarray(clouds.conv_detrainment_qi), 0.0)
+
+    def test_this_steps_detrainment_with_convection(self):
+        import jcm.physics.convection.tiedtke_nordeng.tiedtke_nordeng as tn
+        from jcm.physics.convection.tiedtke_nordeng.types import (
+            ConvectionTendencies)
+        from jcm.physics.echam.testing import idealized_echam_physics
+
+        det_qc, det_qi = 1.0e-8, 3.0e-8
+
+        # A known detrainment with no heating (cap inactive), so the value
+        # the composed stack must publish is exact.
+        def fake_convection(temperature, *args, **kwargs):
+            zeros = jnp.zeros_like(temperature)
+            return ConvectionTendencies(
+                dtedt=zeros, dqdt=zeros, dudt=zeros, dvdt=zeros,
+                qc_conv=zeros, qi_conv=zeros, precip_formation=zeros,
+                precip_conv=jnp.zeros((), temperature.dtype),
+                precip_flux=zeros,
+                precip_floor_source=jnp.zeros((), temperature.dtype),
+                dqc_dt=jnp.full_like(temperature, det_qc),
+                dqi_dt=jnp.full_like(temperature, det_qi),
+            ), None
+
+        monkey = pytest.MonkeyPatch()
+        try:
+            monkey.setattr(tn, "tiedtke_nordeng_convection", fake_convection)
+            for scheme in ("1m", "2m"):
+                with self.subTest(cloud_scheme=scheme):
+                    clouds = self._run(
+                        idealized_echam_physics(cloud_scheme=scheme))
+                    np.testing.assert_allclose(
+                        np.asarray(clouds.conv_detrainment_qc), det_qc,
+                        rtol=1e-6)
+                    np.testing.assert_allclose(
+                        np.asarray(clouds.conv_detrainment_qi), det_qi,
+                        rtol=1e-6)
+        finally:
+            monkey.undo()
+
+
+class TestSharedCloudConstants(unittest.TestCase):
+    """ECHAM's one csecfrl and cthomi: jcm's two copies warn when they differ."""
+
+    @staticmethod
+    def _shared_warnings(**kwargs):
+        import warnings
+        from jcm.physics.echam.echam_terms import echam_physics
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            echam_physics(**kwargs)
+        return [str(w.message) for w in caught if "ECHAM has one" in str(w.message)]
+
+    def test_defaults_do_not_warn(self):
+        for scheme in ("1m", "2m"):
+            self.assertEqual(self._shared_warnings(cloud_scheme=scheme), [])
+
+    def test_differing_copies_warn(self):
+        for kwargs, name in (({"clouds": {"csecfrl": 1e-5}}, "csecfrl"),
+                             ({"microphysics": {"cthomi": 240.0}}, "cthomi"),
+                             ({"cloud_scheme": "2m", "clouds": {"t_ice": 240.0}},
+                              "cthomi")):
+            found = self._shared_warnings(**kwargs)
+            self.assertEqual(len(found), 1, kwargs)
+            self.assertIn(name, found[0])

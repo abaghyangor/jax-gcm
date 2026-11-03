@@ -8,12 +8,16 @@ import unittest
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 
-from jcm.physics.speedy.speedy_terms import speedy_physics
+from jcm.physics.speedy.speedy_terms import (
+    _call_legacy_speedy,
+    speedy_physics,
+)
 from jcm.physics.speedy.speedy_coords import get_speedy_coords
 from jcm.physics.speedy.params import Parameters
-from jcm.physics_interface import PhysicsState
+from jcm.physics_interface import PhysicsState, PhysicsTendency
 from jcm.forcing import ForcingData
 from jcm.terrain import TerrainData
 from jcm.date import DateData
@@ -32,7 +36,7 @@ def _make_test_state(coords):
         u_wind=5.0 * jax.random.normal(keys[0], shape_3d),
         v_wind=5.0 * jax.random.normal(keys[1], shape_3d),
         temperature=250.0 + 20.0 * jax.random.normal(keys[2], shape_3d),
-        specific_humidity=jnp.abs(3.0 * jax.random.normal(keys[3], shape_3d)),
+        specific_humidity=jnp.abs(3e-3 * jax.random.normal(keys[3], shape_3d)),
         geopotential=jnp.broadcast_to(
             jnp.linspace(50000, 0, nlev)[:, None, None], shape_3d
         ),
@@ -70,6 +74,38 @@ class TestSpeedyNumericalEquivalence(unittest.TestCase):
             total_time=1.0,
         )
         self.assertIsNotNone(preds)
+
+    def test_adapter_preserves_legacy_humidity_numerics(self):
+        """Only q crosses SPEEDY's kg/kg <-> g/kg compatibility boundary."""
+        shape = self.state.specific_humidity.shape
+        canonical = self.state.copy(
+            specific_humidity=jnp.full(shape, 7.5e-3, dtype=jnp.float32),
+            tracers={"signed": jnp.full(shape, -2.0, dtype=jnp.float32)},
+        )
+
+        def legacy_routine(legacy_state):
+            # A stand-in for any translated SPEEDY routine: observe its input
+            # and emit a g/kg/s q tendency plus unrelated fields/tracers.
+            tendency = PhysicsTendency.zeros(
+                shape,
+                temperature=jnp.full(shape, 4.0, dtype=jnp.float32),
+                specific_humidity=jnp.full(shape, 2.5, dtype=jnp.float32),
+                tracers={"signed": jnp.full(shape, -3.0, dtype=jnp.float32)},
+            )
+            return tendency, {"legacy_state": legacy_state}
+
+        tendency, data = _call_legacy_speedy(legacy_routine, canonical)
+        legacy_state = data["legacy_state"]
+
+        np.testing.assert_allclose(
+            legacy_state.specific_humidity, 7.5, rtol=1e-6,
+        )
+        np.testing.assert_allclose(tendency.specific_humidity, 2.5e-3)
+        np.testing.assert_allclose(tendency.temperature, 4.0)
+        np.testing.assert_allclose(
+            legacy_state.tracers["signed"], canonical.tracers["signed"],
+        )
+        np.testing.assert_allclose(tendency.tracers["signed"], -3.0)
 
     def test_nnx_grad_through_composable_speedy(self):
         """Gradients flow through the composable SPEEDY physics."""
@@ -113,6 +149,81 @@ class TestSpeedyNumericalEquivalence(unittest.TestCase):
 
         # Should produce valid (non-NaN) tendencies
         self.assertFalse(jnp.any(jnp.isnan(tend.temperature)))
+
+    def test_speedy_humidity_publishes_bolton_rh_without_touching_physics_input(self):
+        """SpeedyHumidity must leave ``humidity.rh`` (a physics input read by
+        speedy_vdiff/speedy_shortwave/speedy_surface_flux) exactly as the
+        reference computes it, however extreme, while publishing a
+        separate ``relative_humidity`` diagnostic computed from the SAME
+        Bolton formula ``MoistAirColumnState`` uses for every ECHAM
+        composition (#407 and its Codex review: a first version instead
+        published SPEEDY's own ice/water-switching ratio, sanity-capped,
+        under this name -- silently redefining an existing cross-package
+        output contract that ``tools/aerocom_cmor.py`` and the science docs
+        both rely on).
+        """
+        from jcm.physics.diagnostics.moist_air_state import (
+            bolton_relative_humidity,
+        )
+        from jcm.physics.speedy.speedy_terms import SpeedyHumidity
+
+        term = SpeedyHumidity()
+        term.cache_coords(self.coords)
+
+        state = self.state.copy(
+            temperature=self.state.temperature.at[0].set(126.0),
+        )
+
+        _, diagnostics = term(state, {}, self.forcing, self.terrain)
+
+        physics_rh = diagnostics["_humidity"].rh
+        reported_rh = diagnostics["relative_humidity"]
+
+        # The physics-facing field is the raw, uncapped ratio -- the same
+        # pathological value speedy_vdiff.py etc. would read unmodified --
+        # and is wildly different from the Bolton-based public field, since
+        # the two are now genuinely different formulas (not the same ratio
+        # under two names).
+        self.assertTrue(float(jnp.max(physics_rh)) > 1e4)
+        self.assertFalse(
+            jnp.allclose(reported_rh, physics_rh, rtol=1e-2).item(),
+        )
+
+        # relative_humidity matches a direct call to the shared function on
+        # SPEEDY's own pure-sigma pressure -- i.e. it is exactly the same
+        # computation an ECHAM composition's MoistAirColumnState would do
+        # given the same (T, q, p), not a rescaled version of humidity.rh.
+        import jcm.constants as c
+        from jcm.physics.speedy.speedy_coords import SpeedyCoords
+        fsg = SpeedyCoords.from_coordinate_system(self.coords).fsg
+        pressure_full = (
+            fsg.reshape((-1,) + (1,) * state.normalized_surface_pressure.ndim)
+            * (state.normalized_surface_pressure * c.p0)[jnp.newaxis]
+        )
+        expected = bolton_relative_humidity(
+            state.temperature, state.specific_humidity, pressure_full,
+        )
+        np.testing.assert_allclose(reported_rh, expected, rtol=1e-6)
+
+    def test_every_output_variable_is_documented(self):
+        """Every published variable carries units and a description.
+
+        The SPEEDY units table reaches the output through the terms that
+        publish the diagnostics, so a term family with no table — or a new
+        diagnostic added without a row — ships an undocumented variable.
+        """
+        from jcm.model import Model
+
+        coords = get_speedy_coords(layers=8, spectral_truncation=31)
+        model = Model(coords=coords, terrain=TerrainData.from_coords(coords),
+                      physics=speedy_physics(checkpoint_terms=False))
+        ds = model.run(save_interval=1.0, total_time=1.0).to_xarray()
+
+        undocumented = sorted(str(v) for v in ds.data_vars
+                              if not ds[v].attrs.get("description"))
+        self.assertEqual(undocumented, [],
+                         "add a row to jcm/physics/speedy/units_table.csv")
+        self.assertEqual(ds["specific_humidity"].attrs["units"], "kg kg-1")
 
 
 if __name__ == "__main__":

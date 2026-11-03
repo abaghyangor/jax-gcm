@@ -30,12 +30,19 @@ emission magnitudes remain calibratable by gradient.
 
 from __future__ import annotations
 
+import warnings
 from typing import ClassVar
 
 import jax.numpy as jnp
 from flax import nnx
 
 from jcm.physics.physics_term import PhysicsTendency, PhysicsTerm
+from jcm.physics.aerosol.jam.emissions.flux_diagnostic import (
+    accumulate_emission_fluxes, emission_flux_keys)
+from jcm.physics.aerosol.jam.tracer_layout import gas_name
+
+#: MAM4's SOA precursor gas; the emissions file is its only source.
+_SOAG = gas_name("soag")
 
 
 class PreSpeciatedEmissions(PhysicsTerm):
@@ -44,7 +51,7 @@ class PreSpeciatedEmissions(PhysicsTerm):
     name: ClassVar[str] = "jam_prescribed_aerosol_emissions"
     category: ClassVar[str] = "aerosol_emissions"
     requires: ClassVar[tuple[str, ...]] = ("air_density", "layer_thickness")
-    provides: ClassVar[tuple[str, ...]] = ()
+    provides: ClassVar[tuple[str, ...]] = emission_flux_keys()
 
     def __init__(self, *, scale: float = 1.0):
         """Hold an overall (differentiable) emission scale."""
@@ -62,6 +69,16 @@ class PreSpeciatedEmissions(PhysicsTerm):
                 if forcing is not None else None)
 
         tends: dict[str, jnp.ndarray] = {}
+        # The bundles' only pre-speciated field is SOAG, so a file without it
+        # usually has none at all: warn on the carried tracer, not on ``emis``.
+        if (forcing is not None and _SOAG in state.tracers
+                and _SOAG not in (emis or {})):
+            warnings.warn(
+                f"forcing.emissions_file has no aero_emis_{_SOAG}: the carried "
+                f"{_SOAG} has no source, so no secondary organic aerosol "
+                "forms. The mirror's emissions bundles carry it; "
+                "jcm.data.emissions.cam6_soa builds it.",
+                stacklevel=2)
         if emis:
             inv = 1.0 / (rho * dz)               # (nlev, ncols) mmr per kg/m²
             for tracer, field in emis.items():
@@ -82,4 +99,11 @@ class PreSpeciatedEmissions(PhysicsTerm):
             specific_humidity=jnp.zeros_like(state.specific_humidity),
             tracers=tends,
         )
+        # Publish this term's contribution to the AeroCom per-species
+        # emission fluxes (accumulated across all emitting terms).
+        diagnostics = accumulate_emission_fluxes(
+            diagnostics, tends,
+            diagnostics["air_density"],
+            diagnostics["layer_thickness"])
+
         return tendency, diagnostics
