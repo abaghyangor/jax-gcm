@@ -59,6 +59,9 @@ def _turbulence_diagnostics(state, params, k):
     return compute_turbulence_diagnostics(
         state, params, kk, kk, kk,
         boundary_layer_height=jnp.full(ncol, 1000.0),
+        # The level that height refers to, top-first: a mid-column value, since
+        # these tests only exercise the surface exchange and the 10 m wind.
+        boundary_layer_level=jnp.full(ncol, nlev // 2, dtype=int),
         richardson_number=jnp.zeros((ncol, nlev - 1)),
         mixing_length=jnp.full((ncol, nlev - 1), 50.0))
 
