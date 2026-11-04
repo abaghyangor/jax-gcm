@@ -340,6 +340,17 @@ class GissConvection(PhysicsTerm):
     name: ClassVar[str] = "giss_convection"
     category: ClassVar[str] = "convection"
     requires: ClassVar[tuple[str, ...]] = ()
+    # Everything this term reads is read *optionally*, with `.get()`, so that it
+    # still runs as a scaffold when an upstream term has not supplied it -- see
+    # the module docstring for what each absence costs. The column pressure /
+    # layer-mass trio is needed for any tendency at all; the rest degrade the
+    # closure rather than disable it.
+    optional_requires: ClassVar[tuple[str, ...]] = (
+        "pressure_full", "layer_thickness", "air_density", "height_full",
+        "surface", "boundary_layer_height", "mixed_layer_top",
+        "cold_pool_fraction", "penetrative_mass", "melting_pressure",
+        "convective_cloud_top_pressure",
+    )
     provides: ClassVar[tuple[str, ...]] = ("convection",)
 
     def __init__(

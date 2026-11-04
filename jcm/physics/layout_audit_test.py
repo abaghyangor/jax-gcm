@@ -119,6 +119,12 @@ INERT_IN_HARNESS = frozenset({
     "AerosolFree",
     "BettsMillerConvection",
     "FrontalGravityWaveDrag",
+    # Broadcasting-native (vertical on axis 0, per-column cloud base gathered
+    # with ``take_along_axis``, no vmap), but it reads ``pressure_full`` /
+    # ``layer_thickness`` / ``air_density`` optionally and this harness supplies
+    # none of them: without that trio it returns zero tendencies and a sentinel
+    # cloud base in either host, so a host-vs-host comparison proves nothing.
+    "GissConvection",
     "IceNucleation",
     "LottMillerSso",
     "M7JaxMicrophysics",
