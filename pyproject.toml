@@ -91,6 +91,7 @@ dependencies = {file = ["requirements.txt"]}
 python_files = "*_test.py"
 markers = [
     "slow: marks tests as slow (> 1 min, deselect with '-m \"not slow\"')",
+    "needs_x64: runs with jax_enable_x64 on, exempt from conftest's float32 pin (see _wants_x64)",
     "requires_network: needs a live connection to an external host at test time; skipped with a reason naming the host when jcm/data/mirror/conftest.py's session probe finds it unreachable (stopgap for #1152 -- the real fix is a packaged fixture that never touches the network)",
 ]
 

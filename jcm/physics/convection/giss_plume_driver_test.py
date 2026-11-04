@@ -8,6 +8,7 @@ which nothing else covers.
 import unittest
 
 import jax
+import pytest
 import jax.numpy as jnp
 import numpy as np
 
@@ -19,10 +20,13 @@ from jcm.physics.convection.giss_thermodynamics import DELTX, LHE, RGAS, SHA
 # The flag is JAX-global, and the rest of the suite asserts the model's float32
 # default, so it is turned on for this module only and put back afterwards --
 # flipping it at import leaks it to every test collected alongside this one.
-# x64 is turned on for this module by the autouse fixture in
-# ``jcm/physics/convection/conftest.py``, which is ordered after the root
-# conftest's ``_pin_jax_x64``. A ``setUpModule`` here cannot do it: that
-# pin runs afterwards and restores the session default before the test body.
+# Nine of these tests compare against ModelE's float64 dumps at tolerances that
+# float32 rounding breaks, so the module runs in float64. It asks with the
+# root conftest's ``needs_x64`` marker, which exempts it from the float32 pin
+# and lets the flag stay on: a ``setUpModule`` cannot work (the pin runs after
+# it and restores the default), and a fixture toggling the flag per test
+# thrashes JAX's compilation cache for every other test on the same worker.
+pytestmark = pytest.mark.needs_x64
 
 
 def _column(nlev=20, horiz=()):

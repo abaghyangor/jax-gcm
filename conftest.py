@@ -119,6 +119,25 @@ def _builds_pyses_backend(item):
                for mark in item.iter_markers("requires_extra"))
 
 
+def _wants_x64(item):
+    """Whether ``item`` opts out of the float32 pin and runs in float64.
+
+    Two ways in: the pySES backend needs it for the life of the grids its
+    ``setUpClass`` builds, and any module may ask with ``needs_x64`` (the
+    plume-driver tests compare against ModelE's float64 dumps at tolerances
+    float32 rounding breaks).
+
+    Both are *exempted from the pin* rather than toggling the flag themselves,
+    and that matters for more than tidiness: flipping ``jax_enable_x64``
+    invalidates JAX's compilation cache, so a fixture that turned it on and off
+    around each test made every other test sharing that xdist worker recompile.
+    Measured on the convection suite -- 45 driver tests that take 40 s on their
+    own added over 90 minutes to a 17-minute run that way. Leaving the flag on
+    across a consecutive run of them costs one invalidation, not two per test.
+    """
+    return _builds_pyses_backend(item) or any(item.iter_markers("needs_x64"))
+
+
 def _restore_x64():
     import jax
     if bool(jax.config.read("jax_enable_x64")) != _X64_BASELINE:
@@ -137,7 +156,7 @@ def _pin_jax_x64(request):
     pySES-backend tests are the exception: they run with the flag on for the
     life of their class (see :func:`pytest_runtest_setup`).
     """
-    if _builds_pyses_backend(request.node):
+    if _wants_x64(request.node):
         yield
         return
     _restore_x64()
@@ -157,7 +176,7 @@ def pytest_runtest_setup(item):
     hook rather than a fixture, because a class fixture is set up before any
     function-scoped fixture could act.
     """
-    if _builds_pyses_backend(item):
+    if _wants_x64(item):
         import jax
         jax.config.update("jax_enable_x64", True)
 
