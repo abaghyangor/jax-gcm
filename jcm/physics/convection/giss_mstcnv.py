@@ -62,7 +62,13 @@ Conventions
 * Operates broadcasting-native on column-vectorized state ``(nlev, ncols)``;
   the per-column cloud base is handled with :func:`jnp.take_along_axis` (a gather
   with per-column indices), so no ``vmap`` is needed.
-* ``state.specific_humidity`` is g/kg (JCM); the GISS routines use kg/kg.
+* ``state.specific_humidity`` is kg/kg, which is what the GISS routines use
+  directly (``physics_interface``: "mass of water vapor per unit mass of
+  moist air [kg/kg]"; ``state_bridge``: "kg/kg is dimensionless"). It was
+  g/kg before jax-gcm#824, and the ``/1000`` that undid that is gone: left
+  in, it dried every parcel by a factor of 1000, which put the diagnosed
+  cloud base 17 levels up and left ``fmp2`` zero on all 18432 columns of a
+  warm-started T63L47 run.
 * ``pressure_full`` [Pa], ``layer_thickness`` [m], ``air_density`` [kg/m^3] are
   read from the diagnostics dict when present (``air_mass = density*thickness =
   dp/g``). They are read optionally so the term still runs as a pure scaffold
@@ -479,7 +485,7 @@ class GissConvection(PhysicsTerm):
         them returns zeros.
 
         Returns:
-            ``(dT/dt [K/s], dq/dt [g/kg/s])`` top-first, the
+            ``(dT/dt [K/s], dq/dt [kg/kg/s])`` top-first, the
             ``(dth_mc, dq_mc)`` surface-first per-step diagnostics in the
             conventional potential temperature and kg/kg the rest of the term
             reports, and ``mcp``, the surface convective precipitation rate
@@ -496,7 +502,7 @@ class GissConvection(PhysicsTerm):
 
         p = jnp.flip(pressure_full, axis=0)
         t = jnp.flip(state.temperature, axis=0)
-        q = jnp.flip(state.specific_humidity, axis=0) / 1000.0
+        q = jnp.flip(state.specific_humidity, axis=0)
         layer_mass = jnp.flip(density, axis=0) * jnp.flip(thickness, axis=0)
         # `zl = gz*bygrav` (ATM_UTILS.f:874). Only differences are used -- the
         # layer depth and the 1 km lag lookback -- so the datum does not matter.
@@ -576,7 +582,7 @@ class GissConvection(PhysicsTerm):
         dq_mc = safe_divide(column.water, layer_mass)
         exner = (p / _P_REF) ** KAPA
         dtemp_dt = jnp.flip(dth_mc * exner / dtsrc, axis=0)
-        dq_dt = jnp.flip(dq_mc * 1000.0 / dtsrc, axis=0)
+        dq_dt = jnp.flip(dq_mc / dtsrc, axis=0)
         # `condpr` is the rain each *level* shed, summed over the sweep's
         # plumes, so the column's surface flux is the sum over levels
         # [kg/m^2 per step]. The oracle's `mcp` is a rate in mm/day and
@@ -633,7 +639,7 @@ class GissConvection(PhysicsTerm):
         returns zeros.
 
         Returns:
-            ``(dT/dt [K/s], dq/dt [g/kg/s])`` top-first, and ``(dth_mc, dq_mc)``
+            ``(dT/dt [K/s], dq/dt [kg/kg/s])`` top-first, and ``(dth_mc, dq_mc)``
             surface-first per-step diagnostics.
         """
         shape = state.temperature.shape
@@ -648,7 +654,7 @@ class GissConvection(PhysicsTerm):
         # Surface-first environment (JCM state is top-first); humidity g/kg->kg/kg.
         p = jnp.flip(pressure_full, axis=0)
         t = jnp.flip(state.temperature, axis=0)
-        q = jnp.flip(state.specific_humidity, axis=0) / 1000.0
+        q = jnp.flip(state.specific_humidity, axis=0)
         phi = jnp.flip(state.geopotential, axis=0)
         dz = jnp.flip(thickness, axis=0)
         air_mass = jnp.flip(density, axis=0) * dz
@@ -702,7 +708,7 @@ class GissConvection(PhysicsTerm):
         # Per-step changes -> per-second rates; potential-temperature change ->
         # temperature change (x Exner). Flip back to JCM top-first for the state.
         dT_dt = jnp.flip(dth_mc * exner / dtsrc, axis=0)
-        dq_dt = jnp.flip(dq_mc * 1000.0 / dtsrc, axis=0)          # kg/kg -> g/kg
+        dq_dt = jnp.flip(dq_mc / dtsrc, axis=0)
         return dT_dt, dq_dt, dth_mc, dq_mc
 
     def _diagnose(self, state, diagnostics, nlev, nodal_shape):
@@ -724,7 +730,7 @@ class GissConvection(PhysicsTerm):
         # Surface-first profiles (JCM state is top-first); humidity g/kg -> kg/kg.
         p_sf = jnp.flip(pressure_full, axis=0)
         t_sf = jnp.flip(state.temperature, axis=0)
-        q_sf = jnp.flip(state.specific_humidity, axis=0) / 1000.0
+        q_sf = jnp.flip(state.specific_humidity, axis=0)
 
         cloud_base, _ = lifting_condensation_level(t_sf[0], p_sf[0], q_sf[0], p_sf)
 
