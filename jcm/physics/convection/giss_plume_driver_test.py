@@ -19,17 +19,10 @@ from jcm.physics.convection.giss_thermodynamics import DELTX, LHE, RGAS, SHA
 # The flag is JAX-global, and the rest of the suite asserts the model's float32
 # default, so it is turned on for this module only and put back afterwards --
 # flipping it at import leaks it to every test collected alongside this one.
-_x64_before_module = None
-
-
-def setUpModule():
-    global _x64_before_module
-    _x64_before_module = jax.config.read("jax_enable_x64")
-    jax.config.update("jax_enable_x64", True)
-
-
-def tearDownModule():
-    jax.config.update("jax_enable_x64", _x64_before_module)
+# x64 is turned on for this module by the autouse fixture in
+# ``jcm/physics/convection/conftest.py``, which is ordered after the root
+# conftest's ``_pin_jax_x64``. A ``setUpModule`` here cannot do it: that
+# pin runs afterwards and restores the session default before the test body.
 
 
 def _column(nlev=20, horiz=()):

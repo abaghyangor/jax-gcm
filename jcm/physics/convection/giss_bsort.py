@@ -40,6 +40,7 @@ helpers intended for use inside the ascent scan, so their inputs have shape
 from typing import NamedTuple
 
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 
 from jcm.physics.convection import giss_microphysics as microphysics
@@ -74,8 +75,11 @@ _REMRAT = 0.333
 
 # Reference blend spectrum: `frac` is each blend's share of the entrained
 # environmental air, `fupd` its share of updraft air. Both are ModelE constants.
-_BLEND_FRACTION = jnp.array([0.25, 0.50, 0.25])
-_BLEND_FUPD_REFERENCE = jnp.array([0.25, 0.50, 0.75])
+# numpy, not jnp: a module-level `jnp.array` initialises a JAX backend at
+# import time, which `import_side_effects_test` forbids (#859). Both are only
+# reshaped and broadcast into jnp expressions, where numpy promotes cleanly.
+_BLEND_FRACTION = np.array([0.25, 0.50, 0.25])
+_BLEND_FUPD_REFERENCE = np.array([0.25, 0.50, 0.75])
 NMIX = 3
 
 # ModelE's `updairm_max = .99999d0*mplume` guard against entraining more updraft

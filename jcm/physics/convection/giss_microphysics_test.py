@@ -47,7 +47,13 @@ class TestCriticalDiameter(unittest.TestCase):
 
     def test_saturates_when_the_updraft_outruns_every_drop(self):
         fast = mp.critical_diameter(jnp.array(50.0), jnp.array(9.0e4))
-        self.assertAlmostEqual(float(fast), float(mp._DIAMETER_MAX), delta=1e-9)
+        # `_DIAMETER_MAX` is an exact float64 scalar (it has to be computed with
+        # numpy: a module-level `jnp.log` would initialise a JAX backend at
+        # import, #859), while `critical_diameter` returns float32. The gap is
+        # then float32's own resolution at 0.077 -- about 6e-9 -- so the delta
+        # bounds the computation's precision, not the constant's. The earlier
+        # 1e-9 only held because both sides were float32.
+        self.assertAlmostEqual(float(fast), float(mp._DIAMETER_MAX), delta=1e-7)
         self.assertTrue(bool(jnp.isfinite(fast)))
 
     def test_gradient_finite_at_the_saturation_boundary(self):

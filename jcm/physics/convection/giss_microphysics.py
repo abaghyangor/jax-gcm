@@ -41,20 +41,21 @@ the caller passes ``PRES(L)``, not ``pl(l)``.
 from typing import NamedTuple
 
 import jax.numpy as jnp
+import numpy as np
 from jax.scipy.special import gammainc
 
 from jcm.physics.convection.giss_thermodynamics import safe_divide
 
 # Water density and the volume factor of a sphere, as ModelE uses them.
 _RHO_WATER = 1000.0
-_PI_6 = jnp.pi / 6.0
+_PI_6 = np.pi / 6.0
 
 # Analytic terminal-fall-speed inversion (`use_s08_fallspeed_mstcnv`). The drop
 # whose fall speed matches the updraft is the largest one the plume can hold.
 _FALL_A, _FALL_B, _FALL_C = 9.65, 9.8, 600.0
 _FALL_PRESSURE_EXPONENT = 0.4
 # When the updraft outruns every drop size, ModelE takes log(teeny)/(-vrc).
-_DIAMETER_MAX = -jnp.log(1e-20) / _FALL_C
+_DIAMETER_MAX = -np.log(1e-20) / _FALL_C
 
 # Gamma-distribution shape parameters.
 _MU_CLOUD_MAX = 15.0
