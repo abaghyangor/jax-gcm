@@ -444,7 +444,11 @@ class GissConvection(PhysicsTerm):
             temperature=dtemp_dt, specific_humidity=dq_dt)
         convection = GissConvectionData.zeros(nodal_shape, nlev).copy(
             cloud_base=cloud_base, cloud_base_mass_flux=fmp2,
-            dth_mc=dth_mc, dq_mc=dq_mc, mcp=mcp)
+            dth_mc=dth_mc, dq_mc=dq_mc, mcp=mcp,
+            # The same rain as a flux, which is what the rest of jcm reads:
+            # `EchamSurfaceExchange` sums it into the total surface
+            # precipitation. 1 mm of water is 1 kg/m^2.
+            precip_conv=mcp / 86400.0)
         return tendency, {**diagnostics, "convection": convection}
 
     def _bsort_tendencies(self, state, diagnostics, closure_base, fmp2,
