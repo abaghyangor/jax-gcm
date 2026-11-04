@@ -480,6 +480,14 @@ class VDiffDiagnostics(NamedTuple):
 
     # Boundary layer diagnostics
     boundary_layer_height: jnp.ndarray    # PBL extension zghabl/g [m] (ncol,)
+    # ECHAM's ``ihpbl``: the LEVEL the extension above refers to, top-first
+    # like the rest of the closure (0 = model top, nlev-1 = surface). Carried
+    # beside the height because the height alone cannot be turned back into a
+    # level by a consumer: ``boundary_layer_height`` is a geopotential *above
+    # the surface*, while the ``height_full`` diagnostic is above sea level, so
+    # comparing them is wrong by the surface elevation -- and a convection
+    # scheme choosing a source parcel needs the level, not the height.
+    boundary_layer_level: jnp.ndarray     # ihpbl, top-first index (ncol,)
     friction_velocity: jnp.ndarray        # u* [m/s] (ncol,), grid-mean
                                            # (fraction-weighted across tiles)
     convective_velocity: jnp.ndarray      # w* [m/s] (ncol,)

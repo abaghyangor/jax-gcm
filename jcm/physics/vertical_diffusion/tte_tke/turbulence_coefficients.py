@@ -280,6 +280,7 @@ def compute_turbulence_diagnostics(
     exchange_coeff_heat: jnp.ndarray,
     exchange_coeff_moisture: jnp.ndarray,
     boundary_layer_height: jnp.ndarray,
+    boundary_layer_level: jnp.ndarray,
     richardson_number: jnp.ndarray,
     mixing_length: jnp.ndarray,
 ) -> VDiffDiagnostics:
@@ -297,6 +298,8 @@ def compute_turbulence_diagnostics(
         exchange_coeff_heat: Heat exchange coefficient [m²/s] (ncol, nlev)
         exchange_coeff_moisture: Moisture exchange coefficient [m²/s] (ncol, nlev)
         boundary_layer_height: Height of the PBL extension [m] (ncol,)
+        boundary_layer_level: ``ihpbl``, the level that height refers to,
+            top-first (ncol,)
         richardson_number: ``zri`` of the interior interfaces (ncol, nlev - 1)
         mixing_length: ``zmix`` of the interior interfaces [m] (ncol, nlev - 1)
 
@@ -457,6 +460,7 @@ def compute_turbulence_diagnostics(
         surface_exchange_moisture=surface_exchange_moisture,
         surface_exchange_momentum=surface_exchange_momentum,
         boundary_layer_height=pbl_height,
+        boundary_layer_level=boundary_layer_level,
         friction_velocity=friction_velocity,
         convective_velocity=convective_velocity,
         surface_friction_velocity_tile=surface_friction_velocity_tile,

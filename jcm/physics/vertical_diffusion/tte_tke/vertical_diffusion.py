@@ -276,6 +276,7 @@ def vertical_diffusion_column(
     diagnostics = compute_turbulence_diagnostics(
         state, params, km, kh, kh,
         boundary_layer_height=closure.pbl.geopotential / c.grav,
+        boundary_layer_level=closure.pbl.level,
         richardson_number=ri, mixing_length=closure.mixing_length.T,
     )
 
@@ -656,7 +657,13 @@ class TteTkeVerticalDiffusion(PhysicsTerm):
         "height_full", "height_half",
         "surface", "clouds",
     )
-    provides: ClassVar[tuple[str, ...]] = ("vertical_diffusion", "surface")
+    # ``mixed_layer_top`` is published as a plain top-level key as well as
+    # inside the struct: a convection scheme has to know how deep the turbulent
+    # layer is to pick the parcel its closure lifts -- ModelE's ``MSTCNV`` takes
+    # exactly this from its own turbulence scheme as ``smixlev``/``dcl`` -- and
+    # one term cannot reach into another's diagnostic struct.
+    provides: ClassVar[tuple[str, ...]] = (
+        "vertical_diffusion", "surface", "mixed_layer_top")
     # The structural shape comes from the declarative slot; TKE and the
     # variance stay zero (a cold start), and :meth:`initial_carry_state` below
     # seeds ``thv_sigma`` and the water tile's friction velocity.
@@ -1275,8 +1282,14 @@ class TteTkeVerticalDiffusion(PhysicsTerm):
             **balance,
         )
 
+        # The closure counts levels top-first; column physics that works
+        # surface-first (the GISS convection port, as ModelE does) wants the
+        # same layer as a count up from the surface.
+        mixed_layer_top = (nlev - 1) - vdiff_diagnostics.boundary_layer_level
+
         return tendency, {**diagnostics, "vertical_diffusion": vdiff_out,
-                          "surface": surface_out}
+                          "surface": surface_out,
+                          "mixed_layer_top": mixed_layer_top}
 
 
 def check_ocean_current_consumers(physics, forcing) -> None:
