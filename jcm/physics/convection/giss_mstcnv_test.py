@@ -110,7 +110,11 @@ class TestGissConvectionTerm(unittest.TestCase):
         # pressure_full increases top -> surface (Pa).
         pfull = jnp.linspace(20000.0, 100000.0, nlev)[:, None]   # (nlev, 1)
         temperature = jnp.linspace(230.0, 298.0, nlev)[:, None]
-        specific_humidity = jnp.full((nlev, 1), 14.0)            # g/kg, moist
+        # kg/kg: PhysicsState's units since jax-gcm#824. This read 14.0 --
+        # the old g/kg value -- which is 14 kg of vapour per kg of air, so
+        # the surface parcel was saturated before it was lifted and the
+        # cloud base came back at level 0.
+        specific_humidity = jnp.full((nlev, 1), 0.014)
         state = PhysicsState.zeros(
             (nlev, 1), temperature=temperature,
             specific_humidity=specific_humidity)
