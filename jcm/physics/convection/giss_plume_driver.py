@@ -666,6 +666,12 @@ class ColumnConvection(NamedTuple):
     # detrainment, and whether it also remains in the surface rain is exactly
     # the question that budget answers.
     downdraft_evaporation: jnp.ndarray
+    # `menv`, the clear-air layer mass the falling rain evaporates into,
+    # `fevap(l)*ma(l)`, summed over plumes [kg/m^2]. Published alongside the
+    # evaporation it drives so the two can be compared against ModelE's dump
+    # separately -- a deficit in the evaporated water is either this mass or
+    # the rate per unit mass, and only the pair tells them apart.
+    environment_air: jnp.ndarray
     plume_count: jnp.ndarray             # candidates that actually convected
     cloud_top: jnp.ndarray               # highest level any plume reached
     base_mass: jnp.ndarray               # mplume per base level [kg/m^2]
@@ -1046,7 +1052,7 @@ def convective_column(potential_temperature: jnp.ndarray,
 
     def one_candidate(carry, offset):
         (theta, q, mass_flux, precipitation, evaporation, downdraft_evap,
-         count, top, base_mass) = carry
+         env_air, count, top, base_mass) = carry
         candidate = highest_base - offset
         if cloud_base_closure_fn is None:
             plume_mass = jnp.sum(
@@ -1122,6 +1128,7 @@ def convective_column(potential_temperature: jnp.ndarray,
                 precipitation + keep(cycle.ascent.precipitation),
                 evaporation + keep(cycle.descent.environment_water),
                 downdraft_evap + keep(cycle.descent.evaporated),
+                env_air + keep(cycle.descent.environment_air),
                 count + convects.astype(count.dtype),
                 jnp.maximum(top, jnp.where(convects, cycle.cloud_top, 0)),
                 base_mass + jnp.where(level == candidate,
@@ -1129,12 +1136,12 @@ def convective_column(potential_temperature: jnp.ndarray,
 
     zeros = jnp.zeros_like(layer_mass)
     scalar = jnp.zeros(horiz)
-    (theta, q, mass_flux, precipitation, evaporation, downdraft_evap, count,
-     top, base_mass), _ = lax.scan(
+    (theta, q, mass_flux, precipitation, evaporation, downdraft_evap, env_air,
+     count, top, base_mass), _ = lax.scan(
         one_candidate,
         # The carry *is* the environment, so it starts at the incoming column.
         (potential_temperature, specific_humidity, zeros, zeros, zeros, zeros,
-         scalar, jnp.zeros(horiz, dtype=level.dtype), zeros),
+         zeros, scalar, jnp.zeros(horiz, dtype=level.dtype), zeros),
         jnp.arange(max_plumes))
 
     return ColumnConvection(
@@ -1146,6 +1153,7 @@ def convective_column(potential_temperature: jnp.ndarray,
         precipitation=precipitation,
         evaporation=evaporation,
         downdraft_evaporation=downdraft_evap,
+        environment_air=env_air,
         plume_count=count,
         cloud_top=top,
         base_mass=base_mass)
