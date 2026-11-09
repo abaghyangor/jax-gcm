@@ -185,10 +185,15 @@ _MAX_PLUME_CANDIDATES = 8
 # tracking both is the melting/freezing heat redistribution
 # `heat1(l) += (vlat(l)-lhp(l))*condpr(l)*bysha`, which is likewise not ported.
 #
-# No oracle currently available exercises any of it: BOMEX is all-liquid on
-# every level and every step, and so is a warm stratocumulus case. Writing it
-# before there is a case that can check it would be writing physics that cannot
-# be validated.
+# BOMEX is all-liquid on every level and every step, and so is a warm
+# stratocumulus case, but **TWP-ICE is not**: its parcel temperature crosses
+# `tfmc` at level 34 (396 hPa), and above that crossing ModelE forms 11.4% of
+# its `condpr` and 34% of its `dwm` as ice (measured over 223 active periods;
+# section 101 of `BSORT_PORT_PLAN.md` in the bridge). So the limitation now has
+# an oracle that can check it, and the cost of leaving it out is bounded rather
+# than unknown: the same measurement puts 95% of the port's 12% production
+# deficit *below* the crossing, and above it the port is at 0.956x, so this is
+# not what drives that bias.
 _FREEZING_THRESHOLD = 273.15 - 15.0     # K, ModelE `tfmc`
 MIXED_PHASE_SUPPORTED = False
 
