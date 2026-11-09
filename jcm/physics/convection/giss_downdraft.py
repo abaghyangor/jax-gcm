@@ -98,6 +98,7 @@ _TEENY = 1e-20
 
 class DowndraftDescent(NamedTuple):
     """Per-level downdraft results. All arrays ``(nlev, *horiz)``."""
+
     mass: jnp.ndarray               # ddm: downdraft mass entering each level
     detrained_mass: jnp.ndarray     # mass handed to the environment
     detrained_heat: jnp.ndarray
@@ -168,6 +169,7 @@ def downdraft_descent(source_mass: jnp.ndarray,
 
     Returns:
         A :class:`DowndraftDescent`.
+
     """
     latent_heat = LHE if phase == "water" else LHS
     slh = latent_heat / SHA

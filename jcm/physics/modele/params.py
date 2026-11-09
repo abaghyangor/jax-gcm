@@ -28,6 +28,7 @@ class GissConvectionParameters:
     Attributes:
         dtsrc: Source/physics time step in seconds. The verified DYCOMS run uses
             1800 s (30-min sub-daily output, 48 periods over 24 h).
+
     """
 
     dtsrc: jnp.ndarray

@@ -120,7 +120,6 @@ class TestBsortEnvironmentTendencies(unittest.TestCase):
     BASE = 4
 
     def _column(self, **over):
-        z = jnp.zeros(self.NLEV)
         levels = jnp.arange(self.NLEV)
         in_cloud = (levels >= self.BASE) & (levels <= self.BASE + 3)
         senv = jnp.full(self.NLEV, 41.5)

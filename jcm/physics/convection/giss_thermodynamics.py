@@ -82,6 +82,7 @@ def saturation_vapor_pressure(temperature: jnp.ndarray,
 
     Returns:
         Saturation vapour pressure [Pa].
+
     """
     if phase == "water":
         tn = jnp.clip(temperature, _MK_WATER_TMIN, _MK_WATER_TMAX)
@@ -114,6 +115,7 @@ def saturation_specific_humidity(temperature: jnp.ndarray,
 
     Returns:
         Saturation specific humidity [kg/kg].
+
     """
     return MRAT * saturation_vapor_pressure(temperature, phase) / pressure
 
@@ -136,6 +138,7 @@ def moist_static_energy(temperature: jnp.ndarray,
 
     Returns:
         Moist static energy [J/kg].
+
     """
     latent_heat = LHE if phase == "water" else LHS
     return SHA * temperature + geopotential + latent_heat * specific_humidity
@@ -158,6 +161,7 @@ def d_ln_qsat_dt(temperature: jnp.ndarray, phase: str = "water") -> jnp.ndarray:
 
     Returns:
         ``d(ln qsat)/dT`` [1/K].
+
     """
     latent_heat = LHE if phase == "water" else LHS
     return latent_heat / (RVAP * temperature ** 2)
@@ -184,6 +188,7 @@ def virtual_temperature(temperature: jnp.ndarray,
     Returns:
         Virtual temperature [K] (or virtual potential temperature, matching the
         input).
+
     """
     return temperature * (1.0 + DELTX * specific_humidity - condensate)
 
@@ -240,6 +245,7 @@ def condensate_evaporation(dry_static_energy: jnp.ndarray,
     Returns:
         ``(dqsum, fevp)`` -- the evaporated water (>= 0, capped by
         ``condensate``) and the fraction of the condensate it represents.
+
     """
     dqsum = _saturation_adjustment(
         dry_static_energy, water_mass, exner, mass, pressure, phase)
@@ -321,6 +327,7 @@ def condensation(dry_static_energy: jnp.ndarray,
     Returns:
         ``(dqsum, fcond)`` -- condensed water (>= 0, at most ``water_mass``) and
         the fraction of the vapour it represents.
+
     """
     dqsum = _saturation_adjustment(
         dry_static_energy, water_mass, exner, mass, pressure, phase)

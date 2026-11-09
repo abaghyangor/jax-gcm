@@ -30,7 +30,7 @@ pytestmark = pytest.mark.needs_x64
 
 
 def _column(nlev=20, horiz=()):
-    """A conditionally unstable trade-cumulus column, surface-first.
+    """Build a conditionally unstable trade-cumulus column, surface-first.
 
     Mixed layer up to level 4, a weak stable lapse above. A parcel lifted from
     the mixed layer is subsaturated at the surface and condenses around 920 mb,
@@ -73,9 +73,9 @@ class ColumnGeometryTest(unittest.TestCase):
         z = np.asarray(col["height"])
         depth = np.asarray(g.layer_depth)
         # Interior: half the span between the layer centres either side.
-        for l in range(1, len(z) - 1):
-            self.assertAlmostEqual(depth[l], 0.5 * (z[l + 1] - z[l - 1]),
-                                   places=9)
+        for lev in range(1, len(z) - 1):
+            self.assertAlmostEqual(depth[lev],
+                                   0.5 * (z[lev + 1] - z[lev - 1]), places=9)
 
     def test_layer_depth_ends_follow_the_fortran(self):
         # CLOUDS_DRV.F90:584-585 zeroes the bottom layer and repeats the top.

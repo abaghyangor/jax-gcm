@@ -76,6 +76,7 @@ def vertical_moment(intensive: jnp.ndarray,
 
     Returns:
         The moment, per unit mass and in the same units as ``intensive``.
+
     """
     # Edges from the mass profile: `dp = ma*g`, walking up from the surface.
     half = 0.5 * layer_mass[:1] * _GRAV
@@ -136,6 +137,7 @@ def quadratic_upstream(scalar: jnp.ndarray,
     the ``qusout_2sides`` branch for a layer emptied from both sides. Whether
     either binds is answered by comparing against the oracle rather than
     assumed; `prather_limits` is 0 in this preset, so that block is inactive.
+
     """
     up = lambda a: jnp.concatenate([a[1:], a[-1:]], axis=0)
     below = lambda a: jnp.concatenate(
@@ -207,6 +209,7 @@ def subsidence_tendency(interface_flux: jnp.ndarray,
         Per-layer change in ``prop`` over the step (same units as ``prop``),
         ``(n, ...)``. The mass-weighted column total is zero (pure internal
         advection conserves the property).
+
     """
     # Upwind donor across each interior interface: lower layer if the flux is
     # upward (>0), upper layer if downward.
@@ -261,6 +264,7 @@ def convective_tendencies(mass_flux, plume_property, detrainment_rate,
 
     Returns:
         Per-layer environmental tendency of the property, ``(n, ...)``.
+
     """
     # Advective compensating subsidence: layer L is warmed/dried by the higher-
     # property air subsiding from layer L+1, at rate (M/MA)*(prop[L+1]-prop[L]).
@@ -303,6 +307,7 @@ def convective_tendencies(mass_flux, plume_property, detrainment_rate,
 
 class EnvironmentTendency(NamedTuple):
     """Per-layer change the convection imposes on the environment, extensive."""
+
     heat: jnp.ndarray            # change in SM (mass * potential-temperature)
     water: jnp.ndarray           # change in QM (mass * specific humidity)
     layer_mass: jnp.ndarray      # change in layer air mass
@@ -393,6 +398,7 @@ def bsort_environment_tendencies(
         formation-level amounts here instead would place the cooling and
         moistening several hundred metres too high and omit the evaporative
         cooling entirely.
+
     """
     deposited_mass = detrained_mass + downdraft_detrained_mass
     deposited_heat = detrained_heat + downdraft_detrained_heat

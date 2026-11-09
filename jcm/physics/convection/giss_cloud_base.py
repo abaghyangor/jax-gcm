@@ -58,6 +58,7 @@ def dry_adiabatic_temperature(parcel_temperature: jnp.ndarray,
 
     Returns:
         Parcel temperature at each ``level_pressure`` [K].
+
     """
     return parcel_temperature * (level_pressure / parcel_pressure) ** KAPA
 
@@ -84,6 +85,7 @@ def lifting_condensation_level(parcel_temperature: jnp.ndarray,
         index of the cloud base (or ``nlev`` if the parcel never saturates), and
         ``condenses`` ``(...)`` is a boolean: whether the parcel reaches
         saturation anywhere in the column.
+
     """
     nlev = level_pressure.shape[0]
     parcel_t = dry_adiabatic_temperature(
@@ -145,6 +147,7 @@ def cloud_base_instability(parcel_potential_temperature: jnp.ndarray,
 
     Returns:
         ``DMSE`` [K]; negative => convectively unstable.
+
     """
     sv_dn = virtual_temperature(
         parcel_potential_temperature, parcel_specific_humidity, parcel_condensate)
@@ -183,6 +186,7 @@ def cloud_base_triggers(parcel_potential_temperature: jnp.ndarray,
 
     Returns:
         ``(triggers, dmse)`` -- a boolean per column and the continuous metric.
+
     """
     qsat_parcel = saturation_specific_humidity(
         parcel_potential_temperature * exner, pressure, phase)

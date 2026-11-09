@@ -201,7 +201,7 @@ class TestClosureDeclinesToConvect(unittest.TestCase):
     """
 
     def _column(self):
-        """The driver's trade-cumulus column, in ModelE's `th`/`plk` pair.
+        """Build the driver's trade-cumulus column, in ModelE's `th`/`plk` pair.
 
         Borrowed rather than rebuilt because this closure reads `exner` as
         ModelE's `(p in mb)**kappa` -- about 7, not the normalised 0.97 -- and a
