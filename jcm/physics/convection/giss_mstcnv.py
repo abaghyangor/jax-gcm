@@ -201,14 +201,6 @@ MIXED_PHASE_SUPPORTED = False
 _CONTCE = 0.6          # Gregory entrainment strength (more-entraining plume)
 _CLOUD_BASE_W = 0.5    # cloud-base updraft seed [m/s]
 
-# Cloud-base adjustment timescale [s]. ``MSTCNV`` relaxes the closure mass flux
-# toward neutrality over ``tadj`` rather than applying it all in one step:
-# ``FMP2 = FMP2 * min(1, dtime/tadj)`` (line 2769). The caller passes
-# ``tadj*seconds_per_hour``, so ``tadj`` is in **seconds** there; the default
-# ``tadjmc(1) = 1`` hour gives 3600 s, i.e. a factor of 0.5 at dtsrc = 1800 s.
-# Without this the scheme applies twice the convective mass flux per step.
-_TADJ_SECONDS = 3600.0
-
 
 def surface_flux_scales(sensible_heat_flux, evaporation, friction_velocity,
                         surface_density, surface_specific_humidity,
@@ -241,6 +233,7 @@ def surface_flux_scales(sensible_heat_flux, evaporation, friction_velocity,
     Returns:
         ``(tstar, qstar)`` -- source-parcel temperature [K] and humidity [kg/kg]
         enhancements.
+
     """
     scale = surface_density * jnp.maximum(friction_velocity, 1.0e-6)
     tstar = jnp.clip(sensible_heat_flux / (scale * SHA), 0.0, 1.0)
@@ -317,6 +310,7 @@ def cloud_base_closure_mass_flux(temperature: jnp.ndarray,
     Returns:
         ``(fplume, fmp2)`` -- the plume mass fraction and mass [kg/m^2] per
         column, ``(...)``; both zero where there is no cloud base.
+
     """
     nlev = temperature.shape[0]
     exner = (pressure / _P_REF) ** KAPA
@@ -383,6 +377,7 @@ class GissConvection(PhysicsTerm):
                 ``False`` falls back to the earlier single entraining plume in
                 :mod:`giss_plume`, which is kept only so the two can be compared
                 against the same oracle. Static, like ``allow_mc``.
+
         """
         self.params = nnx.Param(params or GissConvectionParameters.default())
         self.allow_mc = allow_mc
@@ -416,6 +411,7 @@ class GissConvection(PhysicsTerm):
             ``(PhysicsTendency, diagnostics)`` with the ``GissConvectionData``
             (``cloud_base``, ``cloud_base_mass_flux``, and -- under ``allow_mc`` --
             ``dth_mc``/``dq_mc``) under ``"convection"``.
+
         """
         dtsrc = self.params.get_value().dtsrc
         shape = state.temperature.shape          # (nlev, ncols) in column mode
@@ -490,6 +486,7 @@ class GissConvection(PhysicsTerm):
             conventional potential temperature and kg/kg the rest of the term
             reports, and ``mcp``, the surface convective precipitation rate
             [mm/day] the plume sequence produced.
+
         """
         shape = state.temperature.shape
         pressure_full = diagnostics.get("pressure_full")
@@ -641,6 +638,7 @@ class GissConvection(PhysicsTerm):
         Returns:
             ``(dT/dt [K/s], dq/dt [kg/kg/s])`` top-first, and ``(dth_mc, dq_mc)``
             surface-first per-step diagnostics.
+
         """
         shape = state.temperature.shape
         pressure_full = diagnostics.get("pressure_full")

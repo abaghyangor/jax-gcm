@@ -83,6 +83,7 @@ def moist_adiabat_ascent(t_base: jnp.ndarray,
         ``(parcel_temperature, condensate)`` -- each ``(n_above, ...)``: the
         moist-adiabatic parcel temperature [K] at each level, and the cumulative
         condensed water [kg/kg] produced up to that level.
+
     """
     def step(carry, p_next):
         t_prev, p_prev, cond = carry
@@ -134,6 +135,7 @@ def entrainment_rate(buoyancy: jnp.ndarray,
 
     Returns:
         Fractional entrainment rate [1/m].
+
     """
     return _SIXTH * contce * GRAV * buoyancy / (updraft_speed ** 2 + _TEENY)
 
@@ -168,6 +170,7 @@ def updraft_velocity(buoyancy: jnp.ndarray,
         ``(w2, w, cloud_top)`` -- the updraft ``w²`` [m²/s²] and ``w`` [m/s]
         profiles ``(n, ...)``, and the ``cloud_top`` level index ``(...)`` (first
         level with ``w² ≤ 0``; sentinel ``n`` if the plume never stops in range).
+
     """
     det = jnp.broadcast_to(jnp.asarray(detrainment) * 1.0, buoyancy.shape)
 
@@ -440,6 +443,7 @@ def entraining_plume_ascent(t_base, q_base, geopotential_base, p_base, w_base,
     Returns:
         ``(parcel_temperature, condensate, buoyancy, w2, mass_flux, cloud_top)``
         -- profiles ``(n, ...)`` and the ``cloud_top`` level index ``(...)``.
+
     """
     h_base = SHA * t_base + geopotential_base + LHE * q_base
     qt_base = q_base
@@ -521,6 +525,7 @@ def plume_ascent_column(cloud_base, t_base, q_base, geopotential_base, w_base,
         ``(parcel_temperature, condensate, buoyancy, mass_flux, detrainment_rate,
         cloud_top)`` -- profiles ``(nlev, ...)`` (zero outside the live cloud) and
         the ``cloud_top`` level index ``(...)``.
+
     """
     nlev = env_temperature.shape[0]
     h_base = SHA * t_base + geopotential_base + LHE * q_base

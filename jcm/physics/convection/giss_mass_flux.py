@@ -42,7 +42,6 @@ layer mass kg/m^2, Exner dimensionless.
 import jax.numpy as jnp
 
 from jcm.physics.convection.giss_thermodynamics import (
-    DELTX,
     LHE,
     SHA,
     d_ln_qsat_dt,
@@ -55,8 +54,12 @@ _DMSE_TOL = 1.0e-3   # neutrality band (K), matches the Fortran exit threshold
 _N_ITER = 9          # fixed bisection count, as in MASS_FLUX2
 _FEVAP_FRAC = 0.005  # precip re-evaporation fraction of FPLUME (Fortran FEVAP)
 _TEENY = 1.0e-20     # guards divisions at masked (zero-mass) levels
-# `tadjmc(1)`, the cloud-base adjustment timescale (MSTCNV.F90:286). One hour,
-# so a half-hour physics step applies half the neutralising mass flux.
+# `tadjmc(1)`, the cloud-base adjustment timescale (MSTCNV.F90:286). `MSTCNV`
+# relaxes the closure mass flux toward neutrality over `tadj` rather than
+# applying it all in one step: `FMP2 = FMP2 * min(1, dtime/tadj)` (:2769). The
+# caller passes `tadj*seconds_per_hour`, so `tadj` is in **seconds** there, and
+# the default of one hour gives a factor of 0.5 at dtsrc = 1800 s. Without it
+# the scheme applies twice the convective mass flux per step.
 _TADJ_SECONDS = 3600.0
 
 # `tadjmc(2)`, the relaxation the closure uses for a **closure2** plume -- one
@@ -101,6 +104,7 @@ def cloud_base_mass_flux(theta, specific_humidity, air_mass, exner, pressure,
         ``fplume*air_mass[0]`` [kg/m^2], and the residual cloud-base instability
         after closure (≈0 when neutralized). ``fplume`` is returned raw; the
         caller applies the ``MSTCNV`` limiters (``MINFRAC``, the ``0.5*ma`` caps).
+
     """
     # Unpack the three-level stencil (axis 0) into the per-level names the
     # MASS_FLUX2 redistribution below is written in.
@@ -224,6 +228,7 @@ def cloud_base_mass_flux_column(theta, specific_humidity, air_mass, exner,
     Returns:
         ``(fplume, fmp2, dmse1)`` -- ``fplume`` is the fraction of the *top*
         source layer's mass (``FMP2 = FPLUME*AML(NLPI)``).
+
     """
     nlev = theta.shape[0]
     level = jnp.arange(nlev).reshape((nlev,) + (1,) * (theta.ndim - 1))
@@ -414,6 +419,7 @@ def cloud_base_closure(potential_temperature: jnp.ndarray,
         `fplume` lands on bisection lattice points, riding the ceiling: the sign
         of ``DMSE1`` never flips for a column that stays unstable however much
         mass is removed. Matching ModelE means reproducing that, not converging.
+
     """
     slh = LHE / SHA
     nlev = layer_mass.shape[0]

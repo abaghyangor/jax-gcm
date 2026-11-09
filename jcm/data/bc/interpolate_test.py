@@ -226,7 +226,7 @@ class TestUpsampleSso(unittest.TestCase):
         self.assertLess(float(out["oroval"].min()), 0.0)
 
     def test_orientation_interpolates_around_the_wrap(self):
-        """orothe is axial: +89 and -89 degrees are nearly the same ridge.
+        """Orothe is axial: +89 and -89 degrees are nearly the same ridge.
 
         Interpolating the angle directly would average them to ~0 — a ridge
         at right angles to the real one. The double-angle vector is

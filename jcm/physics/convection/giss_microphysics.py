@@ -101,6 +101,7 @@ def scaled_droplet_number(droplet_number: jnp.ndarray,
 
     Returns:
         Scaled concentration [m^-3].
+
     """
     return (droplet_number * safe_divide(pressure, environment_temperature)
             * (_NC_REFERENCE_TEMPERATURE / _NC_REFERENCE_PRESSURE))
@@ -117,12 +118,14 @@ def finite_ascent_fraction(layer_mass: jnp.ndarray) -> jnp.ndarray:
 
     Returns:
         Fraction in (0, 1].
+
     """
     return jnp.minimum(1.0, layer_mass / _ASCENT_REFERENCE_MASS)
 
 
 class Precipitation(NamedTuple):
     """Partition of a plume's condensate."""
+
     precipitated: jnp.ndarray      # water content rained out [kg/m^3]
     cloud_water: jnp.ndarray       # retained in the cloud mode [kg/m^3]
     rain_water: jnp.ndarray        # in the rain mode before the size cut
@@ -143,6 +146,7 @@ def critical_diameter(updraft_speed: jnp.ndarray,
 
     Returns:
         Critical diameter [m].
+
     """
     speed = jnp.maximum(updraft_speed, 0.0)
     scaled = speed * (pressure / 1.0e5) ** _FALL_PRESSURE_EXPONENT
@@ -176,6 +180,7 @@ def precipitate(condensate: jnp.ndarray,
 
     Returns:
         A :class:`Precipitation`.
+
     """
     air_density = pressure / (_RGAS * temperature)
     # `MSTCNV` calls this twice per level with different size cuts: once with

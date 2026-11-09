@@ -45,7 +45,7 @@ from jax import lax
 
 from jcm.physics.convection import giss_microphysics as microphysics
 from jcm.physics.convection.giss_thermodynamics import (
-    DELTX, GRAV, LHE, LHS, RGAS as RGAS_AIR, SHA, condensate_evaporation,
+    DELTX, GRAV, LHE, LHS, SHA, condensate_evaporation,
     condensation, safe_divide)
 
 # Fraction of the buoyancy force that goes into vertical kinetic energy. ModelE
@@ -113,6 +113,7 @@ def buoyancy_work_increments(buoyancy: jnp.ndarray,
 
     Returns:
         ``(d_kew, d_bdzsum)`` to add to the running integrals.
+
     """
     a_buoy = jnp.where(buoyancy >= 0.0, _A_BUOY_BUOYANT, _A_BUOY_OVERSHOOT)
     # `GRAV` is ModelE's 9.80665, not jcm's 9.81. The 0.034% difference is
@@ -157,6 +158,7 @@ def entrainment_rate(buoyancy: jnp.ndarray,
     Returns:
         ``(ent, det)`` -- non-negative entrainment and detrainment rates [1/m].
         At most one of the two is non-zero.
+
     """
     denominator = bdzsum * plume_mass
     buoyant = kew > denominator
@@ -243,6 +245,7 @@ def blend_air_masses(plume_mass: jnp.ndarray,
         fupd)`` where the last three have a leading axis of length ``NMIX``.
         ``updraft_factor``/``environment_factor`` multiply the *totals*
         ``updraft_air``/``environment_air`` to give each blend's contribution.
+
     """
     blend_shape = (NMIX,) + (1,) * jnp.ndim(plume_mass)
     frac = _BLEND_FRACTION.reshape(blend_shape)
@@ -320,6 +323,7 @@ class SortedBlends(NamedTuple):
     they conserve mass: ``plume_mass + detrained_mass + downdraft_mass`` equals
     the incoming plume mass plus the entrained environmental air.
     """
+
     plume_mass: jnp.ndarray
     plume_heat: jnp.ndarray
     plume_water: jnp.ndarray
@@ -404,6 +408,7 @@ def sort_blends(plume_mass: jnp.ndarray,
 
     Returns:
         A :class:`SortedBlends`.
+
     """
     latent_heat = LHE if phase == "water" else LHS
     slh = latent_heat / SHA
@@ -511,6 +516,7 @@ def vertical_velocity(kew: jnp.ndarray,
 
     Returns:
         Updraft speed [m/s].
+
     """
     # `sqrt` has an infinite derivative at zero, and zero is a perfectly normal
     # argument here: it is what a terminated plume (no mass, no kinetic energy)
@@ -537,6 +543,7 @@ def kinetic_energy(vertical_velocity_: jnp.ndarray,
 
     Returns:
         Buoyancy-work integral to carry upward.
+
     """
     return 0.5 * vertical_velocity_ ** 2 * plume_mass
 
@@ -552,6 +559,7 @@ _LAG_DISTANCE = 1.0e3
 
 class PlumeAscent(NamedTuple):
     """Per-level results of one plume's ascent. All arrays are ``(nlev, *horiz)``."""
+
     plume_mass: jnp.ndarray          # mass entering each level
     # The plume's own heat and water entering each level, extensive, matching
     # ModelE's `smp0`/`qmp0`. Only the plume's mass, velocity and detrainment
@@ -681,6 +689,7 @@ def plume_ascent(cloud_base: jnp.ndarray,
 
     Returns:
         A :class:`PlumeAscent`.
+
     """
     nlev = layer_mass.shape[0]
     horiz = layer_mass.shape[1:]
@@ -968,6 +977,7 @@ def resaturate_plume(plume_mass: jnp.ndarray,
 
     Returns:
         ``(heat, water, condensate)`` after re-saturation.
+
     """
     previous_latent = (LHE if (previous_phase or phase) == "water" else LHS)
     latent = LHE if phase == "water" else LHS

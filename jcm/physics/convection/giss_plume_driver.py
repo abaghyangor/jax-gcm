@@ -109,6 +109,7 @@ def entrainment_efficiency(base_pressure: jnp.ndarray = None,
 
     Returns:
         ``enteff`` [-].
+
     """
     constant = jnp.asarray(_ENTRAINMENT_EFFICIENCY)
     if base_pressure is None:
@@ -158,6 +159,7 @@ _DROPLET_RADIUS = 10.0e-6
 
 class ColumnGeometry(NamedTuple):
     """Profiles ``MSTCNV`` derives from the column before any plume runs."""
+
     layer_depth: jnp.ndarray           # gzl [m], centred geopotential spacing
     layer_thickness: jnp.ndarray       # delz [m], hydrostatic
     virtual_temperature: jnp.ndarray   # tvl [K]
@@ -167,6 +169,7 @@ class ColumnGeometry(NamedTuple):
 
 class PlumeCycle(NamedTuple):
     """Everything one plume does to the column."""
+
     tendency: tendencies.EnvironmentTendency
     ascent: bsort.PlumeAscent
     descent: downdraft.DowndraftDescent
@@ -205,6 +208,7 @@ def column_geometry(potential_temperature: jnp.ndarray,
         ``delz`` is this layer's own hydrostatic thickness. The entrainment
         rates are per ``gzl`` and the buoyancy work integral is per ``delz``, so
         conflating them mis-scales one or the other.
+
     """
     temperature = potential_temperature * exner
     density = pressure / (RGAS * temperature)
@@ -284,6 +288,7 @@ def enhanced_source(potential_temperature: jnp.ndarray,
 
     Returns:
         ``(potential_temperature, specific_humidity)`` for the source draw only.
+
     """
     nlev = potential_temperature.shape[0]
     level = jnp.arange(nlev).reshape(
@@ -315,6 +320,7 @@ def source_parcel(potential_temperature: jnp.ndarray,
         ``(source_removal, heat, water, condensate)`` -- the per-layer removal
         as a positive mass, and the parcel's extensive heat, vapour and
         condensate.
+
     """
     fpi = source_weights(layer_mass, source_bottom, source_top,
                          boundary_layer_top)
@@ -428,6 +434,7 @@ def run_plume(cloud_base: jnp.ndarray,
 
     Returns:
         A :class:`PlumeCycle`.
+
     """
     geometry = column_geometry(potential_temperature, specific_humidity,
                                layer_mass, exner, pressure, height)
@@ -441,13 +448,6 @@ def run_plume(cloud_base: jnp.ndarray,
     # out*: it skips the arrival processing at the base level, because that is
     # where ModelE's ascent loop begins rather than something it does again.
     # The sub-cloud parcel has had neither, so both happen here.
-    def at_base(profile):
-        nlev = profile.shape[0]
-        level = jnp.arange(nlev).reshape((nlev,) + (1,) * (profile.ndim - 1))
-        return jnp.sum(jnp.where(level == cloud_base, profile, 0.0), axis=0)
-
-    exner_base = at_base(exner)
-    pressure_base = at_base(pressure)
     # The parcel condenses and rains at every level from its own `lcl` up to and
     # including the cloud base, not only at the base. With `lcl == cloud_base`
     # this reduces to the single arrival step the port did before, which is the
@@ -459,8 +459,6 @@ def run_plume(cloud_base: jnp.ndarray,
         parcel_heat, parcel_water, parcel_condensate, cloud_base_mass,
         condensation_level, cloud_base, exner, pressure, layer_mass,
         geometry.density, geometry.temperature, cloud_base_velocity, phase)
-
-    base_density = at_base(geometry.density)
 
     ascent = bsort.plume_ascent(
         cloud_base=cloud_base,
@@ -640,6 +638,7 @@ class CandidateSetup(NamedTuple):
     settles them once from the highest base runs every lower candidate as the
     less-entraining `closure2` plume, which it is not.
     """
+
     cloud_base_mass: jnp.ndarray         # mplume [kg/m^2]
     entrainment_efficiency: jnp.ndarray  # enteff [-]
     iplume: jnp.ndarray                  # 1 (less entraining) or 2
@@ -647,6 +646,7 @@ class CandidateSetup(NamedTuple):
 
 class ColumnConvection(NamedTuple):
     """What the whole plume sequence does to one column."""
+
     potential_temperature: jnp.ndarray   # th after every plume
     specific_humidity: jnp.ndarray       # qv after every plume
     heat: jnp.ndarray                    # total extensive change in sm
@@ -728,6 +728,7 @@ def second_displacement(melting_pressure: jnp.ndarray = None,
 
     Returns:
         The displacement [Pa], zero where it falls below ``dp_disp2_min``.
+
     """
     if melting_pressure is None or cloud_top_pressure is None:
         return jnp.asarray(0.0)
@@ -782,6 +783,7 @@ def displacement_top(layer_mass: jnp.ndarray,
     Returns:
         The level index, or ``highest_base + 1`` where nothing clears the
         displacement.
+
     """
     nlev = pressure.shape[0]
     level = jnp.arange(nlev).reshape((nlev,) + (1,) * (pressure.ndim - 1))
@@ -868,6 +870,7 @@ def parcel_condensation_level(parcel_heat: jnp.ndarray,
 
     Returns:
         The level index, ``cloud_base + 1`` where the parcel never saturates.
+
     """
     nlev = pressure.shape[0]
     level = jnp.arange(nlev).reshape((nlev,) + (1,) * (pressure.ndim - 1))
@@ -917,6 +920,7 @@ def sub_cloud_lift(parcel_heat: jnp.ndarray,
     Returns:
         ``(heat, water, condensate, rained)`` -- the parcel entering the cloud
         base, and the mass rained out at each level on the way.
+
     """
     nlev = pressure.shape[0]
 
@@ -1025,6 +1029,7 @@ def convective_column(potential_temperature: jnp.ndarray,
         stabilises the column before the shallower ones are tried, so running it
         the other way lets the shallow plumes consume instability the deep one
         should have had.
+
     """
     nlev = layer_mass.shape[0]
     horiz = layer_mass.shape[1:]

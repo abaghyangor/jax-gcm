@@ -225,7 +225,7 @@ def upsample_terrain_ds(ds: xr.Dataset, grid: HorizontalGridTypes) -> xr.Dataset
     return ds_interp
 
 def upsample_sso_ds(ds: xr.Dataset, grid: HorizontalGridTypes) -> xr.Dataset:
-    f"""Upsample SSO descriptor fields to target resolution with physical constraints.
+    """Upsample SSO descriptor fields to target resolution with physical constraints.
 
     Five of the six Lott-Miller descriptors interpolate like any other field.
     The exception is ``orothe``, the orientation of the principal axis: it is

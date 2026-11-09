@@ -15,7 +15,7 @@ import jax.numpy as jnp
 from jcm.physics.convection.giss_thermodynamics import RGAS, SHA, GRAV
 from jcm.physics.convection.giss_cloud_base import dry_adiabatic_temperature
 from jcm.physics.convection.giss_thermodynamics import (
-    LHE, SHA, saturation_specific_humidity,
+    LHE, saturation_specific_humidity,
 )
 from jcm.physics.convection.giss_plume import (
     _saturation_adjust,

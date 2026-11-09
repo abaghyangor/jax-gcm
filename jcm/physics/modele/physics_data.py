@@ -54,6 +54,7 @@ class GissConvectionData:
     a column as penetrative, shallow or mid-level, so a value here would be an
     invention that quietly moved radiation. The cost is that radiation treats a
     convecting column as non-convective for that one factor.
+
     """
 
     dq_mc: jnp.ndarray
@@ -66,7 +67,8 @@ class GissConvectionData:
     @classmethod
     def zeros(cls, nodal_shape, nlev):
         """Zero-filled diagnostics. ``nodal_shape`` is ``(ncols,)`` in column
-        mode (or the trailing grid shape in 3D mode)."""
+        mode (or the trailing grid shape in 3D mode).
+        """
         return cls(
             dq_mc=jnp.zeros((nlev,) + nodal_shape),
             dth_mc=jnp.zeros((nlev,) + nodal_shape),

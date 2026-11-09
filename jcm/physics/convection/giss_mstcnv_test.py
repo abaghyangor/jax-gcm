@@ -516,7 +516,7 @@ class TestEnvironmentCondensate(unittest.TestCase):
 
 
 class TestPhaseAssumption(unittest.TestCase):
-    """This port is all-liquid, and that is a stated limit rather than an oversight.
+    """All-liquid, a stated limit of the port rather than an oversight.
 
     ModelE picks the latent heat per level from the *parcel* temperature against
     `tfmc` and latches it once ice forms (MSTCNV.F90:1716-1721), tracks a second
