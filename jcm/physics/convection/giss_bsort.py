@@ -45,8 +45,8 @@ from jax import lax
 
 from jcm.physics.convection import giss_microphysics as microphysics
 from jcm.physics.convection.giss_thermodynamics import (
-    DELTX, GRAV, LHE, LHS, SHA, condensate_evaporation,
-    condensation, safe_divide)
+    DELTX, GRAV, SHA, condensate_evaporation, condensation, latent_heat_of,
+    safe_divide)
 
 # Fraction of the buoyancy force that goes into vertical kinetic energy. ModelE
 # applies only a sixth while the parcel is buoyant, but the full force once it
@@ -410,7 +410,7 @@ def sort_blends(plume_mass: jnp.ndarray,
         A :class:`SortedBlends`.
 
     """
-    latent_heat = LHE if phase == "water" else LHS
+    latent_heat = latent_heat_of(phase)
     slh = latent_heat / SHA
 
     # Remove the set-aside air from the plume. What survives is the part that
@@ -548,6 +548,18 @@ def kinetic_energy(vertical_velocity_: jnp.ndarray,
     return 0.5 * vertical_velocity_ ** 2 * plume_mass
 
 
+# `tfmc`, the temperature at which the plume's condensation switches from
+# water to ice (MSTCNV.F90:1849-1854). This is the default preset's
+# `tfmc = tf-15d0`, the same preset that sets `max_dt_overshoot = 1d0` and
+# `geometric_fevapfac = 0d0`; a tuned GCM preset uses 251.47871, 252.36180 or
+# 260.28967 instead and will need this made configurable with them.
+#
+# Recovered from the oracle rather than assumed: the level where ModelE's dumped
+# `lhx` switches straddles this value on 186 of 186 TWP-ICE steps, taking the
+# first plume of each step. Two of 189 plumes miss it, and both are the
+# `TPSAV`/`VLAT` sharing noted in `plume_ascent`.
+_TFMC = 273.16 - 15.0
+
 # Plume termination thresholds (MSTCNV.F90, checked at the top of each level).
 _MIN_PLUME_FRACTION = 5.0e-4      # MINFRAC: mplume vs the layer's own mass
 _MIN_CLOUD_BASE_FRACTION = 0.01   # bsort-specific: mplume vs its cloud-base mass
@@ -611,6 +623,12 @@ class PlumeAscent(NamedTuple):
     # `bdzsum` is geometric.
     entrainment_kew: jnp.ndarray
     entrainment_bdzsum: jnp.ndarray
+    # The latent heat this level condensed at -- ModelE's `lhx`, which it dumps
+    # per level in `mass_budget.txt`. Exported because the phase is now decided
+    # inside the ascent from the parcel's own temperature, so the level it
+    # switches on is a result of the port rather than an input to it, and the
+    # oracle pins it directly.
+    latent_heat: jnp.ndarray         # lhx [J/kg]
     removed_fraction: jnp.ndarray    # frem
     active: jnp.ndarray              # bool: this level was processed
 
@@ -698,7 +716,7 @@ def plume_ascent(cloud_base: jnp.ndarray,
 
     def step(carry, level_inputs):
         (mass, heat, water, condensate, kew, bdzsum, previous_w, previous_w2,
-         alive, dumped, history) = carry
+         alive, dumped, history, previous_ice) = carry
         (level, senv, qenv, tvl, ma, gzl, delz, zl, exner_l,
          pressure_l) = level_inputs
 
@@ -713,8 +731,55 @@ def plume_ascent(cloud_base: jnp.ndarray,
         # some of the condensate out before any sorting happens. Skipped at
         # cloud base, where the seed is already the post-condensation state.
         arrival_mass = jnp.where(mass > 0.0, mass, 1.0)
+
+        # `TPSAV(l) = smp*plk/mplume` (MSTCNV.F90:1842), the parcel temperature
+        # *before* this level's condensation. ModelE forms it once per level and
+        # uses it for two things: the phase switch just below, and the
+        # microphysics further down. Hoisted above the re-saturation because the
+        # phase has to be known before the condensation it governs; the
+        # microphysics reads the same value rather than recomputing it.
+        # At the seed level the plume's state is the seed, not the carry --
+        # `mass` is still zero on the way in and is only replaced with
+        # `cloud_base_mass` further down.
+        present = (mass > 0.0) | at_base
+        offered_mass = jnp.where(at_base, cloud_base_mass, arrival_mass)
+        offered_heat = jnp.where(at_base, cloud_base_heat, heat)
+        risen_temperature = safe_divide(offered_heat, offered_mass) * exner_l
+
+        # ModelE sets the condensation phase **per level**, from that
+        # temperature: `lhx = LHE` at or above `tfmc`, `LHS` below it
+        # (MSTCNV.F90:1849-1854), recording it in `VLAT(l)` so the next level's
+        # evaporation term can undo the right one.
+        #
+        # This is not a cosmetic choice of latent heat. Because ModelE
+        # re-condenses the parcel from scratch at every level (see
+        # `resaturate_plume`), a change of phase re-books the latent heat of the
+        # **whole condensate reservoir**, not of the increment. Measured on
+        # TWP-ICE period 111 at the level where it happens: +1.66 K, a buoyancy
+        # of +6.4e-3 where the overshoot threshold is -3.9e-3, which is the
+        # difference between ModelE's plume (buoyancy recovering from -1.3e-3 to
+        # +2.1e-3, rising nine more levels) and the port's without it (-4.2e-3,
+        # terminating). ModelE glaciates the plume on 26% of the TWP-ICE periods
+        # and those carry 7.7x the rate of >=5-level cloud-top deficits.
+        #
+        # A caller naming a phase statically keeps it: `"ice"` is an all-ice
+        # ascent, as before. `"water"` is ModelE's own initial state (`VLAT=LHE`,
+        # MSTCNV.F90:1283) and is the setting that switches.
+        if phase == "water":
+            level_ice = present & (risen_temperature < _TFMC)
+            level_phase = level_ice
+            previous_phase = previous_ice
+        else:
+            # A statically named phase holds for the whole ascent; the carried
+            # record is kept as an array so the carry's type does not depend on
+            # which branch a caller took.
+            level_ice = jnp.full(horiz, phase == "ice", dtype=bool)
+            level_phase = phase
+            previous_phase = phase
+
         risen_heat, risen_water, risen_condensate = resaturate_plume(
-            arrival_mass, heat, water, condensate, exner_l, pressure_l, phase)
+            arrival_mass, heat, water, condensate, exner_l, pressure_l,
+            level_phase, previous_phase)
         # Rain out what the microphysics says falls faster than the updraft.
         # ModelE passes an extrapolation of the *previous* levels' `wcu` here
         # (`wcupass`), not this level's, because `wcu` is not known until after
@@ -730,11 +795,8 @@ def plume_ascent(cloud_base: jnp.ndarray,
         # the right state to offer the microphysics here -- ModelE's own
         # `CONDMU` at this level is nonzero, and the port's sub-cloud lift
         # reproduces it to 0.2% -- so use it rather than the empty carry.
-        offered_mass = jnp.where(at_base, cloud_base_mass, arrival_mass)
         offered_condensate = jnp.where(at_base, cloud_base_condensate,
                                        risen_condensate)
-        offered_heat = jnp.where(at_base, cloud_base_heat, heat)
-        risen_temperature = safe_divide(offered_heat, offered_mass) * exner_l
         # ModelE forms the volumetric condensate as `CONDMU = (wmp/mplume)*rho0`
         # (MSTCNV.F90:1772) -- `rho0` being the layer's reference air density,
         # not one derived from the plume's own temperature. Using `ma/delz`
@@ -768,7 +830,6 @@ def plume_ascent(cloud_base: jnp.ndarray,
         # how much condensate the sort may detrain -- and a zero cap sends the
         # seed level's whole detrained condensate to precipitation instead,
         # which measured 3.3x ModelE's rain at that level.
-        present = (mass > 0.0) | at_base
         risen_temperature = jnp.where(present, risen_temperature,
                                       environment_temperature)
         water_content = jnp.where(present, water_content, 0.0)
@@ -877,7 +938,7 @@ def plume_ascent(cloud_base: jnp.ndarray,
             mass, heat, water, condensate, senv, qenv, environment_air,
             updraft_air, updraft_factor, environment_factor, exner_l,
             pressure_l, tvl,
-            buoyancy, phase)
+            buoyancy, level_phase)
 
         def keep(value):
             return jnp.where(survives, value, 0.0)
@@ -897,7 +958,8 @@ def plume_ascent(cloud_base: jnp.ndarray,
                  jnp.where(survives, previous_w, previous_w2),
                  survives,
                  dumped | terminating,
-                 history)
+                 history,
+                 jnp.where(survives, level_ice, previous_ice))
         outputs = (keep(mass), keep(heat), keep(water),
                    keep(condensate), keep(rained_mass), keep(lag),
                    keep(w), keep(ent), keep(det),
@@ -920,6 +982,7 @@ def plume_ascent(cloud_base: jnp.ndarray,
                    keep(sorted_blends.blend_evaporated),
                    keep(kew_here),
                    keep(bdzsum_here),
+                   keep(latent_heat_of(level_phase)),
                    keep(sorted_blends.removed_fraction),
                    survives)
         return carry, outputs
@@ -931,7 +994,8 @@ def plume_ascent(cloud_base: jnp.ndarray,
                               zeros.shape)
     initial = (zeros, zeros, zeros, zeros, zeros, zeros, seed_w, seed_w,
                jnp.zeros(horiz, dtype=bool), jnp.zeros(horiz, dtype=bool),
-               jnp.zeros((nlev,) + horiz))
+               jnp.zeros((nlev,) + horiz),
+               jnp.zeros(horiz, dtype=bool))
     _, outputs = lax.scan(
         step, initial,
         (level_axis, environment_heat, environment_water,
@@ -979,8 +1043,9 @@ def resaturate_plume(plume_mass: jnp.ndarray,
         ``(heat, water, condensate)`` after re-saturation.
 
     """
-    previous_latent = (LHE if (previous_phase or phase) == "water" else LHS)
-    latent = LHE if phase == "water" else LHS
+    previous_latent = latent_heat_of(
+        phase if previous_phase is None else previous_phase)
+    latent = latent_heat_of(phase)
 
     # Undo the previous level's condensation, returning all water to vapour.
     heat = plume_heat - previous_latent * plume_condensate / SHA / exner
