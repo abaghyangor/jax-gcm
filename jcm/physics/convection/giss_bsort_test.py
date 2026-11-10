@@ -17,12 +17,14 @@ representative sample plus the structural properties.
 """
 
 import unittest
+from unittest import mock
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
 from jcm.physics.convection import giss_bsort as bs
+from jcm.physics.convection import giss_thermodynamics as gt
 
 # level, mplume, ent, det, ma, mplume_lag, mplume_b, gzl, delz, buoy, bdzsum,
 # kew, frem
@@ -672,3 +674,122 @@ class TestClosedColumn(unittest.TestCase):
         r = self._run()
         base, top = _COLUMN["level"][0], _COLUMN["level"][-1]
         self.assertLess(float(r.plume_mass[top]), float(r.plume_mass[base]))
+
+
+class TestPlumeGlaciation(unittest.TestCase):
+    """The per-level phase, and what a change of phase does to the parcel.
+
+    ModelE picks ``lhx`` per level from the parcel's own pre-condensation
+    temperature against ``tfmc`` (``MSTCNV.F90:1849-1854``) and records it in
+    ``VLAT(l)``. Because it then re-condenses the parcel from scratch at every
+    level -- evaporating the whole reservoir back at ``VLAT(l-1)`` and re-adding
+    it at ``lhx`` -- a change of phase re-books the latent heat of **all** the
+    condensate, not of the increment. That is worth +1.66 K on the TWP-ICE
+    period where it was measured, against an overshoot threshold of 1 K, and
+    without it the port's plume stopped nine levels below ModelE's.
+    """
+
+    def test_tfmc_is_the_default_preset(self):
+        # `tf-15d0`, the preset that also sets `max_dt_overshoot = 1d0` (which
+        # section 109 recovered as exactly 1.0 from the oracle) and
+        # `geometric_fevapfac = 0d0`. Recovered independently: the level where
+        # ModelE's dumped `lhx` switches straddles this value on 186 of 186
+        # TWP-ICE steps. A tuned GCM preset uses 251.47871, 252.36180 or
+        # 260.28967 and will need this made configurable with them.
+        self.assertAlmostEqual(bs._TFMC, 273.16 - 15.0, places=10)
+        self.assertEqual(bs._MAX_OVERSHOOT_DT, 1.0)
+
+    def test_phase_change_rebooks_the_whole_reservoir(self):
+        # Freeze a parcel that already carries condensate: the heat it gains is
+        # the latent heat of the *new* total at LHS less the latent heat of the
+        # *old* total at LHE -- not LHS times the increment.
+        mass, exner, pressure = 40.94896, 7.021307, 90612.06
+        heat, water, condensate = 1704.724, 0.6546861, 0.02265676
+        args = (jnp.array(mass), jnp.array(heat), jnp.array(water),
+                jnp.array(condensate), jnp.array(exner), jnp.array(pressure))
+        liquid_heat, _, liquid_cond = bs.resaturate_plume(
+            *args, "water", "water")
+        frozen_heat, _, frozen_cond = bs.resaturate_plume(*args, "ice", "water")
+
+        expected = (heat
+                    - gt.LHE * condensate / gt.SHA / exner
+                    + gt.LHS * float(frozen_cond) / gt.SHA / exner)
+        self.assertAlmostEqual(float(frozen_heat) / expected, 1.0, delta=1e-6)
+
+        # Whether freezing *gains* heat depends on the temperature, and the
+        # closed form above holds either way. Above ~265 K the Murphy & Koop
+        # ice fit sits above the water fit, so an ice parcel condenses less and
+        # the re-booking does not pay for it: at 292 K this fixture loses
+        # 1.9 K. In the regime where ModelE actually glaciates a plume it gains
+        # -- +0.8 K at 257 K, +1.5 K at 250 K -- and the measured TWP-ICE case
+        # (a ~257 K parcel holding 4.5 g/kg) gained 1.66 K, the reservoir being
+        # what makes it that large.
+        cold_heat = 250.0 / exner * mass
+        cold = (jnp.array(mass), jnp.array(cold_heat), jnp.array(water),
+                jnp.array(condensate), jnp.array(exner), jnp.array(pressure))
+        cold_liquid, _, _ = bs.resaturate_plume(*cold, "water", "water")
+        cold_frozen, _, _ = bs.resaturate_plume(*cold, "ice", "water")
+        gain = (float(cold_frozen) - float(cold_liquid)) * exner / mass
+        self.assertGreater(gain, 1.0)
+
+    def test_previous_phase_defaults_to_the_current_one(self):
+        # `previous_phase=None` must mean "same phase", so every caller that
+        # names one phase keeps the single-phase behaviour exactly.
+        args = (jnp.array(40.94896), jnp.array(1704.724), jnp.array(0.6546861),
+                jnp.array(0.02265676), jnp.array(7.021307),
+                jnp.array(90612.06))
+        for ph in ("water", "ice"):
+            default = bs.resaturate_plume(*args, ph)
+            explicit = bs.resaturate_plume(*args, ph, ph)
+            for a, b in zip(default, explicit):
+                self.assertEqual(float(a), float(b))
+
+    def test_ascent_reports_lhx_and_a_warm_column_stays_liquid(self):
+        # The BOMEX fixture's parcel is ~291 K throughout, well above `tfmc`,
+        # so every level the plume reaches must condense over water. This also
+        # pins that the new output is the latent heat in J/kg, the units
+        # ModelE's `mass_budget.txt` dumps `lhx` in.
+        ascent = _run_column()
+        reached = np.asarray(ascent.active)
+        lhx = np.asarray(ascent.latent_heat)
+        self.assertTrue(reached.any(), "fixture produced no ascent")
+        np.testing.assert_allclose(lhx[reached], gt.LHE)
+
+    def test_ascent_switches_phase_level_by_level(self):
+        """`lhx` is chosen per level from the parcel, not once per ascent.
+
+        Scaling the fixture's Exner profile to make the parcel cold kills the
+        ascent outright -- a parcel that cold is never buoyant -- so move the
+        threshold instead and keep the sounding. The property being pinned is
+        the one that matters: each level is decided on its own parcel
+        temperature, so the switch sits where the profile crosses `tfmc`, and
+        lowering `tfmc` moves it up.
+        """
+        switch_at = {}
+        for threshold in (291.0, 290.0, 289.0):
+            with mock.patch.object(bs, "_TFMC", threshold):
+                ascent = _run_column()
+            reached = np.asarray(ascent.active)
+            lhx = np.asarray(ascent.latent_heat)[reached]
+            self.assertTrue(reached.any(),
+                            f"no ascent at _TFMC={threshold}")
+            ice = lhx == gt.LHS
+            # Liquid below, ice above, with exactly one transition: the
+            # fixture's parcel temperature falls monotonically with height.
+            self.assertEqual(int(np.sum(np.diff(ice.astype(int)) != 0)), 1,
+                             f"_TFMC={threshold} gave {lhx.tolist()}")
+            self.assertFalse(bool(ice[0]))
+            self.assertTrue(bool(ice[-1]))
+            switch_at[threshold] = int(np.argmax(ice))
+
+        # A colder threshold freezes later, one level at a time here.
+        self.assertEqual([switch_at[t] for t in (291.0, 290.0, 289.0)],
+                         [3, 4, 5])
+
+    def test_static_ice_phase_overrides_the_switch(self):
+        # A caller that names "ice" gets an all-ice ascent, as before, even
+        # though the fixture's parcel is far above `tfmc`.
+        ascent = _run_column(phase="ice")
+        reached = np.asarray(ascent.active)
+        np.testing.assert_allclose(np.asarray(ascent.latent_heat)[reached],
+                                   gt.LHS)

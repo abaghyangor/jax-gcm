@@ -39,8 +39,16 @@ We do **not** port ModelE's analytic ``DLNQSATDT`` -- JAX provides
 exercised by the gradient tests.
 
 Following the convention of :mod:`jcm.physics.convection.saturation`, these
-functions are not ``@jit``-ed (they are inlined into the model's outer jit), and
-``phase`` is a static Python string resolved at trace time.
+functions are not ``@jit``-ed (they are inlined into the model's outer jit).
+
+``phase`` is normally the static Python string ``"water"`` or ``"ice"``, resolved
+at trace time so the unused branch is never built. It may also be a **traced
+boolean array**, true where the ice branch applies, which is what the plume
+ascent needs: ModelE sets ``lhx`` per level from the parcel's own temperature
+against ``tfmc`` (``MSTCNV.F90:1849-1854``), and which level that happens on is
+not known at trace time. Both branches are then evaluated and selected
+elementwise -- the saturation fits are two closed forms and each clips its own
+argument, so neither can contaminate the other's value or gradient.
 """
 
 import jax.numpy as jnp
@@ -67,6 +75,45 @@ _MK_WATER_TMIN, _MK_WATER_TMAX = 123.0, 332.0
 _MK_ICE_TMIN = 110.0
 
 
+def _phase_select(phase, water_value, ice_value):
+    """Pick the water or ice branch, statically or elementwise.
+
+    Args:
+        phase: ``"water"``, ``"ice"``, or a traced boolean array that is true
+            where the ice branch applies.
+        water_value: The water branch. For a traced ``phase`` this must already
+            be evaluated, so pass a value, not a thunk.
+        ice_value: The ice branch.
+
+    Returns:
+        The selected value.
+
+    """
+    if isinstance(phase, str):
+        if phase == "water":
+            return water_value
+        if phase == "ice":
+            return ice_value
+        raise ValueError(f"phase must be 'water' or 'ice', got {phase!r}")
+    return jnp.where(phase, ice_value, water_value)
+
+
+def latent_heat_of(phase) -> jnp.ndarray:
+    """Latent heat for a phase [J/kg]: ``LHE`` over water, ``LHS`` over ice.
+
+    ModelE's ``lhx``. Accepts a traced ``phase``, in which case the result is an
+    array -- which is how a freezing level inside one plume ascent is expressed.
+
+    Args:
+        phase: ``"water"``, ``"ice"``, or a traced boolean array.
+
+    Returns:
+        ``LHE``, ``LHS``, or an array of the two.
+
+    """
+    return _phase_select(phase, LHE, LHS)
+
+
 def saturation_vapor_pressure(temperature: jnp.ndarray,
                               phase: str = "water") -> jnp.ndarray:
     """Saturation vapour pressure [Pa], Murphy & Koop (2005).
@@ -77,14 +124,14 @@ def saturation_vapor_pressure(temperature: jnp.ndarray,
 
     Args:
         temperature: Temperature [K].
-        phase: ``"water"`` (uses ``LHE`` branch) or ``"ice"`` (``LHS`` branch).
-            Static, resolved at trace time.
+        phase: ``"water"`` (uses ``LHE`` branch) or ``"ice"`` (``LHS``
+            branch), or a traced boolean array true where ice applies.
 
     Returns:
         Saturation vapour pressure [Pa].
 
     """
-    if phase == "water":
+    def over_water():
         tn = jnp.clip(temperature, _MK_WATER_TMIN, _MK_WATER_TMAX)
         ln_tn = jnp.log(tn)
         return jnp.exp(
@@ -92,12 +139,18 @@ def saturation_vapor_pressure(temperature: jnp.ndarray,
             + jnp.tanh(0.0415 * (tn - 218.8))
             * (53.878 - 1331.22 / tn - 9.44523 * ln_tn + 0.014025 * tn)
         )
-    if phase == "ice":
+
+    def over_ice():
         tn = jnp.maximum(temperature, _MK_ICE_TMIN)
         return jnp.exp(
             9.550426 - 5723.265 / tn + 3.53068 * jnp.log(tn) - 0.00728332 * tn
         )
-    raise ValueError(f"phase must be 'water' or 'ice', got {phase!r}")
+
+    # A static phase builds only its own branch; a traced one needs both, and
+    # each clips its own argument so the discarded branch stays finite.
+    if isinstance(phase, str):
+        return _phase_select(phase, over_water, over_ice)()
+    return _phase_select(phase, over_water(), over_ice())
 
 
 def saturation_specific_humidity(temperature: jnp.ndarray,
@@ -111,7 +164,7 @@ def saturation_specific_humidity(temperature: jnp.ndarray,
     Args:
         temperature: Temperature [K].
         pressure: Air pressure [**Pa**] (oracle ``p_3d`` is hPa -> *100).
-        phase: ``"water"`` or ``"ice"`` (static).
+        phase: ``"water"``, ``"ice"``, or a traced boolean array.
 
     Returns:
         Saturation specific humidity [kg/kg].
@@ -134,13 +187,14 @@ def moist_static_energy(temperature: jnp.ndarray,
         temperature: Temperature [K].
         geopotential: Geopotential [m^2/s^2] (= g * height).
         specific_humidity: Specific humidity [kg/kg].
-        phase: ``"water"`` (``LHE``) or ``"ice"`` (``LHS``). Static.
+        phase: ``"water"`` (``LHE``), ``"ice"`` (``LHS``), or a traced
+            boolean array true where ice applies.
 
     Returns:
         Moist static energy [J/kg].
 
     """
-    latent_heat = LHE if phase == "water" else LHS
+    latent_heat = latent_heat_of(phase)
     return SHA * temperature + geopotential + latent_heat * specific_humidity
 
 
@@ -157,13 +211,14 @@ def d_ln_qsat_dt(temperature: jnp.ndarray, phase: str = "water") -> jnp.ndarray:
 
     Args:
         temperature: Temperature [K].
-        phase: ``"water"`` (``LHE``) or ``"ice"`` (``LHS``). Static.
+        phase: ``"water"`` (``LHE``), ``"ice"`` (``LHS``), or a traced
+            boolean array true where ice applies.
 
     Returns:
         ``d(ln qsat)/dT`` [1/K].
 
     """
-    latent_heat = LHE if phase == "water" else LHS
+    latent_heat = latent_heat_of(phase)
     return latent_heat / (RVAP * temperature ** 2)
 
 
@@ -239,7 +294,8 @@ def condensate_evaporation(dry_static_energy: jnp.ndarray,
             caller must convert, since this module's ``qsat`` is Pa-based.
         condensate: Available condensate, the cap on evaporation [same units as
             ``water_mass``].
-        phase: ``"water"`` (``LHE``) or ``"ice"`` (``LHS``). Static. ModelE
+        phase: ``"water"`` (``LHE``), ``"ice"`` (``LHS``), or a traced
+            boolean array true where ice applies. ModelE
             selects this per level via ``vlat(l)``.
 
     Returns:
@@ -277,7 +333,7 @@ def _saturation_adjustment(dry_static_energy, water_mass, exner, mass,
     convergence criterion -- ModelE stops there regardless of the residual --
     so it is reproduced verbatim.
     """
-    latent_heat = LHE if phase == "water" else LHS
+    latent_heat = latent_heat_of(phase)
     slh = latent_heat / SHA
 
     # `saturation_vapor_pressure` clips its argument to the fit's valid range,
@@ -322,7 +378,7 @@ def condensation(dry_static_energy: jnp.ndarray,
         exner: ``PLK``.
         mass: Parcel air mass.
         pressure: [**Pa**].
-        phase: ``"water"`` or ``"ice"``. Static.
+        phase: ``"water"``, ``"ice"``, or a traced boolean array.
 
     Returns:
         ``(dqsum, fcond)`` -- condensed water (>= 0, at most ``water_mass``) and

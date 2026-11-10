@@ -345,3 +345,77 @@ class TestCondensation(unittest.TestCase):
         grad = jax.grad(f)(jnp.array(qsat * 1.5))
         self.assertTrue(bool(jnp.isfinite(grad)))
         self.assertGreater(float(grad), 0.0)   # more vapour -> more condensate
+
+
+class TestTracedPhase(unittest.TestCase):
+    """``phase`` as a traced boolean array, not only a static string.
+
+    The plume ascent needs this: ModelE sets ``lhx`` per level from the parcel's
+    own temperature against ``tfmc`` (``MSTCNV.F90:1849-1854``), so which level
+    freezes is a result of the run, not something known at trace time. The
+    contract is that the traced path returns *exactly* what the two static paths
+    return, elementwise -- anything less and the static fast path and the traced
+    one are two different schemes.
+    """
+
+    def test_latent_heat_of_static_and_traced(self):
+        self.assertEqual(float(gt.latent_heat_of("water")), gt.LHE)
+        self.assertEqual(float(gt.latent_heat_of("ice")), gt.LHS)
+        mixed = gt.latent_heat_of(jnp.array([False, True]))
+        self.assertEqual([float(v) for v in mixed], [gt.LHE, gt.LHS])
+
+    def test_saturation_vapor_pressure_traced_equals_static(self):
+        t = jnp.array([280.0, 250.0])
+        traced = gt.saturation_vapor_pressure(t, jnp.array([False, True]))
+        self.assertEqual(
+            float(traced[0]),
+            float(gt.saturation_vapor_pressure(t[0], "water")))
+        self.assertEqual(
+            float(traced[1]),
+            float(gt.saturation_vapor_pressure(t[1], "ice")))
+
+    def test_condensation_traced_equals_static(self):
+        # A warm parcel condensed over water and a cold one over ice, in one
+        # call, against the same two run a static phase at a time. The two
+        # temperatures differ on purpose: at 292 K the Murphy & Koop ice fit is
+        # extrapolated past the ice regime and returns a *higher* vapour
+        # pressure than the water fit, so a warm parcel condenses nothing over
+        # ice and that arm of the test would assert against zero.
+        mass = jnp.array([40.94896, 40.94896])
+        exner = jnp.array([7.021307, 7.021307])
+        pressure = jnp.array([90612.06, 90612.06])
+        # heat/mass*exner is the parcel temperature: ~292 K and ~250 K.
+        heat = jnp.array([1704.724, 1458.300])
+        water = jnp.array([0.6546861, 0.6546861])
+        ice = jnp.array([False, True])
+        traced, _ = gt.condensation(heat, water, exner, mass, pressure, ice)
+        for i, static in enumerate(("water", "ice")):
+            expect, _ = gt.condensation(heat[i], water[i], exner[i], mass[i],
+                                        pressure[i], static)
+            self.assertGreater(float(expect), 0.0)
+            # Not bit-exact, unlike the saturation fits above: the saturation
+            # adjustment is a three-pass Newton loop, and the vectorized form
+            # does not reassociate its arithmetic identically to two scalar
+            # runs. Measured at ~1e-6 relative, which is float32 round-off
+            # through three passes, and four orders below the 13% that
+            # choosing the wrong phase would cost.
+            self.assertAlmostEqual(float(traced[i]) / float(expect), 1.0,
+                                   delta=1e-5)
+
+    def test_invalid_phase_string_still_raises(self):
+        with self.assertRaises(ValueError):
+            gt.saturation_vapor_pressure(jnp.array(280.0), "slush")
+
+    def test_traced_phase_is_differentiable(self):
+        # Both branches are built under a traced phase, so a NaN in the
+        # discarded one would survive the `where` and poison the gradient --
+        # the failure mode `safe_divide` exists for. Each branch clips its own
+        # argument, so neither can.
+        ice = jnp.array([False, True])
+
+        def total(t):
+            return jnp.sum(gt.saturation_vapor_pressure(t, ice))
+
+        grad = jax.grad(total)(jnp.array([280.0, 250.0]))
+        self.assertTrue(bool(jnp.all(jnp.isfinite(grad))))
+        self.assertTrue(bool(jnp.all(grad > 0.0)))
