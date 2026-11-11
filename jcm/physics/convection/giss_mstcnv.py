@@ -644,25 +644,46 @@ class GissConvection(PhysicsTerm):
         # guarantees the difference stays positive in a column that produced
         # almost no rain.
         #
-        # Only the *clear-air* evaporation belongs here. `descent.evaporated`,
-        # the rain that evaporates into the downdraft itself, acts on the
-        # downdraft's own condensate allocation rather than on this falling
-        # flux and is accounted for with it; netting that as well takes BOMEX
-        # to 0.29x ModelE's `mcp`.
+        # **Both** evaporation terms come off, because ModelE's surface
+        # precipitation is a falling flux that is depleted on the way down:
+        # `prcpmc = prcpmc + prcp_d + prcp_e` accumulated inside the downdraft
+        # descent (MSTCNV.F90:5154-5155), with `condpr(l)` added where
+        # `l >= lcl` and the flux evaporating at every level below
+        # (MSTCNV.F90:5087-5097). Verified against the oracle: `prcpd + prcp_e`
+        # from the lowest descent row of each plume reproduces ModelE's own
+        # `mcp` to a median ratio of 1.0020 over the 223 active TWP-ICE periods.
         #
-        # What this fixes, against the oracle, is the typical period: the
-        # median port/ModelE `mcp` moves from 1.120/1.294/1.516 to
-        # 0.964/1.015/1.432 on BOMEX/RICO/TWP-ICE. What it does not fix is a
-        # heavy upper tail -- the means stay 1.21-1.46 with p90 3.27 (BOMEX)
-        # and 7.04 (TWP-ICE), so a few periods still rain far too much. That
-        # residue is *not* the rain/cloud split: the condensate the port
-        # detrains as cloud is 0.97-0.98 of ModelE's, its microphysics
-        # partition matches the dumped `condp_raw` exactly (1.0000, corr
-        # +1.0000 over 1035 level-calls), and the overflow fires on 48-57% of
-        # live levels as ModelE's does. BOMEX's period-to-period correlation
-        # also stays ~0 (+0.002) even with the level now right.
+        # Where ModelE's falling rain goes, as a fraction of what it produced:
+        #
+        #   case      into the downdraft   into clear air   delivered
+        #   BOMEX           69.5%              9.7%           20.7%
+        #   TWP-ICE         36.0%              3.5%           63.3%
+        #
+        # so the **downdraft is the dominant sink** -- 98% of the depletion on
+        # TWP-ICE -- and netting only the clear-air term left the port
+        # delivering 95.7% of its production against ModelE's 63.3%, i.e. 1.376x
+        # ModelE's surface rain with 40 of 223 periods over 3x.
+        #
+        # An earlier version of this comment said netting the downdraft term as
+        # well "takes BOMEX to 0.29x ModelE's `mcp`" and kept it out. That is
+        # not what the oracle shows: ModelE delivers only 20.7% on BOMEX, the
+        # port's own downdraft evaporation there is 69.2% of production against
+        # ModelE's 69.5% -- a ratio of 1.00 -- and netting it lands the port at
+        # 21.4% delivered. Netting is what makes BOMEX right.
+        #
+        # What remains after this is a *magnitude* error in the term, not a
+        # question of whether to subtract it: the port's downdraft evaporates
+        # 1.00x ModelE's on BOMEX but only **0.46x** on TWP-ICE (16.5% of
+        # production against 36.0%). That is the next thing to chase, and
+        # `dqevp` is dumped per level in `downdraft_diag.txt` for it. See
+        # sections 125-126 of `BSORT_PORT_PLAN.md` in the bridge.
+        #
+        # Clamped at zero because the three sums are accumulated independently
+        # and nothing guarantees the difference stays positive in a column that
+        # produced almost no rain.
         surface_rain = jnp.maximum(
-            jnp.sum(column.precipitation - column.evaporation, axis=0), 0.0)
+            jnp.sum(column.precipitation - column.evaporation
+                    - column.downdraft_evaporation, axis=0), 0.0)
         mcp = surface_rain / dtsrc * 86400.0
         return dtemp_dt, dq_dt, dth_mc, dq_mc, mcp
 
