@@ -407,7 +407,8 @@ def run_plume(cloud_base: jnp.ndarray,
               iplume: jnp.ndarray = 2,
               source_dtheta: jnp.ndarray = 0.0,
               source_dq: jnp.ndarray = 0.0,
-              phase: str = "water") -> PlumeCycle:
+              phase: str = "water",
+              geometry: ColumnGeometry = None) -> PlumeCycle:
     """Run one plume and return what it does to the environment.
 
     Args:
@@ -431,13 +432,42 @@ def run_plume(cloud_base: jnp.ndarray,
         cloud_base_velocity: ``wbases(iplume)`` [m/s].
         entrainment_efficiency: ``enteff``.
         phase: ``"water"`` or ``"ice"``. Static.
+        geometry: The column's frozen `TL`/`rho0`/`TVL`/`DELZ` profiles. ModelE
+            forms these once per timestep, before any plume, so a caller
+            running several plumes against one evolving column must build them
+            from the *incoming* column and pass the same object to every plume.
+            Defaults to deriving them from this call's own
+            ``potential_temperature`` and ``specific_humidity``, which is only
+            equivalent for the first plume.
 
     Returns:
         A :class:`PlumeCycle`.
 
     """
-    geometry = column_geometry(potential_temperature, specific_humidity,
-                               layer_mass, exner, pressure, height)
+    # ModelE derives `TL`, `rho0` and `TVL(:)` **once**, in the setup block
+    # before any plume runs (`MSTCNV.F90:1233,1252`), and never recomputes them:
+    # `TL` is the caller's temperature, and the only later assignment
+    # (`TL(L)=(SM(L)*BYMA(L))*PLK(L)`, `:5659`) is in `mstcnv_optics`, a routine
+    # that runs after the convection. `MA` is constant through a step too --
+    # zero spread over the 4,270 `(step, level)` pairs more than one plume
+    # reaches -- so `DELZ = MA(L)/RHO0(L)` (`:3731`) is frozen as well.
+    #
+    # Rebuilding the geometry here instead derives it from whatever the
+    # *previous* plumes left in the column, which is the environment the caller
+    # passes. That is right for `senv`/`qenv`, which ModelE really does read
+    # live (`SUP = SM(L)*BYMA(L)`, `:1782`), and wrong for these: on TWP-ICE
+    # period 57 the level-6 `tvl` drifted 296.968 -> 297.208 -> 297.461 across
+    # the eight cloud-base candidates, and +0.486 K of that was enough to turn
+    # the buoyancy one level above cloud base negative (-5.44e-4) where ModelE
+    # has it positive, detraining half the plume's mass per level instead of
+    # entraining.
+    #
+    # So a caller that runs several plumes against one column builds this once
+    # and passes it in; `convective_column` does. Building it here is kept for
+    # a caller running a single plume, where the two are identical.
+    if geometry is None:
+        geometry = column_geometry(potential_temperature, specific_humidity,
+                                   layer_mass, exner, pressure, height)
 
     removal, parcel_heat, parcel_water, parcel_condensate = source_parcel(
         potential_temperature, specific_humidity, layer_mass, cloud_base_mass,
@@ -1055,6 +1085,12 @@ def convective_column(potential_temperature: jnp.ndarray,
     cloud_base_mass = cloud_base_mass.astype(dtype)
     environment_condensate = environment_condensate.astype(dtype)
 
+    # Built from the incoming column and held fixed for every candidate, as
+    # ModelE's setup block does. The scan's carry is the environment and does
+    # evolve; these do not. See `run_plume`.
+    frozen_geometry = column_geometry(potential_temperature, specific_humidity,
+                                      layer_mass, exner, pressure, height)
+
     def one_candidate(carry, offset):
         (theta, q, mass_flux, precipitation, evaporation, downdraft_evap,
          env_air, count, top, base_mass) = carry
@@ -1105,7 +1141,8 @@ def convective_column(potential_temperature: jnp.ndarray,
             iplume=this_iplume,
             source_dtheta=source_dtheta,
             source_dq=source_dq,
-            phase=phase)
+            phase=phase,
+            geometry=frozen_geometry)
 
         def keep(value):
             return jnp.where(convects, value, 0.0)

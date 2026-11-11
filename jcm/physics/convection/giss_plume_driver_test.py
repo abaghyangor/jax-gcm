@@ -595,3 +595,89 @@ class TestPresetConstants(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FrozenGeometryTest(unittest.TestCase):
+    """`TL`, `rho0`, `TVL` and `DELZ` are formed once per step, not per plume.
+
+    ModelE builds them in the setup block before any plume runs
+    (``MSTCNV.F90:1233,1252``) and never recomputes them: the only later
+    assignment to ``TL`` is in ``mstcnv_optics``, which runs after the
+    convection, and ``MA`` is constant through a step -- zero spread over the
+    4,270 ``(step, level)`` pairs that more than one plume reaches -- so
+    ``DELZ = MA(L)/RHO0(L)`` is frozen as well.
+
+    Rebuilding them per candidate instead derives them from whatever the
+    previous plumes left behind. Measured on TWP-ICE period 57, the level-6
+    ``tvl`` drifted 296.968 -> 297.208 -> 297.461 across the eight candidates,
+    and +0.486 K of drift was enough to flip the buoyancy one level above cloud
+    base negative where ModelE has it positive.
+    """
+
+    NLEV = 20
+
+    def _record(self, **over):
+        """Run the sweep, capturing the geometry each candidate was handed."""
+        seen = []
+        original = drv.run_plume
+
+        def spy(*a, **k):
+            seen.append(k["geometry"])
+            return original(*a, **k)
+
+        col = _column()
+        level = jnp.arange(self.NLEV)
+        mass = jnp.zeros_like(col["layer_mass"])
+        for b in (4, 6):
+            mass = jnp.where(level == b, 40.0, mass)
+        args = dict(cloud_base_mass=mass, boundary_layer_top=jnp.array(3),
+                    highest_base=jnp.array(6), timestep=jnp.array(1800.0),
+                    max_plumes=6, **col)
+        args.update(over)
+        drv.run_plume = spy
+        try:
+            drv.convective_column(**args)
+        finally:
+            drv.run_plume = original
+        return col, seen
+
+    def test_every_candidate_is_handed_the_same_geometry(self):
+        col, seen = self._record()
+        self.assertTrue(seen, "run_plume was never called")
+        # The scan body is traced once, so a single capture already proves the
+        # geometry is a closure constant rather than a function of the carry;
+        # assert on whatever the trace produced.
+        first = seen[0]
+        for other in seen[1:]:
+            for a, b in zip(first, other):
+                np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+    def test_it_is_the_incoming_column_not_an_evolved_one(self):
+        col, seen = self._record()
+        expected = drv.column_geometry(
+            col["potential_temperature"], col["specific_humidity"],
+            col["layer_mass"], col["exner"], col["pressure"], col["height"])
+        for got, want in zip(seen[0], expected):
+            np.testing.assert_allclose(np.asarray(got), np.asarray(want),
+                                       rtol=0, atol=0)
+
+    def test_run_plume_still_builds_its_own_when_not_given_one(self):
+        # A caller running a single plume needs no frozen copy, and the two are
+        # identical there. Keeping the fallback means every existing caller and
+        # test is unaffected by the new argument.
+        col = _column()
+        kwargs = dict(
+            cloud_base=jnp.array(5), source_bottom=jnp.array(3),
+            source_top=jnp.array(4), boundary_layer_top=jnp.array(3),
+            cloud_base_mass=jnp.array(40.0), timestep=jnp.array(1800.0),
+            potential_temperature=col["potential_temperature"],
+            specific_humidity=col["specific_humidity"],
+            layer_mass=col["layer_mass"], exner=col["exner"],
+            pressure=col["pressure"], height=col["height"])
+        implicit = drv.run_plume(**kwargs)
+        explicit = drv.run_plume(**kwargs, geometry=drv.column_geometry(
+            col["potential_temperature"], col["specific_humidity"],
+            col["layer_mass"], col["exner"], col["pressure"], col["height"]))
+        np.testing.assert_array_equal(
+            np.asarray(implicit.ascent.plume_mass),
+            np.asarray(explicit.ascent.plume_mass))
