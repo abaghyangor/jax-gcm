@@ -1,0 +1,74 @@
+# ECHAM atmospheric physics with GISS ModelE moist convection (`MSTCNV`)
+# in place of Tiedtke-Nordeng.
+#
+#     python -m jcm.main physics=echam-giss-conv
+#
+# `allow_mc` mirrors ModelE's `SCMopt%allowMC` and must be **true** here.
+# The term's own default is `false`, which runs a diagnostic-only path and
+# returns zero tendencies; that default exists so the term can be built and
+# inspected without the tendency chain, and is not a configuration to run as
+# physics.
+#
+# This file is **standalone** -- it does not inherit `echam` -- because
+# `cfg.physics.terms` is an **ordered** mapping and that order is the execution
+# order (`runners.build_physics`). OmegaConf merges dicts by key, so inheriting
+# `echam` and nulling `tiedtke_convection` appends the new entry at the end,
+# which would run convection after the cloud microphysics and the gravity-wave
+# drag instead of before them. Keep the term list and the two settings below in
+# step with `echam.yaml`; only the convection slot differs.
+#
+# Validation status, so this is not mistaken for a tuned or supported preset.
+# The term is validated in **single column** against a ModelE SCM run of the
+# TWP-ICE case (Darwin, 766 timesteps) through `modele-jcm-bridge`. Against that
+# oracle it produces 0.910 of ModelE's convective rain and delivers 0.923 of its
+# surface flux, with the cloud-base count per step and the mean cloud top both
+# matching. It has **never been run in a global configuration**. Known gaps, all
+# recorded in `docs/source/design/giss_convection_port.md`:
+#
+#   * the *precipitation* phase is all-liquid and the ice microphysics is
+#     unported (the *condensation* phase is per-level; see
+#     `MIXED_PHASE_SUPPORTED` in `giss_mstcnv.py`). Measured at 1.1% of the
+#     production deficit on a tropical case, which is case-specific and must be
+#     re-sized before this is trusted outside the tropics;
+#   * ModelE's cold-pool fraction, penetrative mass and running cloud-top
+#     pressure are prognostic there and are read here as optional diagnostics,
+#     defaulting to zero when absent;
+#   * elevated single-layer convective sources are not found at all.
+#
+# Treat this as a research configuration.
+# Mirrors `echam.yaml`.
+vectorize_columns: true
+checkpoint_terms: true
+
+terms:
+  moist_air_state:
+    _target_: jcm.physics.diagnostics.moist_air_state.MoistAirColumnState
+  echam_boundary_conditions:
+    _target_: jcm.physics.forcing.echam_boundary_conditions.EchamBoundaryConditions
+  macv2_sp_aerosol:
+    _target_: jcm.physics.aerosol.Macv2SpAerosol
+  simple_chemistry:
+    _target_: jcm.physics.chemistry.SimpleChemistry
+  sundqvist_cloud_fraction:
+    _target_: jcm.physics.clouds.sundqvist.SundqvistCloudFraction
+  rrtmgp_radiation:
+    _target_: jcm.physics.radiation.rrtmgp.RRTMGPRadiation
+  # ECHAM physc ordering, unchanged: vdiff (with the surface exchange in its
+  # implicit solve) runs BEFORE convection, and echam_surface follows vdiff
+  # directly because it only republishes the vdiff-delivered fluxes.
+  tte_tke_vertical_diffusion:
+    _target_: jcm.physics.vertical_diffusion.tte_tke.TteTkeVerticalDiffusion
+  echam_surface:
+    _target_: jcm.physics.surface.echam.surface_physics.EchamSurface
+  # The convection slot: GISS MSTCNV instead of Tiedtke-Nordeng.
+  giss_convection:
+    _target_: jcm.physics.convection.giss_mstcnv.GissConvection
+    allow_mc: true
+  echam_1m_microphysics:
+    _target_: jcm.physics.clouds.echam_1m.Echam1MMicrophysics
+  echam_surface_exchange:
+    _target_: jcm.physics.surface.echam.surface_exchange_publisher.EchamSurfaceExchange
+  hines_gwd:
+    _target_: jcm.physics.gravity_waves.hines.HinesGwd
+  lott_miller_sso:
+    _target_: jcm.physics.gravity_waves.sso.LottMillerSso
