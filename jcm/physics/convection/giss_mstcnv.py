@@ -89,6 +89,7 @@ from jcm.forcing import ForcingData
 from jcm.terrain import TerrainData
 from jcm.physics.modele.params import GissConvectionParameters
 from jcm.physics.modele.physics_data import GissConvectionData
+from jcm.physics.convection import giss_bsort as bsort
 from jcm.physics.convection.giss_cloud_base import lifting_condensation_level
 from jcm.physics.convection.giss_mass_flux import (
     _TADJ_CLOSURE2_SECONDS,
@@ -168,34 +169,46 @@ _MODELE_THETA_SCALE = 1000.0 ** KAPA
 _MAX_PLUME_CANDIDATES = 8
 
 # ModelE's `tfmc`, the parcel temperature below which condensate forms as ice
-# (`tf - 15d0` in the preset this port targets, MSTCNV.F90:301). Recorded, not
-# used: this port is **all-liquid**, and the constant is here so the boundary of
-# that assumption is stated in the code rather than only in the plan.
+# (`tf - 15d0` in the preset this port targets, MSTCNV.F90:301).
 #
-# Making the port mixed-phase is not a matter of threading a per-level flag.
-# ModelE's criterion (MSTCNV.F90:1716-1721) is
+# The **condensation** phase is now chosen per level, from the parcel's own
+# pre-condensation temperature against this threshold, exactly as ModelE does
+# (MSTCNV.F90:1842-1854) -- see `giss_bsort.plume_ascent`. That matters far more
+# than a choice of latent heat, because ModelE re-condenses the parcel from
+# scratch at every level, so crossing `tfmc` re-books the latent heat of the
+# whole condensate reservoir: measured at +1.66 K on the TWP-ICE level where it
+# happens, against an overshoot threshold of 1 K, and worth 14.3% of the port's
+# production deficit and 1.5 levels of mean cloud top.
 #
-#     if(tp .ge. tfmc) then ; lhx = lhe ; if(VLAT(L).eq.LHS) LHX=LHS
-#     else                  ; lhx = lhs ; endif
+# **What is still all-liquid** -- so `MIXED_PHASE_SUPPORTED` stays false:
 #
-# which depends on the *parcel* temperature as it ascends -- so it is computed
-# inside the scan -- and latches through `VLAT(L)`, so it is path-dependent
-# state that has to be carried. There is also a second, separate phase field
-# `lhp(l)` for the precipitation (MSTCNV.F90:4295-4302), and the reason for
-# tracking both is the melting/freezing heat redistribution
-# `heat1(l) += (vlat(l)-lhp(l))*condpr(l)*bysha`, which is likewise not ported.
+#  * the *precipitation* phase. ModelE carries a second, separate phase field
+#    `lhp(l)` for the falling condensate (MSTCNV.F90:4295-4302), and tracks both
+#    in order to redistribute the melting/freezing heat as
+#    `heat1(l) += (vlat(l)-lhp(l))*condpr(l)*bysha`. Neither is ported.
+#  * the ice microphysics. `giss_microphysics` is the warm-rain partition
+#    (`PRECIPLIQ_GAMMA`) only; ModelE's live path also needs `PRECIPICE_GAMMA`
+#    and a `PRECIP_MP` graupel blend, about 500 lines of Fortran. Measured as an
+#    **accepted limitation**: over 223 TWP-ICE periods the levels ModelE runs in
+#    the ice phase are already at 0.991 of its rain and carry 1.1% of the
+#    deficit, against 0.883 and 98.9% for the water levels. That number is
+#    case-specific -- only 12.0% of ModelE's rain here falls at ice levels -- so
+#    it must be re-sized before this term is trusted outside the tropics.
+#  * ModelE's cross-plume latching of the phase through `VLAT(L)`/`TPSAV(L)`,
+#    which are column arrays shared by every plume of the timestep. The port
+#    decides per plume. Measured inert on this case: the two disagree on 3
+#    `(step, level)` pairs out of 3,772, none on an active period.
 #
-# BOMEX is all-liquid on every level and every step, and so is a warm
-# stratocumulus case, but **TWP-ICE is not**: its parcel temperature crosses
-# `tfmc` at level 34 (396 hPa), and above that crossing ModelE forms 11.4% of
-# its `condpr` and 34% of its `dwm` as ice (measured over 223 active periods;
-# section 101 of `BSORT_PORT_PLAN.md` in the bridge). So the limitation now has
-# an oracle that can check it, and the cost of leaving it out is bounded rather
-# than unknown: the same measurement puts 95% of the port's 12% production
-# deficit *below* the crossing, and above it the port is at 0.956x, so this is
-# not what drives that bias.
-_FREEZING_THRESHOLD = 273.15 - 15.0     # K, ModelE `tfmc`
-MIXED_PHASE_SUPPORTED = False
+# See sections 115-117 of `BSORT_PORT_PLAN.md` in the bridge for the
+# measurements behind each of these.
+# One value, shared with the ascent that acts on it. ModelE's `tf` is 273.16,
+# not 273.15, and the difference is not cosmetic here: the threshold was
+# recovered from the oracle, where the level ModelE's dumped `lhx` switches on
+# straddles 258.16 K on 186 of 186 TWP-ICE steps.
+_FREEZING_THRESHOLD = bsort._TFMC
+MIXED_PHASE_CONDENSATION = True
+MIXED_PHASE_PRECIPITATION = False
+MIXED_PHASE_SUPPORTED = MIXED_PHASE_CONDENSATION and MIXED_PHASE_PRECIPITATION
 
 
 # Plume-ascent constants used by the (allow_mc) tendency path. These are physical

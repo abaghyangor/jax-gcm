@@ -537,18 +537,27 @@ class TestPhaseAssumption(unittest.TestCase):
         self.term = GissConvection(allow_mc=True)
 
     def test_flag_states_the_limitation(self):
-        from jcm.physics.convection import giss_mstcnv
+        from jcm.physics.convection import giss_bsort, giss_mstcnv
+        # The *condensation* phase is chosen per level now; the precipitation
+        # phase and the ice microphysics are not, so the term as a whole is
+        # still not mixed-phase.
+        self.assertTrue(giss_mstcnv.MIXED_PHASE_CONDENSATION)
+        self.assertFalse(giss_mstcnv.MIXED_PHASE_PRECIPITATION)
         self.assertFalse(giss_mstcnv.MIXED_PHASE_SUPPORTED)
-        # `tf - 15`, the threshold ModelE would switch on.
-        self.assertAlmostEqual(giss_mstcnv._FREEZING_THRESHOLD, 258.15, places=6)
+        # `tf - 15` with ModelE's `tf = 273.16`, recovered from the oracle: the
+        # level its dumped `lhx` switches on straddles this on 186 of 186
+        # TWP-ICE steps. One value, shared with the ascent that acts on it.
+        self.assertAlmostEqual(giss_mstcnv._FREEZING_THRESHOLD, 258.16,
+                               places=6)
+        self.assertIs(giss_mstcnv._FREEZING_THRESHOLD, giss_bsort._TFMC)
 
     def test_sub_freezing_column_stays_finite(self):
-        """Below `tfmc` the answer is liquid-phase, which ModelE's would not be.
+        """A cold column still has to stay finite.
 
-        The requirement here is only that the scheme degrades quietly rather
-        than returning NaN, so that a global run cannot be poisoned by a cold
-        column. Its *accuracy* there is not claimed and is not tested, because
-        nothing available can check it.
+        Its condensation is now ice-phase, but its precipitation is not, so the
+        answer below `tfmc` is still not ModelE's. The requirement here is only
+        that the scheme degrades quietly rather than returning NaN, so a global
+        run cannot be poisoned by a cold column.
         """
         from jcm.physics.convection import giss_mstcnv
         cold = self.state.copy(
