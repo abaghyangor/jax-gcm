@@ -153,20 +153,52 @@ _MODELE_THETA_SCALE = 1000.0 ** KAPA
 #   RICO           1.11          1.10   +0.988 -> +0.987  0.976 -> 0.988
 #   TWP-ICE        1.75          1.76   +0.893 -> +0.912  0.939 -> 1.067
 #
-# and all three keep their cloud-base match (48/48, 46/46, 249/251). BOMEX and
-# RICO converge by width 4 and TWP-ICE by 8, which is why 8 is the default:
-# width 24 moves TWP-ICE by 0.02 bases/step and 0.001 in peak ratio and the
-# other two not at all, so wider only costs trace length. What is left is one *extra* base on 11 of 48
-# BOMEX steps -- never two, and never a missing one -- so the closure is still
-# slightly too permissive per base, and TWP-ICE now overshoots peak heating by
-# 7% where it used to undershoot by 6%.
+# and all three keep their cloud-base match (48/48, 46/46, 249/251). What is
+# left is one *extra* base on 11 of 48 BOMEX steps -- never two, and never a
+# missing one -- so the closure is still slightly too permissive per base, and
+# TWP-ICE now overshoots peak heating by 7% where it used to undershoot by 6%.
 #
-# What is still unported is the other branch of `:2687`: above `lmax_disp`
-# ModelE collapses the source to a single layer and applies a
-# TKE-against-stratification test, while the port uses the full boundary-layer
-# source at every candidate. It only bites above the displacement top, which
-# this sweep does not reach.
-_MAX_PLUME_CANDIDATES = 8
+# **Why 16 and not 8.** This was 8 on the grounds that BOMEX and RICO converge
+# by width 4 and TWP-ICE by 8, with width 24 moving TWP-ICE by only 0.02
+# bases/step. That measurement stands -- widening recovers a base on 3 of the
+# 223 active TWP-ICE periods, which is 0.013 bases/period -- but it was the
+# wrong quantity to decide on. Those three periods are ones where the port
+# converted at *fewer* bases than ModelE, and at 16 their base counts match it
+# exactly (3/3, 2/2, 2/2); the production they carry is +0.066 mm/day, or 3.7%
+# of the deficit that remained once the per-level phase and the frozen geometry
+# were fixed. A width that leaves a base ModelE converts at unreachable is
+# unfaithful however little it moves a column mean, and 8 was our own
+# invention: ModelE has no candidate limit at all, its `cloud_base` loop
+# running downward from `lmcm-1` to `dcl` (MSTCNV.F90:1505-1523, with
+# `lmcm = ls1-1`), which is the whole troposphere.
+#
+# The rain overshoots on two of the three (period 93 goes 0.913 -> 1.117 of
+# ModelE, period 33 1.041 -> 1.051) while period 312 improves, 0.719 -> 0.816;
+# on the three together the absolute error falls 4.6% -> 3.2%. That spread is
+# the buoyancy sort's threshold sensitivity, not the width: the sort's fates
+# turn on ~1.7e-4 in blend buoyancy and the port reproduces it to ~2e-4, so a
+# recovered base cannot be expected to land on ModelE's mass. The base count is
+# the part that is free to be right.
+#
+# **Do not raise this further without re-timing it.** Measured on eight periods
+# with the host otherwise idle: width 8 costs 3.72 s/period, width 16 costs
+# 5.41 s (1.45x), and width 24 costs **129.91 s (35x)** while changing not one
+# number in the results. The per-candidate work is linear, so that is XLA
+# leaving a fast path somewhere between 16 and 24, and it is paid on every
+# column of every step in a global run.
+#
+# What is still unported is the other branch of the source-block choice
+# (MSTCNV.F90:2838-2848): above `lmax_disp` ModelE collapses the source to a
+# single layer and applies a TKE-against-stratification test, while the port
+# uses the full boundary-layer source at every candidate. On TWP-ICE that fires
+# on 8 of ModelE's 9,240 converting bases -- 0.1% -- but two of those are the
+# largest single production losses in the case, periods 102 and 276, where
+# ModelE converts at levels 45 and 50 and takes 51% and 77.5% of the period's
+# rain from there. No width reaches them: `closure_base` is 15 and 16, and a
+# sweep deep enough would be far past the cost cliff above. Capturing them needs
+# an elevated-layer search separate from this window, plus `wturb` supplied like
+# `fcp` and `mwpen`. See section 120 of `BSORT_PORT_PLAN.md` in the bridge.
+_MAX_PLUME_CANDIDATES = 16
 
 # ModelE's `tfmc`, the parcel temperature below which condensate forms as ice
 # (`tf - 15d0` in the preset this port targets, MSTCNV.F90:301).
