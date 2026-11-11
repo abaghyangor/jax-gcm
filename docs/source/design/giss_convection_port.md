@@ -1,11 +1,16 @@
 # GISS ModelE moist convection → JCM: design and porting notes
 
-Status: in progress. This note documents the conversion of the GISS ModelE
+Status: the scheme runs end to end and produces tendencies, validated in single
+column against a ModelE SCM oracle; it is **not** a supported global
+configuration. This note documents the conversion of the GISS ModelE
 moist-convection routine `MSTCNV` (Fortran) into JCM, the design decisions, and
 the physical meaning of each ported piece. It is the narrative companion to the
 code under `jcm/physics/convection/giss_*` and the infrastructure under
-`jcm/physics/modele/`. See also `jcm/physics/modele/README.md` (layout) and
-`STATUS.md` (current state).
+`jcm/physics/modele/`. See also `jcm/physics/modele/README.md` (layout).
+
+Run it with `python -m jcm.main physics=echam-giss-conv`, which puts the term in
+ECHAM's convection slot with `allow_mc: true`. The term's own default is
+`allow_mc=False`, a diagnostic-only path that returns zero tendencies.
 
 ## 1. Goal and method
 
@@ -22,21 +27,36 @@ boundary-layer cloud field campaigns are the relevant test cases.
 
 ### The oracle and the validation boundary
 
-The available oracle is **DYCOMS-II RF02**, a *stratocumulus* case. Its
-convective diagnostics (`dq_mc`, `dth_mc`, `mcp`) are **identically zero**: the
-plume scheme never triggers (stratocumulus is handled by large-scale
-condensation, not convective plumes). Consequences:
+Three ModelE SCM oracles are available, in increasing order of convective
+activity, and the validation boundary has moved with them:
 
-- **Pointwise physics** (saturation, energies, buoyancy, cloud-base level) is
-  validated by physical reasoning and unit tests — independent of the oracle.
-- **Magnitudes** (mass flux, and eventually tendencies) cannot be validated on
-  DYCOMS. They need a *convectively active* case — **BOMEX** (shallow cumulus),
-  then **RICO** (cumulus with precipitation) — which specifically exercise the
-  shallow-convection plumes.
+| case | character | what it exercises |
+|------|-----------|-------------------|
+| DYCOMS-II RF02 | stratocumulus | nothing: `dq_mc`, `dth_mc`, `mcp` are identically zero, the plume never triggers |
+| BOMEX | shallow cumulus | the shallow plume, one cloud base per step, almost no rain |
+| RICO | cumulus with precipitation | the microphysics partition |
+| TWP-ICE | tropical deep convection (Darwin, 766 steps) | everything: multiple bases, deep ascent, downdrafts, the ice transition |
 
-This boundary is the single most important thing to keep in mind when reading
-the code: every port is marked as "validated by reasoning" or "magnitude pending
-an active oracle".
+TWP-ICE is the case the port is now measured on, because it is the only one that
+exercises the deep plume and the phase change. Against it the port currently
+produces **0.910** of ModelE's convective rain and delivers **0.923** of its
+surface flux, with the cloud-base count per step (1.744 against 1.744) and the
+mean cloud top both matching.
+
+Instrumented ModelE dumps, not SUBDD output, are what make this possible. The
+`modele-jcm-bridge` repository carries the patches that add them (20 dumps, from
+the closure's bisection trace to the per-level plume mass budget and the entry
+column) and `BSORT_PORT_PLAN.md` records every measurement against them. Several
+conclusions in this document would have been wrong without that: the SUBDD
+`mc_*` diagnostics this port was first written against are self-registering and
+this SCM configuration never emits them.
+
+**What the oracle cannot settle.** Three of ModelE's inputs are prognostic there
+and are read here as optional diagnostics that default to zero when absent — the
+cold-pool fraction `fcp`, the penetrative mass `mwpen`, and the running
+cloud-top pressure `pmct`. A port validated against TWP-ICE with those supplied
+is not yet a GCM-ready scheme, and that gap is a design question rather than a
+measurement one.
 
 ## 2. Repository layout (separation of concerns)
 
@@ -118,7 +138,10 @@ saturated at the interface. `cloud_base_instability` / `cloud_base_triggers`.
 
 The sign convention was verified by reading the source (`SM=TH*MA`, `PLK=PL^KAPA`)
 and corroborated by worked unstable / stable-but-saturated / subsaturated test
-cases. Structure is faithful; absolute values remain pending an active oracle.
+cases. It is now also checked against the oracle: `dmse0` matches ModelE's to
+three decimals once ModelE's own `sm`/`qm` are supplied, which is what localised
+the remaining cloud-base losses to the environment left by the port's *earlier*
+plumes rather than to the trigger itself.
 
 ### 3.6 Mass-flux closure — how vigorous
 `jcm/physics/convection/giss_mass_flux.py`
@@ -128,28 +151,47 @@ instability. `MASS_FLUX2` finds, by **bisection**, the plume mass fraction
 `FPLUME` that restores the cloud base to neutral (`DMSE1 → 0`), including
 compensating subsidence of the layers above and a small precip re-evaporation.
 
-`cloud_base_mass_flux` is the **single-source-level (`nlpi=1`)** port (the common
-case; the multi-source blend is deferred). Magnitude is **not yet
-oracle-validated**: tests assert closure *behaviour* (the bisection drives
-`DMSE1` toward neutral; a more unstable column needs more flux), not Fortran
-agreement.
+`cloud_base_mass_flux` implements the **multi-source (`nlpi > 1`)** blend with
+the boundary-layer-top `fpi` zeroing, not just the `nlpi = 1` special case: with
+the removal spread over several source levels `DMSE1` is nearly insensitive to
+`fplume`, which is what lets ModelE's bisection climb to 0.68 where a
+single-source form stops near 0.31. The source parcel also carries ModelE's
+`tstar`/`qstar` surface-flux enhancement; the two are synergistic and neither
+reproduces the oracle alone.
+
+Magnitude **is** oracle-validated now. Over the count-matched TWP-ICE periods
+the port's cloud-base mass is 0.977 of ModelE's in aggregate, with a median of
+1.001 per base and exact agreement (0.998-1.001) for every base at level 8 and
+above; it errs only at the lowest bases, `lmin` 4 (0.762) and 7 (0.909). The
+cold-pool source blend ModelE applies where a downdraft exists is reproduced
+bit-for-bit when its four inputs are supplied.
+
+The candidate sweep is `_MAX_PLUME_CANDIDATES = 16` wide, counting down from the
+displacement top. ModelE has no such limit — its `cloud_base` loop runs from
+`lmcm-1` down to `dcl` — so this is a port artifact, and 16 is where TWP-ICE's
+base count stops changing. Do not raise it without re-timing: 8 costs 3.72
+s/period, 16 costs 5.41 s, and 24 costs **129.91 s** while changing no result.
 
 ### 3.7 Term integration — cloud-base diagnostic from model state
 `jcm/physics/convection/giss_mstcnv.py`
 
-`GissConvection.__call__` now diagnoses the cloud base from a real
-`PhysicsState` when a `pressure_full` (Pa) diagnostic is present (consumed from
-the diagnostics dict, as tiedtke/betts_miller do). It writes
-`diagnostics["convection"].cloud_base`. **Tendencies remain zero** — converting
-the mass-flux closure into temperature/humidity tendencies is the next step and
-needs an active oracle to validate.
+`GissConvection.__call__` diagnoses the cloud base from a real `PhysicsState`
+and, with `allow_mc=True`, runs the full chain: the closure, the candidate sweep
+over cloud bases, the buoyancy-sorting plume ascent, the downdraft descent, and
+the tendency assembly. It writes a `GissConvectionData` under the public
+`"convection"` diagnostics key and returns temperature and humidity tendencies.
 
-Two integration details:
+Three integration details:
 - **Vertical orientation.** JCM orders the column index 0 = top / last = surface;
-  the ported GISS routines are surface-first. The term flips the column before
-  the lift (documented in `_diagnose_cloud_base`).
-- **Units.** `PhysicsState.specific_humidity` is g/kg; converted to kg/kg at the
-  edge.
+  the ported GISS routines are surface-first. The term flips the column at the
+  edge and flips the tendencies back.
+- **Units.** `PhysicsState.specific_humidity` is **kg/kg** (jax-gcm#824), which
+  is also the GISS routines' own unit, so no conversion happens at the edge.
+- **Surface flux.** `mcp` is the production minus *both* evaporation sinks, the
+  clear-air term and the downdraft term, because ModelE's surface precipitation
+  is a falling flux depleted on the way down (`prcpmc = prcpmc + prcp_d +
+  prcp_e`). Netting only the clear-air term left the port delivering 95.7% of
+  its production against ModelE's 63.3%.
 
 ## 4. Fortran → JAX translation patterns
 
@@ -182,19 +224,86 @@ boolean are step functions. Gradients flow through the thermodynamic quantities,
 not through these integer/boolean switches; the discontinuities are documented at
 each site.
 
-## 6. Status and next steps
+## 6. Status
 
-Ported and tested (≈46 unit tests): saturation, moist static energy, virtual
-temperature, `d_ln_qsat_dt`; cloud-base/LCL detection; the instability trigger
-(`DMSE`); the single-source mass-flux closure; and the term-level cloud-base
-diagnostic. The term computes a real diagnostic from state but **produces no
-tendencies yet**.
+**What runs.** The full chain, producing tendencies: saturation and the energy
+ledger, cloud-base/LCL detection, the instability trigger, the multi-source
+mass-flux closure with the cold-pool blend and the surface-flux enhancement, the
+candidate sweep over cloud bases with the environment carried between them, the
+buoyancy-sorting plume ascent (`plume_ent_det_w2_bsort`, the routine
+`bsort_entdet` actually selects — an earlier version of this port implemented the
+dead one), the microphysics partition, the downdraft descent, and the tendency
+assembly. Coverage is 100% on the bsort, mass-flux, microphysics, plume,
+tendencies and thermodynamics modules; the convection suite is 639 tests.
 
-Remaining:
-1. Convert the mass-flux closure into temperature/humidity tendencies and wire it
-   into the term (needs the dynamic cloud-base level selection).
-2. Port the plume above cloud base (entrainment, condensation, updraft velocity,
-   downdrafts, precipitation).
-3. Generalize the mass-flux closure to multiple source levels (`nlpi > 1`).
-4. Obtain BOMEX/RICO oracles (NASA), regenerate nonzero fixture targets via the
-   bridge repo, and validate magnitudes.
+**Measured against TWP-ICE** (223 active periods, the harness reconstructing the
+entry column as a production port would have to):
+
+| quantity | port / ModelE |
+|----------|---------------|
+| convective rain produced | **0.910** |
+| surface flux delivered | **0.923** |
+| cloud bases per step | 1.744 / 1.744 |
+| mean cloud top | 27.0 levels, bias −0.08 |
+| cloud-base mass | 0.977 aggregate, 1.001 median |
+
+**What the remaining production deficit is**, from `BSORT_PORT_PLAN.md` sections
+113–126, because its composition matters more than its size:
+
+- about 30% is two timesteps where ModelE convects from a **detached
+  single-layer source** high in the column (levels 45 and 50). The branch is six
+  lines of Fortran and its inputs are dumped, but it fires above the
+  displacement top, which this sweep cannot reach at any affordable width.
+  Detached sources are 8 of ModelE's 9,240 converting bases on this case;
+- about 30% is the remaining base-count periods, where the **vetoed base is
+  nearly irrelevant** — on the six tractable ones it carries 0.8–18.4% of the
+  rain and accounts for only 10.8% of their deficit, the rest being the bases
+  the port *does* convert;
+- roughly a quarter is **not the port**: the harness reconstructs MSTCNV's entry
+  column from an end-of-step snapshot and folds some cloud condensate into
+  vapour. `run_column(..., entry_column="oracle")` reads the real column
+  instead, which halves the per-period scatter and drops the worst period from
+  8.45x ModelE's rain to 1.56x;
+- most of the rest is the **buoyancy sort's threshold sensitivity**, not a
+  defect. Its fates turn on ~1.7e-4 in blend buoyancy and the port reproduces
+  that quantity to ~2e-4, so a single blend differing by 0.07 K flips between
+  rejoining the updraft and detraining. A plume given ModelE's input, cloud base
+  and top reproduces ModelE's rain to **1%**; per-period agreement is therefore
+  the wrong acceptance test for this scheme and aggregate agreement is the right
+  one.
+
+**Accepted limitations**, each with its measured size:
+
+1. **Ice microphysics.** The *condensation* phase is chosen per level from the
+   parcel's temperature against `tfmc` = 258.16 K, as ModelE does, and that was
+   worth 14.3% of the deficit and 1.5 levels of cloud top. But `PRECIPICE_GAMMA`
+   and the graupel blend are unported, so the *precipitation* phase is
+   all-liquid, as is the melting/freezing heat redistribution. Measured at
+   **1.1%** of the deficit — and that number is specific to a case where only
+   12% of ModelE's rain falls at ice levels, so it must be re-sized before this
+   term is trusted outside the tropics. See `MIXED_PHASE_SUPPORTED`.
+2. **The terminating-level rain partition.** The port rains 0.650 of ModelE's
+   condensate at the level a plume dies on and over-rains by 3.1% below, so the
+   column total is 0.990 — a redistribution rather than a loss, worth ~1%. Its
+   effect on the *downdraft* profile is unmeasured, and that coupling is a known
+   runaway.
+3. **The downdraft evaporation's magnitude.** 1.00x ModelE's on BOMEX but 0.46x
+   on TWP-ICE, which is why the surface flux lands at 0.923 rather than nearer
+   the production ratio. `dqevp` is dumped per level and the candidate causes —
+   downdraft mass, the `fddrt` split, the evaporation efficiency — are all
+   instrumented.
+4. **Cross-plume phase latching.** ModelE shares `TPSAV`/`VLAT` across every
+   plume of a timestep; the port decides per plume. Measured inert here: the two
+   disagree on 3 of 3,772 shared `(step, level)` pairs, none on an active period.
+
+**Not yet done.**
+
+1. A **global run**. The term has only ever run in single column. There is no
+   reason to expect the tropical-case tunings to transfer, and the three
+   diagnostics it reads optionally (`fcp`, `mwpen`, `pmct`) are zero in a
+   configuration that does not supply them.
+2. **BOMEX's surface flux** under-delivers at 0.473 against a production ratio
+   of 0.723, so a factor there is still unexplained and is BOMEX-specific.
+3. A decision on whether the port carries a **cold-pool state of its own** or
+   stays a diagnostic-fed comparison. That is the blocker on the cold-pool
+   source blend, whose own effect measured 3.2% and was accepted.
