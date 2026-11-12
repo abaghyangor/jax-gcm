@@ -247,8 +247,20 @@ entry column as a production port would have to):
 | mean cloud top | 27.0 levels, bias −0.08 |
 | cloud-base mass | 0.977 aggregate, 1.001 median |
 
+**The downdraft descent is exact.** Every argument
+`giss_downdraft.downdraft_descent` takes is dumped, so ModelE's own shaft can be
+replayed through it level by level with the ascent taken out of the question.
+Doing that reproduces ModelE's `dqevp` — the precipitation evaporated into the
+downdraft, which is 98% of what depletes the falling rain — to **1.0000** on all
+52 BOMEX plumes and **1.0002** over 1,031 TWP-ICE downdrafts, 96.3% of them
+inside 1%. The bridge's `downdraft_replay_test.py` pins this on the committed
+BOMEX oracle. An earlier reading of "0.46x ModelE's on TWP-ICE" compared the
+port over the first 60 active periods with ModelE over all 223, and TWP-ICE's
+rain falls in the later monsoon burst; on a common period set the port
+evaporates 40.9% of its production into the downdraft against ModelE's 44.3%.
+
 **What the remaining production deficit is**, from `BSORT_PORT_PLAN.md` sections
-113–126, because its composition matters more than its size:
+113–128, because its composition matters more than its size:
 
 - about 30% is two timesteps where ModelE convects from a **detached
   single-layer source** high in the column (levels 45 and 50). The branch is six
@@ -287,12 +299,7 @@ entry column as a production port would have to):
    column total is 0.990 — a redistribution rather than a loss, worth ~1%. Its
    effect on the *downdraft* profile is unmeasured, and that coupling is a known
    runaway.
-3. **The downdraft evaporation's magnitude.** 1.00x ModelE's on BOMEX but 0.46x
-   on TWP-ICE, which is why the surface flux lands at 0.923 rather than nearer
-   the production ratio. `dqevp` is dumped per level and the candidate causes —
-   downdraft mass, the `fddrt` split, the evaporation efficiency — are all
-   instrumented.
-4. **Cross-plume phase latching.** ModelE shares `TPSAV`/`VLAT` across every
+3. **Cross-plume phase latching.** ModelE shares `TPSAV`/`VLAT` across every
    plume of a timestep; the port decides per plume. Measured inert here: the two
    disagree on 3 of 3,772 shared `(step, level)` pairs, none on an active period.
 

@@ -671,12 +671,18 @@ class GissConvection(PhysicsTerm):
         # ModelE's 69.5% -- a ratio of 1.00 -- and netting it lands the port at
         # 21.4% delivered. Netting is what makes BOMEX right.
         #
-        # What remains after this is a *magnitude* error in the term, not a
-        # question of whether to subtract it: the port's downdraft evaporates
-        # 1.00x ModelE's on BOMEX but only **0.46x** on TWP-ICE (16.5% of
-        # production against 36.0%). That is the next thing to chase, and
-        # `dqevp` is dumped per level in `downdraft_diag.txt` for it. See
-        # sections 125-126 of `BSORT_PORT_PLAN.md` in the bridge.
+        # The netted term is the right size. An earlier reading put it at
+        # "0.46x ModelE's on TWP-ICE" and left a magnitude error open; that
+        # compared the port over the first 60 active periods with ModelE over
+        # all 223, and TWP-ICE's rain is concentrated in the later monsoon
+        # burst. Measured over the same 251 periods the port evaporates 40.9%
+        # of its production into the downdraft against ModelE's 44.3%, and
+        # replaying ModelE's own per-level shaft through `downdraft_descent`
+        # reproduces its `dqevp` to **1.0002** over 1031 TWP-ICE downdrafts
+        # (1.0000 on all 52 of BOMEX's). So the surface ratio of 0.923 is the
+        # production deficit showing through, not an undersized sink. See
+        # section 128 of `BSORT_PORT_PLAN.md` in the bridge, and the replay
+        # test that pins it there.
         #
         # Clamped at zero because the three sums are accumulated independently
         # and nothing guarantees the difference stays positive in a column that
