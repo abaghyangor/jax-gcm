@@ -93,9 +93,13 @@
   agreement is the right acceptance measure.
 
   **Validated in single column only**, against an instrumented ModelE SCM run
-  of TWP-ICE: 0.910 of ModelE's convective rain produced, 0.923 of its surface
+  of TWP-ICE: 0.910 of ModelE's convective rain produced, 1.017 of its surface
   flux delivered, cloud bases per step 1.744 against 1.744, mean cloud-top bias
-  −0.08 levels. It has never been run globally. Three of ModelE's inputs are
+  −0.08 levels. The surface flux is the depleted falling flux the downdraft
+  descent carries out of the column — what ModelE accumulates into ``prcpmc`` —
+  rather than production minus the evaporation terms, which omits the
+  condensate the buoyancy sort routes into the shaft (42% of BOMEX's
+  production). It has never been run globally. Three of ModelE's inputs are
   prognostic there and are read here as optional diagnostics defaulting to zero
   — the cold-pool fraction, the penetrative mass and the running cloud-top
   pressure — so a global configuration does not yet reproduce what the oracle

@@ -242,10 +242,23 @@ entry column as a production port would have to):
 | quantity | port / ModelE |
 |----------|---------------|
 | convective rain produced | **0.910** |
-| surface flux delivered | **0.923** |
+| surface flux delivered | **1.017** (0.960 on the oracle entry column) |
 | cloud bases per step | 1.744 / 1.744 |
 | mean cloud top | 27.0 levels, bias −0.08 |
 | cloud-base mass | 0.977 aggregate, 1.001 median |
+
+**The surface flux is read off the descent, not rebuilt.** ModelE's convective
+surface rain is the flux that survives the fall — `prcp_d + prcp_e` as the
+descent leaves them (`MSTCNV.F90:5156-5157`) — and it is not reconstructible as
+"produced minus evaporated", because the flux is also *fed* by `wmdnl`, the
+condensate the buoyancy sort carries into the downdraft, which never enters
+`condpr`. ModelE's own BOMEX budget closes only with it: `condpr + wmdnl -
+dqevp - dqm_evp` gives 0.9142 mm/day against its reported 0.911, where dropping
+`wmdnl` leaves 0.3008. `wmdnl` is 42% of BOMEX's production and 7% of
+TWP-ICE's. Carrying the flux out of the descent instead took BOMEX from 0.455
+to **0.981** (absolute error 27× smaller) and TWP-ICE from 0.927 to **1.017**,
+with the median period moving from 0.80 to 1.00; it is also non-negative by
+construction, since each evaporation is capped at the stream it draws from.
 
 **The downdraft descent is exact.** Every argument
 `giss_downdraft.downdraft_descent` takes is dumped, so ModelE's own shaft can be
@@ -309,8 +322,6 @@ evaporates 40.9% of its production into the downdraft against ModelE's 44.3%.
    reason to expect the tropical-case tunings to transfer, and the three
    diagnostics it reads optionally (`fcp`, `mwpen`, `pmct`) are zero in a
    configuration that does not supply them.
-2. **BOMEX's surface flux** under-delivers at 0.473 against a production ratio
-   of 0.723, so a factor there is still unexplained and is BOMEX-specific.
-3. A decision on whether the port carries a **cold-pool state of its own** or
+2. A decision on whether the port carries a **cold-pool state of its own** or
    stays a diagnostic-fed comparison. That is the blocker on the cold-pool
    source blend, whose own effect measured 3.2% and was accepted.

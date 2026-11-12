@@ -684,18 +684,26 @@ class ColumnConvection(NamedTuple):
     mass_flux: jnp.ndarray               # ccm, summed over plumes [kg/m^2]
     precipitation: jnp.ndarray           # condpr, summed over plumes [kg/m^2]
     # `dqm_evp`, the falling rain that evaporates back into the environment,
-    # summed over plumes [kg/m^2]. Carried out separately because
-    # `precipitation` is rain *produced*: ModelE's reported `mcp` is what
-    # survives the fall, so the surface rate is the difference of the two.
+    # summed over plumes [kg/m^2].
     evaporation: jnp.ndarray
     # `descent.evaporated`, the falling rain that evaporates into the DOWNDRAFT
-    # rather than into the clear air, summed over plumes [kg/m^2]. It is not
-    # subtracted from the surface flux (see `giss_mstcnv._bsort_tendencies`),
-    # so it is published to let a caller close the column water budget: the
-    # vapour it returns to the column appears in `dq_mc` via the downdraft's
-    # detrainment, and whether it also remains in the surface rain is exactly
-    # the question that budget answers.
+    # rather than into the clear air, summed over plumes [kg/m^2]. It is the
+    # dominant sink -- 98% of what depletes the flux on TWP-ICE.
+    #
+    # Neither evaporation term is subtracted from the surface flux any more:
+    # the descent carries the depleted flux out itself, in
+    # `surface_precipitation` below. They stay published because they are what
+    # lets a caller close the column water budget against the vapour the
+    # downdraft returns through `dq_mc`, and because they are the quantities
+    # the oracle dumps as `dqm_evp` and `dqevp`.
     downdraft_evaporation: jnp.ndarray
+    # The rain that survives the fall, summed over plumes [kg/m^2]: the
+    # descent's own `prcp_d + prcp_e` where it runs out of column, which is
+    # what ModelE accumulates into `prcpmc` (`MSTCNV.F90:5156-5157`). A
+    # per-column scalar, unlike the profiles around it. This -- not
+    # `precipitation` minus the two evaporation terms -- is the surface flux;
+    # see `giss_downdraft.DowndraftDescent.surface_precipitation`.
+    surface_precipitation: jnp.ndarray
     # `menv`, the clear-air layer mass the falling rain evaporates into,
     # `fevap(l)*ma(l)`, summed over plumes [kg/m^2]. Published alongside the
     # evaporation it drives so the two can be compared against ModelE's dump
@@ -1093,7 +1101,7 @@ def convective_column(potential_temperature: jnp.ndarray,
 
     def one_candidate(carry, offset):
         (theta, q, mass_flux, precipitation, evaporation, downdraft_evap,
-         env_air, count, top, base_mass) = carry
+         surface_rain, env_air, count, top, base_mass) = carry
         candidate = highest_base - offset
         if cloud_base_closure_fn is None:
             plume_mass = jnp.sum(
@@ -1170,6 +1178,7 @@ def convective_column(potential_temperature: jnp.ndarray,
                 precipitation + keep(cycle.ascent.precipitation),
                 evaporation + keep(cycle.descent.environment_water),
                 downdraft_evap + keep(cycle.descent.evaporated),
+                surface_rain + keep(cycle.descent.surface_precipitation),
                 env_air + keep(cycle.descent.environment_air),
                 count + convects.astype(count.dtype),
                 jnp.maximum(top, jnp.where(convects, cycle.cloud_top, 0)),
@@ -1178,12 +1187,14 @@ def convective_column(potential_temperature: jnp.ndarray,
 
     zeros = jnp.zeros_like(layer_mass)
     scalar = jnp.zeros(horiz)
-    (theta, q, mass_flux, precipitation, evaporation, downdraft_evap, env_air,
-     count, top, base_mass), _ = lax.scan(
+    (theta, q, mass_flux, precipitation, evaporation, downdraft_evap,
+     surface_rain, env_air, count, top, base_mass), _ = lax.scan(
         one_candidate,
         # The carry *is* the environment, so it starts at the incoming column.
+        # `surface_rain` is a per-column scalar; everything else up to
+        # `env_air` is a profile.
         (potential_temperature, specific_humidity, zeros, zeros, zeros, zeros,
-         zeros, scalar, jnp.zeros(horiz, dtype=level.dtype), zeros),
+         scalar, zeros, scalar, jnp.zeros(horiz, dtype=level.dtype), zeros),
         jnp.arange(max_plumes))
 
     return ColumnConvection(
@@ -1195,6 +1206,7 @@ def convective_column(potential_temperature: jnp.ndarray,
         precipitation=precipitation,
         evaporation=evaporation,
         downdraft_evaporation=downdraft_evap,
+        surface_precipitation=surface_rain,
         environment_air=env_air,
         plume_count=count,
         cloud_top=top,

@@ -111,6 +111,18 @@ class DowndraftDescent(NamedTuple):
     environment_water: jnp.ndarray       # dqm_evp: the vapour it adds
     environment_air: jnp.ndarray         # menv: layer mass the clear-air rain
                                          # evaporates into, fevap(l)*ma(l)
+    # `prcp_d + prcp_e` as the descent leaves them, i.e. the rain that survives
+    # the fall and reaches the ground (`MSTCNV.F90:5156-5157`, where ModelE
+    # forms exactly this sum and accumulates it into `prcpmc`). A per-column
+    # scalar `(*horiz)`, not a profile like the fields above.
+    #
+    # This is the only correct surface flux, and reconstructing it as
+    # `produced - evaporated` instead loses a term: the falling flux is also
+    # *fed* by `wmdnl`, the condensate the buoyancy sort carries into the
+    # downdraft, which never appears in `condpr`. On BOMEX that is 0.613 of a
+    # 1.454 production, so the reconstruction delivered 0.280 against ModelE's
+    # own 0.914 -- and ModelE's budget closes to 0.3% once `wmdnl` is counted.
+    surface_precipitation: jnp.ndarray = None
 
 
 def downdraft_descent(source_mass: jnp.ndarray,
@@ -378,6 +390,8 @@ def downdraft_descent(source_mass: jnp.ndarray,
     # this the shaft simply vanishes with its mass, and the continuity
     # integration loses that mass from the environment.
     mass_left, heat_left, water_left = final[0], final[1], final[2]
+    # What the two streams still carry when the column runs out beneath them.
+    descent = descent._replace(surface_precipitation=final[3] + final[4])
     reached = descent.mass > 0.0
     ldmin = jnp.argmax(reached, axis=0)
     at_ldmin = (level_axis == ldmin) & jnp.any(reached, axis=0)
