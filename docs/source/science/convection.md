@@ -102,9 +102,11 @@
   validated. The precipitation phase is all-liquid and the ice microphysics
   (``PRECIPICE_GAMMA`` and the graupel blend) is unported, measured at 1.1% of
   the production deficit on a case where only 12% of ModelE's rain falls at ice
-  levels; the terminating-level rain partition redistributes 35% of a plume's
-  top-level rain downward at a column cost of ~1%; and the downdraft evaporates
-  1.00x ModelE's on BOMEX but 0.46x on TWP-ICE. Run it with
+  levels; and the terminating-level rain partition redistributes 35% of a
+  plume's top-level rain downward at a column cost of ~1%. The downdraft
+  descent, by contrast, is exact: replayed on ModelE's own per-level shaft it
+  reproduces the precipitation evaporated into the downdraft to 1.0000 on BOMEX
+  and 1.0002 over 1,031 TWP-ICE downdrafts. Run it with
   ``physics=echam-giss-conv``; see ``docs/source/design/giss_convection_port.md``
   for the measurements behind each number.
 
