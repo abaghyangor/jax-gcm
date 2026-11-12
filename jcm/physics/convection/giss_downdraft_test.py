@@ -174,6 +174,53 @@ class TestDescentStructure(unittest.TestCase):
         self.assertEqual(top, 0.0)
 
 
+class TestSurfacePrecipitation(unittest.TestCase):
+    """The flux that reaches the ground, and the source that used to be lost.
+
+    ModelE's convective surface rain is ``prcp_d + prcp_e`` as the descent
+    leaves them (``MSTCNV.F90:5156-5157``). It is *not* reconstructible as
+    "produced minus evaporated", because the falling flux is also fed by
+    ``wmdnl`` -- the condensate the buoyancy sort carries into the downdraft
+    (``prcp_d = prcp_d + wmdnl(l)``, ``MSTCNV.F90:4738``), which never enters
+    ``condpr``. ModelE's own BOMEX budget closes only with it: ``condpr +
+    wmdnl - dqevp - dqm_evp`` is 0.9142 mm/day against its reported 0.911,
+    where dropping ``wmdnl`` leaves 0.3008.
+    """
+
+    def test_flux_balances_its_sources_and_sinks(self):
+        """Everything put into the flux either evaporates or reaches the ground."""
+        result = _descend(
+            precipitation=jnp.array([0.0, 0.0, 0.0, 0.0, 0.3, 0.0]))
+        # `produced` joins the flux only at or above the condensation level,
+        # which `_descend` puts at index 2.
+        injected = (float(jnp.sum(jnp.array([0.1, 0.2, 0.2]))) + 0.3)
+        removed = float(jnp.sum(result.evaporated)
+                        + jnp.sum(result.environment_water))
+        self.assertAlmostEqual(float(result.surface_precipitation),
+                               injected - removed, places=5)
+
+    def test_shed_condensate_reaches_the_ground(self):
+        """`wmdnl` is a source: more of it means more surface rain.
+
+        This is the term the old `produced - evaporated` reconstruction lost
+        entirely -- it is 42% of BOMEX's production and 7% of TWP-ICE's.
+        """
+        without = _descend()
+        with_shed = _descend(
+            precipitation=jnp.array([0.0, 0.0, 0.0, 0.0, 0.3, 0.0]))
+        self.assertGreater(float(with_shed.surface_precipitation),
+                           float(without.surface_precipitation))
+
+    def test_flux_is_never_negative(self):
+        """A column that produces nothing delivers nothing, not a deficit."""
+        result = _descend(produced_precipitation=jnp.zeros(_NLEV))
+        self.assertGreaterEqual(float(result.surface_precipitation), 0.0)
+
+    def test_flux_is_a_per_column_scalar(self):
+        """It is a scalar, not a profile like every other field."""
+        self.assertEqual(_descend().surface_precipitation.shape, ())
+
+
 class TestNumerics(unittest.TestCase):
     def test_outputs_are_finite(self):
         for field in _descend():
@@ -228,11 +275,17 @@ class TestNumerics(unittest.TestCase):
             boundary_layer_top=jnp.full((ncols,), 2),
             cloud_base=jnp.full((ncols,), 2),
         )
-        for one, many in zip(single, block):
+        for name, one, many in zip(single._fields, single, block):
             for col in range(ncols):
-                np.testing.assert_allclose(np.asarray(many)[:, col],
-                                           np.asarray(one), rtol=1e-6,
-                                           atol=1e-9)
+                # Every field is a `(nlev, *horiz)` profile except
+                # `surface_precipitation`, the flux reaching the ground, which
+                # is a per-column scalar.
+                sliced = (np.asarray(many)[col]
+                          if name == "surface_precipitation"
+                          else np.asarray(many)[:, col])
+                np.testing.assert_allclose(sliced, np.asarray(one), rtol=1e-6,
+                                           atol=1e-9,
+                                           err_msg=f"{name}, column {col}")
 
 
 if __name__ == "__main__":

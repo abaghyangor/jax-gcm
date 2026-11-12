@@ -684,13 +684,21 @@ class GissConvection(PhysicsTerm):
         # section 128 of `BSORT_PORT_PLAN.md` in the bridge, and the replay
         # test that pins it there.
         #
-        # Clamped at zero because the three sums are accumulated independently
-        # and nothing guarantees the difference stays positive in a column that
-        # produced almost no rain.
-        surface_rain = jnp.maximum(
-            jnp.sum(column.precipitation - column.evaporation
-                    - column.downdraft_evaporation, axis=0), 0.0)
-        mcp = surface_rain / dtsrc * 86400.0
+        # The flux is therefore read off the descent rather than reconstructed
+        # from the sums. Reconstructing it as `produced - evaporated` loses a
+        # source: the falling flux is also fed by `wmdnl`, the condensate the
+        # buoyancy sort carries into the downdraft (`prcp_d = prcp_d + wmdnl(l)`,
+        # MSTCNV.F90:4738), which never enters `condpr`. ModelE's own budget
+        # closes only with it -- on BOMEX `condpr + wmdnl - dqevp - dqm_evp` is
+        # 0.9142 mm/day against its reported 0.911, where dropping `wmdnl`
+        # leaves 0.3008 -- and `wmdnl` is 42% of BOMEX's production and 7% of
+        # TWP-ICE's, so the reconstruction was short by that much.
+        #
+        # `column.surface_precipitation` is the descent's own `prcp_d + prcp_e`
+        # where it runs out of column beneath it, summed over the sweep's
+        # plumes: the same quantity `prcpmc` accumulates, and conservative by
+        # construction rather than as the difference of three separate sums.
+        mcp = column.surface_precipitation / dtsrc * 86400.0
         return dtemp_dt, dq_dt, dth_mc, dq_mc, mcp
 
     def _convective_tendencies(self, state, diagnostics, cloud_base, fmp2,
