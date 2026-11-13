@@ -210,6 +210,167 @@ class TestGissConvectionTerm(unittest.TestCase):
         self.assertTrue(jnp.all(jnp.isfinite(g)))
 
 
+def _moist_grid(shape, nlev=12):
+    """Build a convecting column over ``shape``, with per-column variety.
+
+    Shaped like ``TestGissConvectionTerm._moist_column`` but over arbitrary
+    trailing (horizontal) axes, with the humidity varied column to column so the
+    columns take genuinely different paths through the scheme: measured on the
+    ``(3, 2)`` grid used below, the two driest do not convect at all and the four
+    that do take cloud bases at four different levels.
+
+    Unlike ``_moist_column`` the humidity here is in **kg/kg**, the unit
+    ``PhysicsState.specific_humidity`` is actually in. That fixture passes the
+    number 16 with a ``g/kg`` comment, i.e. 16 kg/kg -- a column
+    supersaturated by three orders of magnitude. It is harmless there, since
+    every test using it asserts only shapes, finiteness and differentiability
+    ("structural; magnitudes not validated"), but it would make the
+    column-to-column variety this file needs meaningless: every column
+    convects, and ``mcp`` comes out at 10^5 mm/day.
+    """
+    horiz = (1,) * len(shape)
+    pfull = jnp.linspace(20000.0, 100000.0, nlev).reshape((nlev,) + horiz)
+    temperature = jnp.linspace(230.0, 298.0, nlev).reshape((nlev,) + horiz)
+    pfull = jnp.broadcast_to(pfull, (nlev,) + shape)
+    temperature = jnp.broadcast_to(temperature, (nlev,) + shape)
+    # 2 g/kg to 16 g/kg across the columns: the dry end cannot convect.
+    spread = jnp.linspace(0.002, 0.016, int(np.prod(shape))).reshape(shape)
+    humidity = jnp.broadcast_to(spread, (nlev,) + shape)
+    state = PhysicsState.zeros((nlev,) + shape, temperature=temperature,
+                               specific_humidity=humidity)
+    density = pfull / (287.0 * temperature)
+    dp = jnp.abs(jnp.gradient(pfull, axis=0))
+    diagnostics = {"pressure_full": pfull,
+                   "layer_thickness": dp / (_G * density),
+                   "air_density": density}
+    return state, diagnostics
+
+
+class TestGissConvectionGridShapes(unittest.TestCase):
+    """The ``allow_mc`` path on a real grid, and column by column.
+
+    ``TestGissConvectionComposition`` below runs the term on a
+    ``(nlev, nlon, nlat)`` state but with ``allow_mc`` at its default of
+    ``False``, so it only ever exercised the zero path. The whole ported scheme
+    -- the sweep, the buoyancy sort, the descent -- had never run in anything
+    but a single column, while ``physics=echam-giss-conv`` sets
+    ``allow_mc: true``. That is the configuration a global run would use, so
+    these tests run it.
+
+    The contract being pinned is the one in ``CLAUDE.md``: a column-physics term
+    puts the vertical on axis 0 and lets the trailing axes broadcast, so the
+    identical code must give the identical answer for a column whether it is run
+    alone, in a ``(nlev, ncols)`` block or in a ``(nlev, nlon, nlat)`` grid. A
+    rank assumption, a reduction over the wrong axis or an integer index that
+    fails to broadcast all show up here and nowhere else.
+    """
+
+    GRID = (3, 2)
+
+    def test_runs_on_a_three_dimensional_grid(self):
+        state, diag = _moist_grid(self.GRID)
+        tend, out = GissConvection(allow_mc=True)(state, diag, None, None)
+        conv = out["convection"]
+        self.assertEqual(tend.temperature.shape, state.temperature.shape)
+        self.assertEqual(conv.mcp.shape, self.GRID)
+        self.assertEqual(conv.dth_mc.shape, state.temperature.shape)
+        self.assertTrue(jnp.all(jnp.isfinite(tend.temperature)))
+        self.assertTrue(jnp.all(jnp.isfinite(tend.specific_humidity)))
+        self.assertTrue(jnp.all(jnp.isfinite(conv.mcp)))
+        self.assertTrue(jnp.all(conv.mcp >= 0.0),
+                        "surface precipitation must never be negative")
+
+    def test_some_columns_convect_and_some_do_not(self):
+        """Otherwise the agreement below could be an agreement about zeros.
+
+        The grid is built so this is a real mixture: the two driest columns get
+        no cloud-base mass flux and rain nothing, the other four rain. Several
+        distinct cloud-base levels appear, which is what makes the
+        column-by-column comparison test the integer index handling rather than
+        one level repeated six times.
+        """
+        state, diag = _moist_grid(self.GRID)
+        _, out = GissConvection(allow_mc=True)(state, diag, None, None)
+        conv = out["convection"]
+        mcp = np.asarray(conv.mcp)
+        self.assertGreater((mcp > 0.0).sum(), 0, "no column convected")
+        self.assertGreater((mcp == 0.0).sum(), 0, "every column convected")
+        # A dry column must be zero in both the closure and the rain, not just
+        # one of them.
+        dry = np.asarray(conv.cloud_base_mass_flux) == 0.0
+        np.testing.assert_array_equal(mcp[dry], 0.0)
+        self.assertGreater(len(np.unique(np.asarray(conv.cloud_base))), 2,
+                           "the columns should not share one cloud base")
+
+    def test_each_column_matches_the_same_column_run_alone(self):
+        """The broadcasting contract, on the full ``allow_mc`` chain."""
+        term = GissConvection(allow_mc=True)
+        state, diag = _moist_grid(self.GRID)
+        grid_tend, grid_out = term(state, diag, None, None)
+        for i in range(self.GRID[0]):
+            for j in range(self.GRID[1]):
+                one_state = PhysicsState.zeros(
+                    (state.temperature.shape[0], 1),
+                    temperature=state.temperature[:, i, j][:, None],
+                    specific_humidity=state.specific_humidity[:, i, j][:, None])
+                one_diag = {k: v[:, i, j][:, None] for k, v in diag.items()}
+                one_tend, one_out = term(one_state, one_diag, None, None)
+                with self.subTest(column=(i, j)):
+                    np.testing.assert_allclose(
+                        np.asarray(grid_tend.temperature[:, i, j]),
+                        np.asarray(one_tend.temperature[:, 0]),
+                        rtol=1e-5, atol=1e-12)
+                    np.testing.assert_allclose(
+                        np.asarray(grid_out["convection"].mcp[i, j]),
+                        np.asarray(one_out["convection"].mcp[0]),
+                        rtol=1e-5, atol=1e-12)
+
+    def test_two_dimensional_block_matches_the_grid(self):
+        """``(nlev, ncols)`` and ``(nlev, nlon, nlat)`` are the same code.
+
+        Looser than the per-column test above, and deliberately so: changing the
+        trailing rank changes the array layout XLA picks, so the float32
+        reductions inside the sweep accumulate in a different order. Measured,
+        that moves one of the 72 tendencies by 1.5e-8 K/s on a value of
+        -3.9e-4 -- 4e-5 relative. The per-column comparison does not see this
+        because it holds the grid layout fixed and only varies which column is
+        read out.
+        """
+        term = GissConvection(allow_mc=True)
+        grid_state, grid_diag = _moist_grid(self.GRID)
+        flat_state, flat_diag = _moist_grid((int(np.prod(self.GRID)),))
+        grid_tend, _ = term(grid_state, grid_diag, None, None)
+        flat_tend, _ = term(flat_state, flat_diag, None, None)
+        np.testing.assert_allclose(
+            np.asarray(grid_tend.temperature).reshape(
+                grid_tend.temperature.shape[0], -1),
+            np.asarray(flat_tend.temperature), rtol=2e-4, atol=1e-12)
+
+    def test_composes_with_allow_mc_on(self):
+        """The term inside ``ComposablePhysics``, actually convecting."""
+        state, diag = _moist_grid(self.GRID)
+        physics = ComposablePhysics(terms=[GissConvection(allow_mc=True)],
+                                    checkpoint_terms=False)
+        tend, out = physics.compute_tendencies(
+            state, ForcingData.zeros(self.GRID), _make_terrain(self.GRID),
+            prev_physics_data=diag)
+        self.assertTrue(jnp.all(jnp.isfinite(tend.temperature)))
+        self.assertTrue(jnp.any(out["convection"].dth_mc != 0.0))
+
+    def test_gradient_on_a_grid_is_finite(self):
+        term = GissConvection(allow_mc=True)
+        state, diag = _moist_grid(self.GRID)
+
+        def loss(temperature):
+            tend, _ = term(state.copy(temperature=temperature), diag,
+                           None, None)
+            return jnp.sum(tend.temperature ** 2)
+
+        g = jax.grad(loss)(state.temperature)
+        self.assertEqual(g.shape, state.temperature.shape)
+        self.assertTrue(jnp.all(jnp.isfinite(g)))
+
+
 class TestGissConvectionComposition(unittest.TestCase):
     """The term must compose and run inside ComposablePhysics."""
 
