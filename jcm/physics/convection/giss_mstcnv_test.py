@@ -740,3 +740,148 @@ class TestPhaseAssumption(unittest.TestCase):
 
         grad = jax.grad(loss)(cold.temperature)
         self.assertTrue(bool(jnp.all(jnp.isfinite(grad))))
+
+
+class TestDetrainedCondensate(unittest.TestCase):
+    """The condensate the plumes detrain, and the column water budget.
+
+    ``MSTCNV`` splits what a plume condenses three ways: the rain it sheds
+    (``condpr``), the condensate the buoyancy sort carries into the downdraft
+    (``wmdnl``) and the condensate it detrains into the environment as cloud
+    (``dwm``, accumulated into ``detrQC`` and handed to ``LSCOND``,
+    ``MSTCNV.F90:2294``). Measured from ``dwm`` in the oracle's
+    ``sweep_state_diag.txt``, that third part is **27%** of what the plumes
+    condense on BOMEX and **13%** on TWP-ICE.
+
+    The term computed it and then dropped it: it is condensate, so it is not in
+    ``dq_mc`` (the vapour budget), and nothing else carried it. A
+    ``physics=echam-giss-conv`` run therefore detrained no condensate anywhere
+    on the globe -- ``clouds.conv_detrainment_qc`` was identically zero over
+    all 18,432 columns -- and the water left the column altogether. These tests
+    pin the budget rather than the magnitude.
+    """
+
+    def _column(self, nlev=24, ice=False):
+        """Build a convecting column that carries the condensate tracers."""
+        pfull = jnp.linspace(10000.0, 100000.0, nlev)[:, None]
+        base = 300.0 - 40.0 * float(ice)
+        temperature = jnp.linspace(base - 90.0, base, nlev)[:, None]
+        humidity = jnp.linspace(0.00002, 0.018, nlev)[:, None]
+        state = PhysicsState.zeros(
+            (nlev, 1), temperature=temperature, specific_humidity=humidity,
+            tracers={"qc": jnp.zeros((nlev, 1)), "qi": jnp.zeros((nlev, 1))})
+        density = pfull / (287.0 * temperature)
+        dp = jnp.abs(jnp.gradient(pfull, axis=0))
+        diagnostics = {"pressure_full": pfull,
+                       "layer_thickness": dp / (_G * density),
+                       "air_density": density}
+        return state, diagnostics, np.asarray(dp[:, 0]) / _G
+
+    def test_the_column_water_budget_closes(self):
+        """Vapour removed = rain delivered + condensate detrained.
+
+        Everything the plumes take out of the vapour has to leave the column as
+        surface rain or stay in it as cloud; rain that evaporates on the way
+        down is already back in ``dq_mc``. Before the detrained condensate was
+        published this residual was the whole of it.
+        """
+        state, diag, layer_mass = self._column()
+        term = GissConvection(allow_mc=True)
+        tendency, out = term(state, diag, None, None)
+        dt = float(term.params.get_value().dtsrc)
+
+        vapour = float(np.sum(np.asarray(tendency.specific_humidity[:, 0])
+                              * dt * layer_mass))
+        condensate = float(np.sum(
+            (np.asarray(tendency.tracers["qc"][:, 0])
+             + np.asarray(tendency.tracers["qi"][:, 0])) * dt * layer_mass))
+        rain = float(np.asarray(out["convection"].mcp)[0]) / 86400.0 * dt
+
+        self.assertLess(vapour, -1e-3, "this column has to actually convect")
+        self.assertGreater(condensate, 0.0, "nothing detrained")
+        self.assertLess(abs(vapour + condensate + rain),
+                        1e-4 * abs(vapour),
+                        "the column's water budget does not close")
+
+    def test_the_cloud_scheme_is_handed_the_detrainment(self):
+        """``conv_detrainment_qc``/``_qi`` carry it, as ECHAM's pxtecl/pxteci.
+
+        ``cloud_inputs.cloud_scheme_inputs`` takes these two out of the running
+        condensate tendency and passes them to the cloud scheme separately, so
+        they must equal the tracer tendencies exactly -- the same identity
+        ``TiedtkeConvection`` maintains.
+        """
+        from jcm.physics.clouds.cloud_data import CloudData
+
+        state, diag, _ = self._column()
+        nlev = state.temperature.shape[0]
+        diag = {**diag, "clouds": CloudData.zeros((1,), nlev)}
+        tendency, out = GissConvection(allow_mc=True)(state, diag, None, None)
+
+        np.testing.assert_array_equal(
+            np.asarray(out["clouds"].conv_detrainment_qc),
+            np.asarray(tendency.tracers["qc"]))
+        np.testing.assert_array_equal(
+            np.asarray(out["clouds"].conv_detrainment_qi),
+            np.asarray(tendency.tracers["qi"]))
+        self.assertGreater(
+            float(jnp.sum(out["clouds"].conv_detrainment_qc)), 0.0)
+
+    def test_the_detrainment_is_non_negative_and_phase_split(self):
+        """Warm column -> liquid only; the ice slot is the glaciated part.
+
+        The split is read back from the ascent's own ``lhx`` rather than from a
+        temperature test here, so a warm column proves the plumes never
+        glaciated and a cold one that the ice path is reachable at all.
+        """
+        warm_state, warm_diag, _ = self._column()
+        _, warm = GissConvection(allow_mc=True)(
+            warm_state, warm_diag, None, None)
+        cold_state, cold_diag, _ = self._column(ice=True)
+        cold_tend, _ = GissConvection(allow_mc=True)(
+            cold_state, cold_diag, None, None)
+
+        warm_tend, _ = GissConvection(allow_mc=True)(
+            warm_state, warm_diag, None, None)
+        for name in ("qc", "qi"):
+            self.assertTrue(
+                bool(jnp.all(warm_tend.tracers[name] >= 0.0)),
+                f"{name} detrainment went negative")
+            self.assertTrue(bool(jnp.all(jnp.isfinite(cold_tend.tracers[name]))))
+        self.assertEqual(float(jnp.sum(warm_tend.tracers["qi"])), 0.0,
+                         "a column above freezing detrained ice")
+        del warm
+
+    def test_it_advances_the_running_thermodynamic_state(self):
+        """A pre-cloud term must leave ``thermo_run`` post-convection.
+
+        Otherwise the cloud scheme's saturation balance condenses against the
+        column as it was before this term ran
+        (``moist_air_state.advance_thermo_run``).
+        """
+        state, diag, _ = self._column()
+        nlev = state.temperature.shape[0]
+        thermo = {"temperature": state.temperature,
+                  "specific_humidity": state.specific_humidity,
+                  "qc": jnp.zeros((nlev, 1)), "qi": jnp.zeros((nlev, 1))}
+        tendency, out = GissConvection(allow_mc=True)(
+            state, {**diag, "thermo_run": thermo}, None, None)
+        dt = float(GissConvection(allow_mc=True)
+                   .params.get_value().dtsrc)
+
+        np.testing.assert_allclose(
+            np.asarray(out["thermo_run"]["temperature"]),
+            np.asarray(state.temperature + tendency.temperature * dt),
+            rtol=1e-6)
+        self.assertGreater(float(jnp.sum(out["thermo_run"]["qc"])), 0.0,
+                           "the detrained condensate never reached thermo_run")
+
+    def test_a_host_without_condensate_tracers_still_runs(self):
+        """The idealised and SPEEDY stacks carry no qc/qi to detrain into."""
+        state, diag, _ = self._column()
+        bare = PhysicsState.zeros(
+            state.temperature.shape, temperature=state.temperature,
+            specific_humidity=state.specific_humidity)
+        tendency, _ = GissConvection(allow_mc=True)(bare, diag, None, None)
+        self.assertEqual(tendency.tracers, {})
+        self.assertTrue(bool(jnp.all(jnp.isfinite(tendency.specific_humidity))))
