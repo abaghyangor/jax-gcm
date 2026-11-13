@@ -318,10 +318,15 @@ evaporates 40.9% of its production into the downdraft against ModelE's 44.3%.
 
 **Not yet done.**
 
-1. A **global run**. The term has only ever run in single column. There is no
-   reason to expect the tropical-case tunings to transfer, and the three
-   diagnostics it reads optionally (`fcp`, `mwpen`, `pmct`) are zero in a
-   configuration that does not supply them.
+1. A **global run**. The term has never run in a real global composition — with
+   ECHAM's radiation, surface and microphysics around it, on a T63 grid, for
+   more than one step. There is no reason to expect the tropical-case tunings to
+   transfer, and the three diagnostics it reads optionally (`fcp`, `mwpen`,
+   `pmct`) are zero in a configuration that does not supply them. What *is*
+   covered is the term's own shape handling: the `allow_mc` chain runs on a
+   `(nlev, nlon, nlat)` grid and every column matches the same column run alone
+   to 1e-5, with four distinct cloud bases and two non-convecting columns among
+   six, so a rank assumption or a mis-broadcast level index would fail there.
 2. A decision on whether the port carries a **cold-pool state of its own** or
    stays a diagnostic-fed comparison. That is the blocker on the cold-pool
    source blend, whose own effect measured 3.2% and was accepted.
