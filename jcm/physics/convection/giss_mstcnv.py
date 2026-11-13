@@ -89,6 +89,7 @@ from jcm.forcing import ForcingData
 from jcm.terrain import TerrainData
 from jcm.physics.modele.params import GissConvectionParameters
 from jcm.physics.modele.physics_data import GissConvectionData
+from jcm.physics.diagnostics.moist_air_state import advance_thermo_run
 from jcm.physics.convection import giss_bsort as bsort
 from jcm.physics.convection.giss_cloud_base import lifting_condensation_level
 from jcm.physics.convection.giss_mass_flux import (
@@ -473,16 +474,20 @@ class GissConvection(PhysicsTerm):
              state, diagnostics, nlev, nodal_shape)
 
         if self.allow_mc and self.bsort:
-            dtemp_dt, dq_dt, dth_mc, dq_mc, mcp = self._bsort_tendencies(
-                state, diagnostics, closure_base, fmp2, boundary_layer_top,
-                nlev, nodal_shape, dtsrc, second_closure, base_profile,
-                candidate_closure)
+            (dtemp_dt, dq_dt, dth_mc, dq_mc, mcp, d_qc,
+             d_qi) = self._bsort_tendencies(
+                 state, diagnostics, closure_base, fmp2, boundary_layer_top,
+                 nlev, nodal_shape, dtsrc, second_closure, base_profile,
+                 candidate_closure)
         elif self.allow_mc:
             dtemp_dt, dq_dt, dth_mc, dq_mc = self._convective_tendencies(
                 state, diagnostics, cloud_base, fmp2, nlev, nodal_shape, dtsrc)
             # The single-plume fallback has no microphysics of its own to
-            # account the rain with, so it reports no precipitation.
+            # account the rain with, so it reports no precipitation -- and no
+            # buoyancy sort, so nothing detrains as condensate either.
             mcp = jnp.zeros(nodal_shape)
+            d_qc = jnp.zeros(shape)
+            d_qi = jnp.zeros(shape)
         else:
             # Convection off: zero tendencies. Multiplying by dtsrc*0 keeps the
             # parameter in the trace so nnx.grad has a defined gradient path.
@@ -491,9 +496,25 @@ class GissConvection(PhysicsTerm):
             dth_mc = jnp.zeros((nlev,) + nodal_shape)
             dq_mc = jnp.zeros((nlev,) + nodal_shape)
             mcp = jnp.zeros(nodal_shape)
+            d_qc = jnp.zeros(shape)
+            d_qi = jnp.zeros(shape)
 
+        # The detrained condensate is returned as a qc/qi tracer tendency, so
+        # the operator-split sum carries it into the prognostic condensate the
+        # way every other tendency is carried, and is published separately
+        # below for the cloud scheme. Only where the host actually carries the
+        # condensate tracers: on a stack without them (the idealised and
+        # SPEEDY compositions) there is nowhere to put it.
+        tracers = {}
+        if "qc" in state.tracers:
+            tracers["qc"] = d_qc
+        if "qi" in state.tracers:
+            tracers["qi"] = d_qi
         tendency = PhysicsTendency.zeros(shape).copy(
             temperature=dtemp_dt, specific_humidity=dq_dt)
+        if tracers:
+            tendency = tendency.copy(
+                tracers={**tendency.tracers, **tracers})
         convection = GissConvectionData.zeros(nodal_shape, nlev).copy(
             cloud_base=cloud_base, cloud_base_mass_flux=fmp2,
             dth_mc=dth_mc, dq_mc=dq_mc, mcp=mcp,
@@ -501,7 +522,49 @@ class GissConvection(PhysicsTerm):
             # `EchamSurfaceExchange` sums it into the total surface
             # precipitation. 1 mm of water is 1 kg/m^2.
             precip_conv=mcp / 86400.0)
-        return tendency, {**diagnostics, "convection": convection}
+
+        out = {**diagnostics, "convection": convection}
+
+        # ModelE's `detrQC`/`detrNc` are arguments to `LSCOND`, its stratiform
+        # scheme (`MSTCNV.F90:124-125`), not an addition to the environment's
+        # vapour. The same handoff here is `clouds.conv_detrainment_qc`/`_qi`,
+        # which `jcm.physics.clouds.cloud_inputs.cloud_scheme_inputs` takes out
+        # of the running condensate tendency and passes to the cloud scheme by
+        # itself, as ECHAM passes `pxtecl`/`pxteci`. `TiedtkeConvection`
+        # publishes the same two fields from the same place in its own call.
+        #
+        # Without this the fields stayed at the zero the cover term resets them
+        # to: a `physics=echam-giss-conv` run detrained no condensate anywhere
+        # on the globe, and the water went nowhere at all.
+        # `dtsrc` is ModelE's own step, which is what every rate this term
+        # returns is divided by; `_dt_seconds` is the step the host will
+        # actually apply those rates over. They are the same 1800 s in the
+        # configurations validated here, but the provisional condensate and
+        # `thermo_run` below have to be advanced by the increment the
+        # prognostic state will really receive, which is the host's -- the same
+        # `diagnostics["_dt_seconds"]` `TiedtkeConvection` uses.
+        dt_host = diagnostics.get("_dt_seconds", dtsrc)
+        if "clouds" in out:
+            cloud = out["clouds"]
+            out["clouds"] = cloud.copy(
+                qc=jnp.maximum(cloud.qc + d_qc * dt_host, 0.0),
+                qi=jnp.maximum(cloud.qi + d_qi * dt_host, 0.0),
+                conv_detrainment_qc=d_qc,
+                conv_detrainment_qi=d_qi)
+
+        # This term changes T, q and the condensate before the cloud
+        # microphysics runs, so the running thermodynamic view has to carry its
+        # effect or the cloud scheme's saturation balance condenses against the
+        # pre-convection column. The pattern is
+        # `moist_air_state.advance_thermo_run`'s "any opt-in pre-cloud term";
+        # Tiedtke is the other one.
+        out = advance_thermo_run(
+            out, dt_host,
+            d_temperature=dtemp_dt,
+            d_specific_humidity=dq_dt,
+            d_qc=d_qc,
+            d_qi=d_qi)
+        return tendency, out
 
     def _bsort_tendencies(self, state, diagnostics, closure_base, fmp2,
                           boundary_layer_top, nlev, nodal_shape, dtsrc,
@@ -545,7 +608,8 @@ class GissConvection(PhysicsTerm):
         if pressure_full is None or thickness is None or density is None:
             zero2d = jnp.zeros(shape)
             zero3d = jnp.zeros((nlev,) + nodal_shape)
-            return zero2d, zero2d, zero3d, zero3d, jnp.zeros(nodal_shape)
+            return (zero2d, zero2d, zero3d, zero3d, jnp.zeros(nodal_shape),
+                    zero2d, zero2d)
 
         p = jnp.flip(pressure_full, axis=0)
         t = jnp.flip(state.temperature, axis=0)
@@ -699,7 +763,22 @@ class GissConvection(PhysicsTerm):
         # plumes: the same quantity `prcpmc` accumulates, and conservative by
         # construction rather than as the difference of three separate sums.
         mcp = column.surface_precipitation / dtsrc * 86400.0
-        return dtemp_dt, dq_dt, dth_mc, dq_mc, mcp
+        # `detrQC`, the condensate the plumes hand to the environment as cloud
+        # (`MSTCNV.F90:2294`). Extensive per level, so `/layer_mass` makes it a
+        # mixing ratio and `/dtsrc` a rate, and the flip puts it in the
+        # top-first frame the rest of `jcm` uses -- the same two conversions
+        # `dq_dt` gets just above.
+        #
+        # This water is NOT in `dq_mc`: it left the plume as condensate, not
+        # vapour, so nothing downstream sees it unless the term publishes it.
+        # Dropping it lost 27% of what the plumes condense on BOMEX and 13% on
+        # TWP-ICE (`dwm` in `sweep_state_diag.txt`), which is a hole in the
+        # column's water budget rather than a bias in a rate.
+        d_qc = jnp.flip(safe_divide(column.detrained_liquid, layer_mass)
+                        / dtsrc, axis=0)
+        d_qi = jnp.flip(safe_divide(column.detrained_ice, layer_mass)
+                        / dtsrc, axis=0)
+        return dtemp_dt, dq_dt, dth_mc, dq_mc, mcp, d_qc, d_qi
 
     def _convective_tendencies(self, state, diagnostics, cloud_base, fmp2,
                                nlev, nodal_shape, dtsrc):

@@ -49,7 +49,7 @@ from jcm.physics.convection import giss_downdraft as downdraft
 from jcm.physics.convection import giss_microphysics as microphysics
 from jcm.physics.convection import giss_tendencies as tendencies
 from jcm.physics.convection.giss_thermodynamics import (
-    DELTX, GRAV, RGAS, safe_divide, saturation_specific_humidity)
+    DELTX, GRAV, LHE, LHS, RGAS, safe_divide, saturation_specific_humidity)
 
 # `bsort_enteff(2)`, the entraining plume's entrainment efficiency
 # (MSTCNV.F90:282). The less-entraining plume never fires under
@@ -674,6 +674,19 @@ class CandidateSetup(NamedTuple):
     iplume: jnp.ndarray                  # 1 (less entraining) or 2
 
 
+def _is_ice(latent_heat: jnp.ndarray) -> jnp.ndarray:
+    """Whether a level condensed over ice, read back from its ``lhx``.
+
+    The ascent decides the phase from the parcel's own temperature and reports
+    the latent heat it used, which is ``LHE`` or ``LHS`` and nothing between,
+    so the midpoint separates them exactly. Reading the phase back this way
+    rather than re-testing a temperature keeps the split tied to the
+    condensation that actually happened (ModelE's ``LHXMC(L)``, the phase it
+    stores alongside ``detrQC``).
+    """
+    return latent_heat > 0.5 * (LHE + LHS)
+
+
 class ColumnConvection(NamedTuple):
     """What the whole plume sequence does to one column."""
 
@@ -704,6 +717,19 @@ class ColumnConvection(NamedTuple):
     # `precipitation` minus the two evaporation terms -- is the surface flux;
     # see `giss_downdraft.DowndraftDescent.surface_precipitation`.
     surface_precipitation: jnp.ndarray
+    # `detrQC`, the condensate the plumes detrain into the environment as
+    # cloud rather than raining out, summed over plumes [kg/m^2] and split by
+    # the phase the level condensed at (`MSTCNV.F90:2294`:
+    # `detrQC(L) = detrQC(L) + dwm(l)*byma(l)`, with `LHXMC(L)` carrying the
+    # phase). ModelE hands `detrQC` to `LSCOND`, its stratiform scheme; the
+    # term publishes it as `clouds.conv_detrainment_qc`/`_qi`.
+    #
+    # It is NOT part of `water`, which is the vapour budget alone, so a caller
+    # that ignores these two loses the condensate from the column entirely --
+    # 27% of what the plumes condense on BOMEX and 13% on TWP-ICE, measured
+    # from `dwm` in `sweep_state_diag.txt`.
+    detrained_liquid: jnp.ndarray
+    detrained_ice: jnp.ndarray
     # `menv`, the clear-air layer mass the falling rain evaporates into,
     # `fevap(l)*ma(l)`, summed over plumes [kg/m^2]. Published alongside the
     # evaporation it drives so the two can be compared against ModelE's dump
@@ -1101,6 +1127,7 @@ def convective_column(potential_temperature: jnp.ndarray,
 
     def one_candidate(carry, offset):
         (theta, q, mass_flux, precipitation, evaporation, downdraft_evap,
+         detrained_liquid, detrained_ice,
          surface_rain, env_air, count, top, base_mass) = carry
         candidate = highest_base - offset
         if cloud_base_closure_fn is None:
@@ -1178,6 +1205,16 @@ def convective_column(potential_temperature: jnp.ndarray,
                 precipitation + keep(cycle.ascent.precipitation),
                 evaporation + keep(cycle.descent.environment_water),
                 downdraft_evap + keep(cycle.descent.evaporated),
+                # `dwm` as the cloud-mode cap above left it, split at the phase
+                # the level actually condensed at rather than at a fixed
+                # temperature: `latent_heat` is the ascent's own `lhx`, so the
+                # ice part is what the plume made above its glaciation level.
+                detrained_liquid + keep(jnp.where(
+                    _is_ice(cycle.ascent.latent_heat),
+                    0.0, cycle.ascent.detrained_condensate)),
+                detrained_ice + keep(jnp.where(
+                    _is_ice(cycle.ascent.latent_heat),
+                    cycle.ascent.detrained_condensate, 0.0)),
                 surface_rain + keep(cycle.descent.surface_precipitation),
                 env_air + keep(cycle.descent.environment_air),
                 count + convects.astype(count.dtype),
@@ -1188,12 +1225,14 @@ def convective_column(potential_temperature: jnp.ndarray,
     zeros = jnp.zeros_like(layer_mass)
     scalar = jnp.zeros(horiz)
     (theta, q, mass_flux, precipitation, evaporation, downdraft_evap,
+     detrained_liquid, detrained_ice,
      surface_rain, env_air, count, top, base_mass), _ = lax.scan(
         one_candidate,
         # The carry *is* the environment, so it starts at the incoming column.
         # `surface_rain` is a per-column scalar; everything else up to
         # `env_air` is a profile.
         (potential_temperature, specific_humidity, zeros, zeros, zeros, zeros,
+         zeros, zeros,
          scalar, zeros, scalar, jnp.zeros(horiz, dtype=level.dtype), zeros),
         jnp.arange(max_plumes))
 
@@ -1207,6 +1246,8 @@ def convective_column(potential_temperature: jnp.ndarray,
         evaporation=evaporation,
         downdraft_evaporation=downdraft_evap,
         surface_precipitation=surface_rain,
+        detrained_liquid=detrained_liquid,
+        detrained_ice=detrained_ice,
         environment_air=env_air,
         plume_count=count,
         cloud_top=top,

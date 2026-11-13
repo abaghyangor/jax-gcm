@@ -99,7 +99,18 @@
   descent carries out of the column — what ModelE accumulates into ``prcpmc`` —
   rather than production minus the evaporation terms, which omits the
   condensate the buoyancy sort routes into the shaft (42% of BOMEX's
-  production). It has never been run globally. Three of ModelE's inputs are
+  production). The condensate a plume detrains into the environment as cloud —
+  ModelE's ``detrQC``, which it passes to its stratiform scheme, and 27% of
+  BOMEX's plume condensate — is handed to the cloud scheme as
+  ``clouds.conv_detrainment_qc``/``_qi`` and as a qc/qi tracer tendency, the
+  same handoff Tiedtke makes with ECHAM's ``pxtecl``/``pxteci``, with the phase
+  taken from the ``lhx`` the ascent condensed at. The term advances
+  ``thermo_run``, so the cloud microphysics downstream of it condenses against
+  the post-convection column.
+
+  It **has** now run globally — T63L47, one day, every field finite under the
+  runner's health gates — but that is a smoke test, not a validation: the
+  global magnitudes have no oracle behind them. Three of ModelE's inputs are
   prognostic there and are read here as optional diagnostics defaulting to zero
   — the cold-pool fraction, the penetrative mass and the running cloud-top
   pressure — so a global configuration does not yet reproduce what the oracle

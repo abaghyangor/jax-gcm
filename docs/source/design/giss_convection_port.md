@@ -260,6 +260,35 @@ to **0.981** (absolute error 27× smaller) and TWP-ICE from 0.927 to **1.017**,
 with the median period moving from 0.80 to 1.00; it is also non-negative by
 construction, since each evaporation is capped at the stream it draws from.
 
+**The detrained condensate reaches the cloud scheme.** `MSTCNV` splits what a
+plume condenses three ways — the rain it sheds (`condpr`), the condensate the
+buoyancy sort carries into the downdraft (`wmdnl`) and the condensate it
+detrains into the environment as cloud (`dwm`, accumulated into `detrQC` and
+passed to `LSCOND`, ModelE's stratiform scheme, at `MSTCNV.F90:2294`). Measured
+from `dwm` in `sweep_state_diag.txt`, the third part is **27%** of BOMEX's
+plume condensate and **12.7%** of TWP-ICE's. The port computed it, applied
+ModelE's cloud-mode cap to it, and then dropped it: it is condensate, so it is
+not in `dq_mc`, which is the vapour budget, and nothing else carried it. The
+first global run made that visible — `clouds.conv_detrainment_qc` was
+identically zero over all 18,432 columns of a T63L47 step.
+
+The amount was never the problem. Comparing the port's own free-running plume
+against `sweep_state_diag.txt` over all 48 BOMEX periods, the three-way split
+matches ModelE nearly term for term — rain 51.0% against 51.4% (ratio 0.960),
+detrained 26.9% against 26.9% (0.969), into the downdraft 22.2% against 21.7%
+(0.990), total condensate 0.969. The port put the right quantity in the right
+bucket and then dropped the bucket.
+
+It is now published as `clouds.conv_detrainment_qc`/`_qi` and as a qc/qi
+tracer tendency, which is how `TiedtkeConvection` hands ECHAM's `pxtecl`/
+`pxteci` to the same consumer, with the phase read back from the ascent's own
+`lhx` rather than from a second temperature test. The term also advances
+`thermo_run`, which it had never done, so the cloud scheme's saturation balance
+now sees the post-convection column instead of the pre-convection one. With the
+condensate published the column's water budget closes: vapour removed = surface
+rain + condensate detrained, to float32 roundoff (3.9e-6 of 6.86 kg/m² on the
+test column). Before it, that residual *was* the whole detrainment.
+
 **The downdraft descent is exact.** Every argument
 `giss_downdraft.downdraft_descent` takes is dumped, so ModelE's own shaft can be
 replayed through it level by level with the ascent taken out of the question.
@@ -318,8 +347,18 @@ evaporates 40.9% of its production into the downdraft against ModelE's 44.3%.
 
 **Not yet done.**
 
-1. A **global run**. The term has never run on a global grid, or with RRTMGP.
-   What now exists is the single-column half of that: the preset's own term
+1. A **validated global run**. The term now *runs* globally: `+configuration=
+   t63-echam-1m physics=echam-giss-conv run=smoke` completes a day at T63L47
+   with RRTMGP, every output field finite, under the runner's health gates
+   (`bail_on_unhealthy`) and without tripping them. Convection is active across
+   the grid — a cloud base in nearly every column, `cloud_base_mass_flux` to
+   149 kg/m², `mcp` to 13.8 mm/day. That is a smoke test and nothing more: the
+   global magnitudes have no oracle behind them, and the A/B against
+   `physics=echam` that would size the term's effect on the simulated climate
+   has not been run. It also took 1 h 54 m on this CPU host, essentially all of
+   it XLA compilation, so the A/B needs a GPU.
+
+   The single-column half of the coupling is more than a smoke test: the preset's own term
    list, built through Hydra with the grey two-stream standing in for RRTMGP,
    integrated as a radiative-convective column through the same
    `compute_tendencies` path the model uses. Over 10 days (720 steps) it stays
