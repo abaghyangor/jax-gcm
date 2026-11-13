@@ -318,9 +318,18 @@ evaporates 40.9% of its production into the downdraft against ModelE's 44.3%.
 
 **Not yet done.**
 
-1. A **global run**. The term has never run in a real global composition — with
-   ECHAM's radiation, surface and microphysics around it, on a T63 grid, for
-   more than one step. There is no reason to expect the tropical-case tunings to
+1. A **global run**. The term has never run on a global grid, or with RRTMGP.
+   What now exists is the single-column half of that: the preset's own term
+   list, built through Hydra with the grey two-stream standing in for RRTMGP,
+   integrated as a radiative-convective column through the same
+   `compute_tendencies` path the model uses. Over 10 days (720 steps) it stays
+   finite and takes the column to a surface temperature of 303.61 K against the
+   stock `physics=echam` preset's 303.59 K, with the same drift — so the term is
+   not injecting or removing heat the rest of the stack has to absorb, and the
+   downdraft runaway `giss_microphysics` warns about does not appear through the
+   coupling. `giss_rce_integration_test.py` holds that as a slow test. The
+   column stabilises after spin-up, though, so convection is only exercised
+   while it settles. There is no reason to expect the tropical-case tunings to
    transfer, and the three diagnostics it reads optionally (`fcp`, `mwpen`,
    `pmct`) are zero in a configuration that does not supply them. What *is*
    covered is the term's own shape handling: the `allow_mc` chain runs on a
