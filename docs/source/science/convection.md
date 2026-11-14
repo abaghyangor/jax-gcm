@@ -104,9 +104,13 @@
   BOMEX's plume condensate — is handed to the cloud scheme as
   ``clouds.conv_detrainment_qc``/``_qi`` and as a qc/qi tracer tendency, the
   same handoff Tiedtke makes with ECHAM's ``pxtecl``/``pxteci``, with the phase
-  taken from the ``lhx`` the ascent condensed at. The term advances
-  ``thermo_run``, so the cloud microphysics downstream of it condenses against
-  the post-convection column.
+  taken from the ``lhx`` the ascent condensed at. The environment it convects
+  is the running ``thermo_run`` view where a composition seeds one — the column
+  after vertical diffusion and the surface exchange, which is what ECHAM hands
+  ``cumastr`` and what ModelE's ``CLOUDS_DRV`` ordering gives ``MSTCNV`` — and
+  the raw state otherwise, which is what the single column and the oracle
+  harness supply. It advances ``thermo_run`` in turn, so the cloud
+  microphysics downstream of it condenses against the post-convection column.
 
   It **has** now run globally — T63L47, one day, every field finite under the
   runner's health gates — but that is a smoke test, not a validation: the

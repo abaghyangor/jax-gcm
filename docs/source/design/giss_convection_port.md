@@ -273,21 +273,62 @@ first global run made that visible — `clouds.conv_detrainment_qc` was
 identically zero over all 18,432 columns of a T63L47 step.
 
 The amount was never the problem. Comparing the port's own free-running plume
-against `sweep_state_diag.txt` over all 48 BOMEX periods, the three-way split
-matches ModelE nearly term for term — rain 51.0% against 51.4% (ratio 0.960),
-detrained 26.9% against 26.9% (0.969), into the downdraft 22.2% against 21.7%
-(0.990), total condensate 0.969. The port put the right quantity in the right
-bucket and then dropped the bucket.
+against `sweep_state_diag.txt`, the *proportions* of the split match ModelE on
+both cases:
+
+| branch | BOMEX ModelE / port | TWP-ICE ModelE / port |
+|---|---|---|
+| `condpr` (rain) | 51.4% / 51.0% | 81.5% / 83.3% |
+| `dwm` (detrained) | 26.9% / **26.9%** | 12.4% / **11.3%** |
+| `wmdnl` (downdraft) | 21.7% / 22.2% | 6.2% / 5.5% |
+| total condensate, port/ModelE | 0.969 | 0.809 |
+
+The per-branch ratios track the total, not each other: on TWP-ICE the port
+produces 0.809 of ModelE's condensate and the detrained branch comes out at
+0.737, which is that production deficit showing through rather than a second
+error in the detrainment — the deficit this section's sibling above decomposes.
+The port put the right fraction in the right bucket and then dropped the
+bucket.
 
 It is now published as `clouds.conv_detrainment_qc`/`_qi` and as a qc/qi
 tracer tendency, which is how `TiedtkeConvection` hands ECHAM's `pxtecl`/
 `pxteci` to the same consumer, with the phase read back from the ascent's own
-`lhx` rather than from a second temperature test. The term also advances
-`thermo_run`, which it had never done, so the cloud scheme's saturation balance
-now sees the post-convection column instead of the pre-convection one. With the
+`lhx` rather than from a second temperature test. With the
 condensate published the column's water budget closes: vapour removed = surface
 rain + condensate detrained, to float32 roundoff (3.9e-6 of 6.86 kg/m² on the
 test column). Before it, that residual *was* the whole detrainment.
+
+**A Tiedtke control confirms both the defect and its scale.** Run at the
+identical configuration, `physics=echam` writes a non-zero
+`clouds.conv_detrainment_qc` (max 4.9e-08) where the pre-fix GISS run wrote
+exactly zero in all 18,432 columns — the defect seen beside a term that does it
+correctly. The same control also sizes the one global number this run could not
+interpret on its own: Tiedtke's convection is active in 4.6% of columns (14.9%
+within 20° of the equator) against the GISS term's 0.3% (1.1%), a factor of
+~15. It does not follow that the GISS closure under-rains: at the same instant
+it delivers *more* convective precipitation than Tiedtke (0.0051 against 0.0014
+mm/day area-weighted, Tiedtke raining in no column at all), both schemes being
+one day out of an initial state. An instantaneous snapshot one day in is a poor
+instrument for either quantity; the firing-rate gap is real and open, and
+sizing it needs the 30-day A/B.
+
+**The term is coupled to its neighbours in both directions.** Publishing the
+detrainment was the output half; the input half is that `GissConvection` read
+`state` for its environment, i.e. the column as the step *started*. ECHAM hands
+`cumastr` the provisional `ztp1 = ptm1 + ptte·dt` — the column after vertical
+diffusion and the surface exchange have run (`physc`) — and ModelE's ordering is
+the same, `MSTCNV` being called from `CLOUDS_DRV` downstream of the boundary
+layer. Convection is driven by boundary-layer instability, so reading the
+step-start column meant the closure never saw the heat and moisture the surface
+supplied on the step it was convecting. The term now reads `thermo_run`, as
+`TiedtkeConvection` does, and advances it afterwards, which it had never done,
+so the cloud microphysics downstream no longer condenses against the
+pre-convection column.
+
+Nothing that validated this port supplies `thermo_run` — not the oracle
+harness, not the single column, not the unit tests — so the fallback to the raw
+state keeps every SCM measurement on this page exactly as it was. The change is
+live only in a composition that seeds it, which is the ECHAM stack.
 
 **The downdraft descent is exact.** Every argument
 `giss_downdraft.downdraft_descent` takes is dumped, so ModelE's own shaft can be
