@@ -376,6 +376,33 @@ def cloud_base_closure_mass_flux(temperature: jnp.ndarray,
     return jnp.where(has_cloud, fplume, 0.0), jnp.where(has_cloud, fmp2, 0.0)
 
 
+def _environment(state, diagnostics):
+    """Return the (T, q) this term convects, as the terms before it left them.
+
+    ECHAM hands ``cumastr`` the provisional ``ztp1 = ptm1 + ptte*dt``, i.e. the
+    column *after* vertical diffusion and the surface exchange have run
+    (``physc``), and ModelE's ordering is the same -- ``MSTCNV`` is called from
+    ``CLOUDS_DRV`` downstream of the boundary layer. Convection is driven by
+    boundary-layer instability, so reading the step-start state instead means
+    the closure never sees the moisture and heat the surface supplied on this
+    step. ``TiedtkeConvection`` reads the same view for the same reason.
+
+    Only T and q move. Pressure, geopotential and the layer masses stay at
+    their step-start values, as they do for ``TiedtkeConvection``: ``thermo_run``
+    carries no geometry, and the ascent uses the geopotential only through
+    differences (the layer depth and the 1 km lag lookback), so the mismatch is
+    second order against the instability the humidity sets.
+
+    Falls back to the raw state where nothing seeded ``thermo_run``: the single
+    column, the oracle harness and the unit tests, none of which carry it, so
+    the SCM validation is unchanged by this.
+    """
+    thermo_run = diagnostics.get("thermo_run")
+    if thermo_run is None:
+        return state.temperature, state.specific_humidity
+    return thermo_run["temperature"], thermo_run["specific_humidity"]
+
+
 class GissConvection(PhysicsTerm):
     """GISS ModelE moist convection (``MSTCNV``) as a PhysicsTerm.
 
@@ -611,9 +638,10 @@ class GissConvection(PhysicsTerm):
             return (zero2d, zero2d, zero3d, zero3d, jnp.zeros(nodal_shape),
                     zero2d, zero2d)
 
+        env_t, env_q = _environment(state, diagnostics)
         p = jnp.flip(pressure_full, axis=0)
-        t = jnp.flip(state.temperature, axis=0)
-        q = jnp.flip(state.specific_humidity, axis=0)
+        t = jnp.flip(env_t, axis=0)
+        q = jnp.flip(env_q, axis=0)
         layer_mass = jnp.flip(density, axis=0) * jnp.flip(thickness, axis=0)
         # `zl = gz*bygrav` (ATM_UTILS.f:874). Only differences are used -- the
         # layer depth and the 1 km lag lookback -- so the datum does not matter.
@@ -814,9 +842,10 @@ class GissConvection(PhysicsTerm):
             return zero2d, zero2d, zero3d, zero3d
 
         # Surface-first environment (JCM state is top-first); humidity g/kg->kg/kg.
+        env_t, env_q = _environment(state, diagnostics)
         p = jnp.flip(pressure_full, axis=0)
-        t = jnp.flip(state.temperature, axis=0)
-        q = jnp.flip(state.specific_humidity, axis=0)
+        t = jnp.flip(env_t, axis=0)
+        q = jnp.flip(env_q, axis=0)
         phi = jnp.flip(state.geopotential, axis=0)
         dz = jnp.flip(thickness, axis=0)
         air_mass = jnp.flip(density, axis=0) * dz
@@ -890,9 +919,10 @@ class GissConvection(PhysicsTerm):
                     False, None, None)
 
         # Surface-first profiles (JCM state is top-first); humidity g/kg -> kg/kg.
+        env_t, env_q = _environment(state, diagnostics)
         p_sf = jnp.flip(pressure_full, axis=0)
-        t_sf = jnp.flip(state.temperature, axis=0)
-        q_sf = jnp.flip(state.specific_humidity, axis=0)
+        t_sf = jnp.flip(env_t, axis=0)
+        q_sf = jnp.flip(env_q, axis=0)
 
         cloud_base, _ = lifting_condensation_level(t_sf[0], p_sf[0], q_sf[0], p_sf)
 

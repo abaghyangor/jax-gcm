@@ -885,3 +885,83 @@ class TestDetrainedCondensate(unittest.TestCase):
         tendency, _ = GissConvection(allow_mc=True)(bare, diag, None, None)
         self.assertEqual(tendency.tracers, {})
         self.assertTrue(bool(jnp.all(jnp.isfinite(tendency.specific_humidity))))
+
+
+class TestTheEnvironmentIsThePostDiffusionColumn(unittest.TestCase):
+    """The term convects the column the terms before it left, not step-start.
+
+    ECHAM hands ``cumastr`` the provisional ``ztp1 = ptm1 + ptte·dt`` — the
+    column after vertical diffusion and the surface exchange have run
+    (``physc``) — and ModelE's ordering is the same, ``MSTCNV`` being called
+    from ``CLOUDS_DRV`` downstream of the boundary layer. Convection is driven
+    by boundary-layer instability, so a term reading the step-start state never
+    sees the heat and moisture the surface supplied on the step it is
+    convecting. ``TiedtkeConvection`` reads ``thermo_run`` for exactly this
+    reason; this term now does too.
+
+    The fallback matters as much as the read: the oracle harness, the single
+    column and every test but this one supply no ``thermo_run``, so they are
+    unaffected and the SCM validation still measures what it measured.
+    """
+
+    def _column(self, nlev=24, humidity_scale=1.0):
+        pfull = jnp.linspace(10000.0, 100000.0, nlev)[:, None]
+        temperature = jnp.linspace(210.0, 300.0, nlev)[:, None]
+        humidity = jnp.linspace(0.00002, 0.012, nlev)[:, None] * humidity_scale
+        state = PhysicsState.zeros(
+            (nlev, 1), temperature=temperature, specific_humidity=humidity)
+        density = pfull / (287.0 * temperature)
+        dp = jnp.abs(jnp.gradient(pfull, axis=0))
+        return state, {"pressure_full": pfull,
+                       "layer_thickness": dp / (_G * density),
+                       "air_density": density}
+
+    def test_a_moistened_running_state_is_what_convects(self):
+        """A ``thermo_run`` wetter than the state must change the closure.
+
+        Built as the physical case rather than an arbitrary perturbation: the
+        state is the dry step-start column, ``thermo_run`` is that column after
+        an upstream term moistened the boundary layer, and the test is that
+        convection responds to the moistening.
+        """
+        dry, diag = self._column(humidity_scale=1.0)
+        wet, _ = self._column(humidity_scale=1.6)
+        term = GissConvection(allow_mc=True)
+
+        _, without = term(dry, diag, None, None)
+        thermo = {"temperature": wet.temperature,
+                  "specific_humidity": wet.specific_humidity}
+        _, with_run = term(dry, {**diag, "thermo_run": thermo}, None, None)
+
+        # Read on the rain and the cloud base, not on ``fmp2``: in a column
+        # this unstable the closure sits on its own limiter (199.3148 kg/m^2
+        # for every humidity from 0.5x to 1.6x of this profile), so the mass
+        # flux cannot register the difference even when everything else does.
+        self.assertGreater(
+            float(jnp.sum(with_run["convection"].mcp)),
+            float(jnp.sum(without["convection"].mcp)),
+            "the rain ignored the moisture the upstream term supplied")
+        self.assertLess(
+            int(np.asarray(with_run["convection"].cloud_base)[0]),
+            int(np.asarray(without["convection"].cloud_base)[0]),
+            "a moistened boundary layer must lower the cloud base")
+
+    def test_without_a_running_state_nothing_changes(self):
+        """The oracle harness supplies none, so its numbers must not move."""
+        state, diag = self._column()
+        term = GissConvection(allow_mc=True)
+        tendency, out = term(state, diag, None, None)
+
+        # The same column handed a thermo_run that IS the state must give the
+        # identical answer -- which is what makes the fallback a fallback
+        # rather than a second code path.
+        thermo = {"temperature": state.temperature,
+                  "specific_humidity": state.specific_humidity}
+        same_tendency, same_out = term(
+            state, {**diag, "thermo_run": thermo}, None, None)
+        np.testing.assert_array_equal(
+            np.asarray(tendency.specific_humidity),
+            np.asarray(same_tendency.specific_humidity))
+        np.testing.assert_array_equal(
+            np.asarray(out["convection"].mcp),
+            np.asarray(same_out["convection"].mcp))
