@@ -338,16 +338,39 @@ twin. This clears it on every row but temperature, the TOA term by a factor of
 percentage points on convective precipitation, so these are systematic
 properties of the scheme and not weather.
 
-One chain explains all of it. The term convects in 0.3 % of columns where
-Tiedtke convects in 4.6 %, so it removes 20.7 % less water as convective rain;
-the column it leaves behind is 6.0 % moister; the stratiform scheme condenses
-that excess, lifting liquid water path 45.7 % (81 % in the tropics) and
-large-scale rain 33.3 %; the resulting clouds reflect 15 W/m² more shortwave.
-OLR does not move at all, so the bias is purely shortwave — an albedo error,
-not a greenhouse one. Total precipitation falls only 4.6 % because the
-stratiform compensation is nearly complete, which is why a near-correct global
-precipitation here is a compensation artifact and must not be read as the
-scheme being approximately right.
+One chain explains all of it. The term removes 20.7 % less water as convective
+rain; the column it leaves behind is 6.0 % moister; the stratiform scheme
+condenses that excess, lifting liquid water path 45.7 % (81 % in the tropics)
+and large-scale rain 33.3 %; the resulting clouds reflect 15 W/m² more
+shortwave. OLR does not move at all, so the bias is purely shortwave — an
+albedo error, not a greenhouse one. Total precipitation falls only 4.6 %
+because the stratiform compensation is nearly complete, which is why a
+near-correct global precipitation here is a compensation artifact and must not
+be read as the scheme being approximately right.
+
+**The convective deficit is in intensity, not in triggering.** Read on the
+days 5–10 means, the port convects over *more* area than Tiedtke, not less —
+70.9 % of columns carry some convective rain against 54.1 % (tropics 74.4 %
+against 62.8 %), and `cloud_base_mass_flux` is non-zero in 70.3 %. The deficit
+appears entirely at the heavy end. Area raining above 5 mm/day is halved,
+14.0 % against 7.1 % globally and 27.5 % against 12.8 % in the tropics, and the
+conditional intensity where a column is active runs at 0.73 of Tiedtke's
+(0.53 at the 90th percentile). Above the 99th percentile the port is *stronger*
+than Tiedtke, 1.55× at the 99.9th.
+
+That combination — too much area at drizzle intensity, half the area at
+raining intensity, a heavier extreme tail — is a bimodal response rather than a
+weak one: columns either barely convect or convect explosively, instead of
+grading smoothly with instability. It is the signature the buoyancy sort's
+knife edge would produce, its thresholds sitting at ~1.7e-4 against inputs good
+to ~2e-4, where a sub-0.1 K error flips a blend fate.
+
+An earlier reading of this run attributed the deficit to the term triggering
+too rarely, from an instantaneous one-day snapshot putting it at 0.3 % of
+columns against Tiedtke's 4.6 %. That snapshot is not a measure of how often
+the scheme convects over a climate — both arms were one day out of an initial
+state — and the 5-day means above contradict it on area. The open question is
+the closure's response function, not the trigger.
 
 Double counting of the detrained condensate is excluded as a cause: the port's
 handoff is `TiedtkeConvection`'s, field for field, and
@@ -446,19 +469,18 @@ evaporates 40.9% of its production into the downdraft against ModelE's 44.3%.
 
 **Not yet done.**
 
-1. The **firing rate**, which the 30-day A/B above turned from an open
-   question into the port's one blocking defect. The term convects in 0.3 % of
-   columns against Tiedtke's 4.6 %, and that single difference propagates to a
-   −14.4 W/m² TOA shortwave bias through a moister column and a brighter
-   stratiform deck. The column cases bound how much of this the plume can
-   explain: the port's condensate production is 0.91 of ModelE's on TWP-ICE and
-   BOMEX, nowhere near enough for −20.7 % of convective precipitation globally.
-   The deficit is therefore in *how often a column convects at all* rather than
-   in how much a convecting column produces, which points at the trigger and
-   the closure rather than the plume — the unported detached single-layer
-   source branch, worth ~30 % of the column production deficit, being the first
-   suspect. Until it is closed the term is not usable for a coupled climate
-   run, whatever its column-level fidelity.
+1. The **convective intensity distribution**, which the 30-day A/B above
+   turned from an open question into the port's one blocking defect. The term
+   produces 20.7 % less convective rain, and that propagates to a −14.4 W/m²
+   TOA shortwave bias through a moister column and a brighter stratiform deck.
+   It is not a triggering failure: the port convects over more area than
+   Tiedtke and finds a cloud base in 70 % of columns. It is that the heavy
+   events are missing — half the area above 5 mm/day — while the extreme tail
+   is heavier, a bimodal response pointing at the closure rather than at the
+   trigger or the plume. The column cases bound what the plume can explain:
+   production is 0.91 of ModelE's on TWP-ICE and BOMEX, far too little for a
+   20.7 % global deficit. Until this is closed the term is not usable for a
+   coupled climate run, whatever its column-level fidelity.
 
    What *is* settled is that it runs globally and stably. `+configuration=
    t63-echam-1m physics=echam-giss-conv` completes 30 days at T63L47 with
