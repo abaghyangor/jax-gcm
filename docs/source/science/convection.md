@@ -115,9 +115,11 @@
   It runs globally and stably — T63L47, 30 days, every field finite under the
   runner's health gates — but a 30-day A/B against the Tiedtke preset puts it
   **−14.4 W/m² at top of atmosphere**, 29 times the local gate's threshold and
-  66 times the noise twin's drift. The term convects in 0.3 % of columns where
-  Tiedtke convects in 4.6 %; it therefore removes 20.7 % less water as
-  convective rain, leaves the column 6.0 % moister, and the stratiform scheme
+  66 times the noise twin's drift. It removes 20.7 % less water as
+  convective rain — not by triggering too rarely, since it convects over more
+  area than Tiedtke (70.9 % of columns against 54.1 %), but by missing the
+  heavy events, the area raining above 5 mm/day being halved while the extreme
+  tail runs heavier. It leaves the column 6.0 % moister, and the stratiform scheme
   condensing that excess lifts liquid water path 45.7 % and reflects 15 W/m²
   more shortwave. Outgoing longwave does not move, so the bias is an albedo
   error. Total precipitation falls only 4.6 %, the stratiform pathway almost
