@@ -112,9 +112,19 @@
   harness supply. It advances ``thermo_run`` in turn, so the cloud
   microphysics downstream of it condenses against the post-convection column.
 
-  It **has** now run globally — T63L47, one day, every field finite under the
-  runner's health gates — but that is a smoke test, not a validation: the
-  global magnitudes have no oracle behind them. Three of ModelE's inputs are
+  It runs globally and stably — T63L47, 30 days, every field finite under the
+  runner's health gates — but a 30-day A/B against the Tiedtke preset puts it
+  **−14.4 W/m² at top of atmosphere**, 29 times the local gate's threshold and
+  66 times the noise twin's drift. The term convects in 0.3 % of columns where
+  Tiedtke convects in 4.6 %; it therefore removes 20.7 % less water as
+  convective rain, leaves the column 6.0 % moister, and the stratiform scheme
+  condensing that excess lifts liquid water path 45.7 % and reflects 15 W/m²
+  more shortwave. Outgoing longwave does not move, so the bias is an albedo
+  error. Total precipitation falls only 4.6 %, the stratiform pathway almost
+  exactly compensating, so the global precipitation is not evidence the scheme
+  is approximately right. Closing that firing-rate gap is a precondition for
+  using the term in a coupled climate run. It also costs 13.1× the Tiedtke
+  preset for the same integration. Three of ModelE's inputs are
   prognostic there and are read here as optional diagnostics defaulting to zero
   — the cold-pool fraction, the penetrative mass and the running cloud-top
   pressure — so a global configuration does not yet reproduce what the oracle

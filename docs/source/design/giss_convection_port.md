@@ -309,8 +309,66 @@ within 20° of the equator) against the GISS term's 0.3% (1.1%), a factor of
 it delivers *more* convective precipitation than Tiedtke (0.0051 against 0.0014
 mm/day area-weighted, Tiedtke raining in no column at all), both schemes being
 one day out of an initial state. An instantaneous snapshot one day in is a poor
-instrument for either quantity; the firing-rate gap is real and open, and
-sizing it needs the 30-day A/B.
+instrument for either quantity; the 30-day A/B below is what sized it.
+
+**The 30-day A/B sizes the firing rate, and makes it a blocker.** Run to the
+local gate's recipe (T63L47, 30 days from `echam-1m-t63_v31_warm.msgpack`
+starting 2000-12-31, 5-day chunks, one A100-40GB), `physics=echam-giss-conv`
+against `physics=echam`, with a noise twin of the control at
+`+constants.grav=9.81000981` to measure weather divergence rather than assume
+it. Area weights are Gauss-Legendre on the Gaussian grid and the surface level
+is resolved from `pressure_full`. The 30-day means, each change given as a
+multiple of the noise twin's drift in the same quantity:
+
+| quantity | control | GISS | change | × noise |
+| --- | --- | --- | --- | --- |
+| TOA net | +3.9 W/m² | −10.5 W/m² | **−14.4 W/m²** | 66 |
+| TOA SW up | 98.0 W/m² | 112.8 W/m² | +15.2 % | 48 |
+| TOA OLR | 243.9 W/m² | 243.4 W/m² | −0.19 % | 5 |
+| liquid water path | 59.1 g/m² | 86.1 g/m² | +45.7 % | 176 |
+| convective precipitation | 1.954 mm/day | 1.549 mm/day | −20.7 % | 19 |
+| large-scale rain | 0.827 mm/day | 1.102 mm/day | +33.3 % | 418 |
+| total precipitation | 2.963 mm/day | 2.826 mm/day | −4.6 % | 6 |
+| near-surface humidity | 8.90 g/kg | 9.43 g/kg | +6.0 % | 81 |
+| near-surface temperature | 286.08 K | 286.04 K | −0.01 % | 1.2 |
+
+The gate asks for a 1 % global-mean move or 0.5 W/m² at TOA, at ≥3× the noise
+twin. This clears it on every row but temperature, the TOA term by a factor of
+29. The days 5–10 pre-divergence window agrees with the 30-day mean to 0.03
+percentage points on convective precipitation, so these are systematic
+properties of the scheme and not weather.
+
+One chain explains all of it. The term convects in 0.3 % of columns where
+Tiedtke convects in 4.6 %, so it removes 20.7 % less water as convective rain;
+the column it leaves behind is 6.0 % moister; the stratiform scheme condenses
+that excess, lifting liquid water path 45.7 % (81 % in the tropics) and
+large-scale rain 33.3 %; the resulting clouds reflect 15 W/m² more shortwave.
+OLR does not move at all, so the bias is purely shortwave — an albedo error,
+not a greenhouse one. Total precipitation falls only 4.6 % because the
+stratiform compensation is nearly complete, which is why a near-correct global
+precipitation here is a compensation artifact and must not be read as the
+scheme being approximately right.
+
+Double counting of the detrained condensate is excluded as a cause: the port's
+handoff is `TiedtkeConvection`'s, field for field, and
+`cloud_inputs.cloud_scheme_inputs` subtracts the detrainment from the running
+upstream tendency before adding it back, so it enters the cloud scheme exactly
+once. The liquid water path rise is the physical consequence of under-convecting,
+not a plumbing defect.
+
+Against Tiedtke the port also detrains 58 % less liquid and **84 % less ice**,
+and tropical snow is 77.5 % lower. That is larger than the ~1.1 % the SCM
+attributes to the unported ice microphysics, so the
+`qci_detrainment_multiplier` branch is a candidate for more of the global error
+than the column cases suggest.
+
+**Cost.** The term integrates 30 days in 157.4 min against the Tiedtke
+preset's 12.0 min on the same A100 — **13.1×**, or ~11 simulated days per hour
+against ~180. Running it with the full 40 GB rather than the 9 GB left by a
+careless host process bought 3.6 %, so this is the term's cost and not a
+memory-pressure artifact. The plume scan, not the compile, dominates: XLA
+compilation is a one-off ~30 min and the persistent compile cache removes it on
+a rerun.
 
 **The term is coupled to its neighbours in both directions.** Publishing the
 detrainment was the output half; the input half is that `GissConvection` read
@@ -388,16 +446,28 @@ evaporates 40.9% of its production into the downdraft against ModelE's 44.3%.
 
 **Not yet done.**
 
-1. A **validated global run**. The term now *runs* globally: `+configuration=
-   t63-echam-1m physics=echam-giss-conv run=smoke` completes a day at T63L47
-   with RRTMGP, every output field finite, under the runner's health gates
-   (`bail_on_unhealthy`) and without tripping them. Convection is active across
-   the grid — a cloud base in nearly every column, `cloud_base_mass_flux` to
-   149 kg/m², `mcp` to 13.8 mm/day. That is a smoke test and nothing more: the
-   global magnitudes have no oracle behind them, and the A/B against
-   `physics=echam` that would size the term's effect on the simulated climate
-   has not been run. It also took 1 h 54 m on this CPU host, essentially all of
-   it XLA compilation, so the A/B needs a GPU.
+1. The **firing rate**, which the 30-day A/B above turned from an open
+   question into the port's one blocking defect. The term convects in 0.3 % of
+   columns against Tiedtke's 4.6 %, and that single difference propagates to a
+   −14.4 W/m² TOA shortwave bias through a moister column and a brighter
+   stratiform deck. The column cases bound how much of this the plume can
+   explain: the port's condensate production is 0.91 of ModelE's on TWP-ICE and
+   BOMEX, nowhere near enough for −20.7 % of convective precipitation globally.
+   The deficit is therefore in *how often a column convects at all* rather than
+   in how much a convecting column produces, which points at the trigger and
+   the closure rather than the plume — the unported detached single-layer
+   source branch, worth ~30 % of the column production deficit, being the first
+   suspect. Until it is closed the term is not usable for a coupled climate
+   run, whatever its column-level fidelity.
+
+   What *is* settled is that it runs globally and stably. `+configuration=
+   t63-echam-1m physics=echam-giss-conv` completes 30 days at T63L47 with
+   RRTMGP, every output field finite, under the runner's health gates
+   (`bail_on_unhealthy`) and without tripping them, with a cloud base in nearly
+   every column, `cloud_base_mass_flux` to 149 kg/m² and `mcp` to 13.8 mm/day.
+   Near-surface temperature moves 0.01 % over the 30 days, within the noise
+   twin, so nothing in the term is injecting or removing heat the rest of the
+   stack has to absorb at global scale.
 
    The single-column half of the coupling is more than a smoke test: the preset's own term
    list, built through Hydra with the grey two-stream standing in for RRTMGP,
