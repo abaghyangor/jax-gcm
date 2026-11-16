@@ -965,3 +965,76 @@ class TestTheEnvironmentIsThePostDiffusionColumn(unittest.TestCase):
         np.testing.assert_array_equal(
             np.asarray(out["convection"].mcp),
             np.asarray(same_out["convection"].mcp))
+
+
+class TestTheDiagnosticsAreInTheStatesFrame(unittest.TestCase):
+    """``dth_mc``/``dq_mc`` are published in the frame the state uses.
+
+    The plume code works in ModelE's own vertical frame and returns these two
+    there, while the tendency it returns alongside them is flipped back. A
+    publication that skipped that flip put a deep plume's convective heating
+    maximum in the mesosphere and left the whole troposphere reading as
+    exactly zero. The model integrates the tendency and never these, so no
+    budget, conservation check or column case could see it; it took plotting a
+    global run's heating against pressure. These tests read the two fields
+    against each other so the frames cannot drift apart again.
+    """
+
+    def _column(self, nlev=24):
+        """Build a column unstable enough to convect over part of its depth."""
+        pfull = jnp.linspace(10000.0, 100000.0, nlev)[:, None]
+        temperature = jnp.linspace(210.0, 300.0, nlev)[:, None]
+        humidity = jnp.linspace(0.00002, 0.018, nlev)[:, None]
+        state = PhysicsState.zeros(
+            (nlev, 1), temperature=temperature, specific_humidity=humidity)
+        density = pfull / (287.0 * temperature)
+        dp = jnp.abs(jnp.gradient(pfull, axis=0))
+        return state, {"pressure_full": pfull,
+                       "layer_thickness": dp / (_G * density),
+                       "air_density": density}
+
+    def _run(self):
+        state, diagnostics = self._column()
+        term = GissConvection(allow_mc=True)
+        tendency, out = term(state, diagnostics, None, None)
+        return tendency, out
+
+    def test_the_heating_diagnostic_shares_the_tendencys_frame(self):
+        tendency, out = self._run()
+        dth = np.asarray(out["convection"].dth_mc)[:, 0]
+        dtemp = np.asarray(tendency.temperature)[:, 0]
+        self.assertTrue(np.any(dth != 0.0), "the column did not convect")
+        # Without this the test would pass on a column whose active levels
+        # happen to be symmetric about the middle, where a flip is invisible.
+        self.assertFalse(
+            np.array_equal(dth != 0.0, (dth != 0.0)[::-1]),
+            "this column is vertically symmetric, so it cannot detect a flip")
+        np.testing.assert_array_equal(
+            dth != 0.0, dtemp != 0.0,
+            "dth_mc is not in the same vertical frame as the temperature "
+            "tendency computed from it")
+
+    def test_the_moistening_diagnostic_shares_the_tendencys_frame(self):
+        tendency, out = self._run()
+        dq = np.asarray(out["convection"].dq_mc)[:, 0]
+        dq_dt = np.asarray(tendency.specific_humidity)[:, 0]
+        self.assertTrue(np.any(dq != 0.0), "the column did not convect")
+        np.testing.assert_array_equal(
+            dq != 0.0, dq_dt != 0.0,
+            "dq_mc is not in the same vertical frame as the humidity "
+            "tendency computed from it")
+
+    def test_convective_heating_stays_out_of_the_model_top(self):
+        """A plume cannot heat the top of the atmosphere.
+
+        The frame tests above pin the two fields to each other; this one
+        pins them to physical reality, so that flipping *both* consistently
+        in the wrong direction would still fail.
+        """
+        _, out = self._run()
+        dth = np.asarray(out["convection"].dth_mc)[:, 0]
+        # The column is top-first, so index 0 is the model top.
+        self.assertEqual(
+            dth[0], 0.0,
+            "convective heating reached the model top, so the profile is "
+            "upside down")
