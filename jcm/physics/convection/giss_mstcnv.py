@@ -544,7 +544,17 @@ class GissConvection(PhysicsTerm):
                 tracers={**tendency.tracers, **tracers})
         convection = GissConvectionData.zeros(nodal_shape, nlev).copy(
             cloud_base=cloud_base, cloud_base_mass_flux=fmp2,
-            dth_mc=dth_mc, dq_mc=dq_mc, mcp=mcp,
+            # Flipped into the frame the state uses, which is the frame every
+            # other published field is in. The plume code works in ModelE's
+            # own frame (`L=1` at the ground) and returns `dth_mc`/`dq_mc`
+            # there, while `dtemp_dt` and `d_qc` are already flipped back at
+            # their own returns. Published unflipped these two land upside
+            # down in the output -- a deep plume's heating maximum appears in
+            # the mesosphere and the troposphere reads as exactly zero, which
+            # is how this was found. The tendency the model integrates never
+            # went through here, so only the diagnostic was ever wrong.
+            dth_mc=jnp.flip(dth_mc, axis=0),
+            dq_mc=jnp.flip(dq_mc, axis=0), mcp=mcp,
             # The same rain as a flux, which is what the rest of jcm reads:
             # `EchamSurfaceExchange` sums it into the total surface
             # precipitation. 1 mm of water is 1 kg/m^2.

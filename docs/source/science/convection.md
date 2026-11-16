@@ -117,9 +117,12 @@
   **−14.4 W/m² at top of atmosphere**, 29 times the local gate's threshold and
   66 times the noise twin's drift. It removes 20.7 % less water as
   convective rain — not by triggering too rarely, since it convects over more
-  area than Tiedtke (70.9 % of columns against 54.1 %), but by missing the
-  heavy events, the area raining above 5 mm/day being halved while the extreme
-  tail runs heavier. It leaves the column 6.0 % moister, and the stratiform scheme
+  area than Tiedtke (70.9 % of columns against 54.1 %), but because its plumes
+  stop too low. Its median tropical plume top is 405 hPa against Tiedtke's
+  180 hPa, and 6.9 % of its convecting columns reach 150–50 hPa where 40.5 %
+  of Tiedtke's do, so the area raining above 5 mm/day is halved. The
+  termination criterion is what needs the work; the trigger and the closure
+  mass flux are not implicated. It leaves the column 6.0 % moister, and the stratiform scheme
   condensing that excess lifts liquid water path 45.7 % and reflects 15 W/m²
   more shortwave. Outgoing longwave does not move, so the bias is an albedo
   error. Total precipitation falls only 4.6 %, the stratiform pathway almost

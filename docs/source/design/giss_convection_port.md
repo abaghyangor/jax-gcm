@@ -358,12 +358,21 @@ conditional intensity where a column is active runs at 0.73 of Tiedtke's
 (0.53 at the 90th percentile). Above the 99th percentile the port is *stronger*
 than Tiedtke, 1.55× at the 99.9th.
 
-That combination — too much area at drizzle intensity, half the area at
-raining intensity, a heavier extreme tail — is a bimodal response rather than a
-weak one: columns either barely convect or convect explosively, instead of
-grading smoothly with instability. It is the signature the buoyancy sort's
-knife edge would produce, its thresholds sitting at ~1.7e-4 against inputs good
-to ~2e-4, where a sub-0.1 K error flips a blend fate.
+**The missing rain is missing plume depth.** Taking the top of each column's
+convective heating profile, the port's median tropical plume top is **405 hPa
+against Tiedtke's 180 hPa**, and only 6.9 % of its convecting columns carry a
+plume into 150–50 hPa where 40.5 % of Tiedtke's do — a factor of 0.17. It
+instead fills the 600–250 hPa band that Tiedtke leaves nearly empty, at 4.7×
+and 4.5× Tiedtke's share there. Tiedtke is bimodal in depth by construction,
+having separate shallow and deep closures; the port is unimodal and
+mid-level. A plume that stops near 450 hPa cannot rain like one reaching the
+tropopause, and that is where the 3–30 mm/day band goes.
+
+This is the column-level diagnosis seen globally. The SCM cases attribute the
+production deficit to an ascent that terminates early; the global tops show
+exactly that, and give it a magnitude — the median plume is ~225 hPa short of
+where Tiedtke puts it. It is the termination criterion that needs the work,
+not the trigger, the closure mass flux, or the microphysics.
 
 An earlier reading of this run attributed the deficit to the term triggering
 too rarely, from an instantaneous one-day snapshot putting it at 0.3 % of
@@ -384,6 +393,18 @@ and tropical snow is 77.5 % lower. That is larger than the ~1.1 % the SCM
 attributes to the unported ice microphysics, so the
 `qci_detrainment_multiplier` branch is a candidate for more of the global error
 than the column cases suggest.
+
+**One diagnostic was published upside down.** `convection.dth_mc` and
+`dq_mc` were written in the plume code's own vertical frame — ModelE's, with
+`L=1` at the ground — while every other published field is in the state's.
+A deep plume's heating maximum therefore appeared at 17 hPa with the whole
+troposphere reading as exactly zero. Only the diagnostics were affected: the
+tendency the model integrates is flipped back at its own return, which is why
+no budget, conservation check or column case caught it, and why the simulated
+climate above is unaffected. The plume tops in this section are read from the
+corrected orientation. `TestTheDiagnosticsAreInTheStatesFrame` now pins both
+fields against the tendencies they are computed from, and against a plume
+being unable to heat the model top.
 
 **Cost.** The term integrates 30 days in 157.4 min against the Tiedtke
 preset's 12.0 min on the same A100 — **13.1×**, or ~11 simulated days per hour
