@@ -259,6 +259,8 @@ TWP-ICE's. Carrying the flux out of the descent instead took BOMEX from 0.455
 to **0.981** (absolute error 27× smaller) and TWP-ICE from 0.927 to **1.017**,
 with the median period moving from 0.80 to 1.00; it is also non-negative by
 construction, since each evaporation is capped at the stream it draws from.
+Both figures predate the terminal-dump fix, which raises the delivered flux
+again — see "Landing the dump correctly costs surface rain on TWP-ICE" below.
 
 **The detrained condensate reaches the cloud scheme.** `MSTCNV` splits what a
 plume condenses three ways — the rain it sheds (`condpr`), the condensate the
@@ -443,6 +445,42 @@ warmer. Holding the parcel excess to an implausible 18 K still leaves 38 %.
 The realised figure needs a re-run of the A/B to measure; the fix also moves
 the detrained mass, heat and water down a level, so the 30-day numbers above
 are all superseded by it.
+
+### Landing the dump correctly costs surface rain on TWP-ICE
+
+The fix moves heat and water as well as phase, and the surface precipitation it
+delivers moves with them. Measured by one script over the same periods on both
+sides of the change (BOMEX 48, TWP-ICE 749 of 766 with ModelE's `mcp` above
+zero — a wider population than the 223-period table above, so these numbers
+compare only with each other):
+
+| case | before | after | median period before → after |
+|------|--------|-------|------------------------------|
+| BOMEX | 0.981 | **0.994** | 0.997 → 1.001 |
+| TWP-ICE | 0.995 | **1.095** | 1.002 → 1.076 |
+
+The sign is the same in both: the port rains more. On BOMEX, which was short,
+that closes the gap. On TWP-ICE, which was already at 0.995, it overshoots by
+9.5 %, and the error against ModelE grows roughly eighteenfold. Periods off by
+more than 3× fall slightly, 60 to 51.
+
+The placement itself is not in doubt — ModelE's own `dm` per level is exact
+after the change and was split across two levels before it, and no reading of
+`continuity_diag.txt` makes the old split right. What the overshoot says is
+that the misplacement was **compensating** for something: depositing a plume's
+terminal heat one layer too high stabilised the air above each plume top
+against the next candidate, suppressing convection the port needed suppressed
+for the wrong reason. With that gone, deep convection rains too much on the
+case with the most plume terminations — and the effect scales with depth, which
+is why BOMEX moves 1 % and TWP-ICE 10 %.
+
+Which direction that runs globally is **not** settled by this. The 30-day A/B
+had convective precipitation 20.7 % *low*, so a scheme that now rains more may
+close much of that; but a single-step harness on ModelE's own column is not a
+free-running GCM, and the extrapolation is a guess until the A/B is re-run.
+What should not be concluded is that TWP-ICE's 0.995 was evidence of fidelity:
+it was a compensation, of the same kind as the near-correct global total
+precipitation above.
 
 **One diagnostic was published upside down.** `convection.dth_mc` and
 `dq_mc` were written in the plume code's own vertical frame — ModelE's, with
