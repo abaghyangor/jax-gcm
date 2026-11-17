@@ -944,8 +944,41 @@ def plume_ascent(cloud_base: jnp.ndarray,
             return jnp.where(survives, value, 0.0)
 
         next_mass = jnp.where(survives, sorted_blends.plume_mass, mass)
-        def dump(value):
-            return jnp.where(terminating, value, 0.0)
+
+        # A plume that fails its entry test never occupied this level, so what
+        # it still carries belongs to the level **below** -- ModelE decrements
+        # `lmax` back to "the highest layer actually reached" (MSTCNV.F90:2163)
+        # before `DM(LMAX) += MPLUME` and `DWM(LMAX) += WMP` (`:2205-2210`).
+        # The scan cannot write backwards, so the dump is emitted here and
+        # shifted one level down once the scan has run.
+        #
+        # Against `continuity_diag.txt` (BOMEX step 1, first plume, which runs
+        # levels 10-16 as ModelE's does) ModelE puts all of `dm(16) = 16.8468`
+        # at its top level, where emitting the dump in place split it as
+        # 8.434 at level 16 and 8.413 at 17. That oracle covers the whole
+        # tendency chain and nothing had checked it.
+        #
+        # The phase travelled with the level, so the misplacement also stranded
+        # it: `latent_heat` is recorded under `keep`, which is false exactly
+        # where the dump landed, and `_is_ice(0.0)` is False -- so every
+        # plume's terminal dump was published as liquid however cold it was.
+        # In a 30-day T63 run that put 23% of all detrained condensate into
+        # liquid below 240 K and drove the tropical ice fraction of detrained
+        # condensate monotonically *down* with height, 0.84 at 368 hPa to 0.004
+        # at 91 hPa, where it must rise to 1. Landing the dump on the level the
+        # plume reached fixes both at once, because that level condensed and so
+        # has a phase -- ModelE's own `LHXMC(L) = VLAT(L)` across `lcl..lmax`
+        # (`:2334-2337`), applied to the sort's detrainment and the dump alike.
+        def dump_below(value):
+            return jnp.where(terminating & ~survives, value, 0.0)
+
+        # A plume still rising at the model top has nowhere left to go. It did
+        # occupy this level, so it detrains here and needs no shift. ModelE
+        # never reaches this branch -- its loop is bounded by `lm` and the
+        # stratosphere stops the plume first -- but without it the entrained
+        # mass has no way back into the environment.
+        def dump_here(value):
+            return jnp.where(terminating & survives, value, 0.0)
 
         carry = (next_mass,
                  jnp.where(survives, sorted_blends.plume_heat, heat),
@@ -964,10 +997,11 @@ def plume_ascent(cloud_base: jnp.ndarray,
                    keep(condensate), keep(rained_mass), keep(lag),
                    keep(w), keep(ent), keep(det),
                    keep(environment_air),
-                   keep(sorted_blends.detrained_mass) + dump(mass),
-                   keep(sorted_blends.detrained_heat) + dump(heat),
-                   keep(sorted_blends.detrained_water) + dump(water),
-                   keep(sorted_blends.detrained_condensate) + dump(condensate),
+                   keep(sorted_blends.detrained_mass) + dump_here(mass),
+                   keep(sorted_blends.detrained_heat) + dump_here(heat),
+                   keep(sorted_blends.detrained_water) + dump_here(water),
+                   keep(sorted_blends.detrained_condensate)
+                   + dump_here(condensate),
                    keep(sorted_blends.downdraft_mass),
                    keep(sorted_blends.downdraft_heat),
                    keep(sorted_blends.downdraft_water),
@@ -984,7 +1018,11 @@ def plume_ascent(cloud_base: jnp.ndarray,
                    keep(bdzsum_here),
                    keep(latent_heat_of(level_phase)),
                    keep(sorted_blends.removed_fraction),
-                   survives)
+                   survives,
+                   # Shifted onto the level below once the scan has run; see
+                   # `dump_below`. Not part of `PlumeAscent`.
+                   dump_below(mass), dump_below(heat),
+                   dump_below(water), dump_below(condensate))
         return carry, outputs
 
     # `previous_w`/`previous_w2` start at the cloud-base updraft speed, which is
@@ -1001,6 +1039,23 @@ def plume_ascent(cloud_base: jnp.ndarray,
         (level_axis, environment_heat, environment_water,
          environment_virtual_temperature, layer_mass, layer_depth,
          layer_thickness, height, exner, pressure))
+
+    # Land each terminal dump on the level the plume actually reached, one
+    # below the level whose entry test it failed. `level_axis` increases
+    # upwards, so dropping the first element and padding the top end moves
+    # every stream down exactly one level. A plume that fails at level 0 has
+    # no level below to reach -- ModelE cannot express that either, since its
+    # `lmin` is at least 1 -- so that one is kept where it is rather than
+    # shifted off the bottom, which would silently lose the mass.
+    outputs = list(outputs)
+    dumps, outputs = outputs[-4:], outputs[:-4]
+    for field, stream in zip(("detrained_mass", "detrained_heat",
+                              "detrained_water", "detrained_condensate"),
+                             dumps):
+        index = PlumeAscent._fields.index(field)
+        shifted = jnp.concatenate(
+            [stream[1:], jnp.zeros_like(stream[:1])], axis=0)
+        outputs[index] = outputs[index] + shifted.at[0].add(stream[0])
     return PlumeAscent(*outputs)
 
 

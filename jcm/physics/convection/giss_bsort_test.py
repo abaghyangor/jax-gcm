@@ -793,3 +793,77 @@ class TestPlumeGlaciation(unittest.TestCase):
         reached = np.asarray(ascent.active)
         np.testing.assert_allclose(np.asarray(ascent.latent_heat)[reached],
                                    gt.LHS)
+
+
+class TestTheTerminalDumpLandsOnTheLevelReached(unittest.TestCase):
+    """Where a plume puts what it is still carrying when it stops.
+
+    ModelE decrements ``lmax`` to "the highest layer actually reached"
+    (MSTCNV.F90:2163) before ``DM(LMAX) += MPLUME``, so the dump goes to the
+    last level the plume occupied -- not to the level whose entry test it
+    failed, where it never condensed and has no phase. Emitting it there split
+    the detrainment across two levels and stranded its ``lhx`` at zero, which
+    ``_is_ice`` reads as liquid.
+    """
+
+    def test_per_level_detrainment_matches_the_continuity_oracle(self):
+        # ModelE's own `dm(l)` for this plume, from `continuity_diag.txt`
+        # (BOMEX step 1, first plume). This is the post-loop total -- the
+        # buoyancy sort's detrainment plus the terminal dump -- and is the one
+        # part of the tendency chain its Fortran comment records as never
+        # having been checked against an oracle.
+        want = {10: 32.49318, 11: 10.42755, 12: 25.08094, 13: 21.61005,
+                14: 12.09685, 15: 0.0, 16: 16.84680}
+        got = np.asarray(_run_column().detrained_mass)
+        for level, expected in want.items():
+            if expected == 0.0:
+                self.assertEqual(float(got[level]), 0.0, msg=f"level {level}")
+            else:
+                self.assertAlmostEqual(float(got[level]) / expected, 1.0,
+                                       delta=1e-4, msg=f"level {level}")
+        # Level 16 is the last the plume reaches, so nothing may detrain above
+        # it: the whole 16.8468 belongs there, not 8.434 there and 8.413 at 17.
+        self.assertEqual(float(np.sum(got[17:])), 0.0)
+
+    def test_nothing_detrains_above_the_level_the_plume_reached(self):
+        # The property behind the oracle row, over every glaciation state the
+        # fixture can reach -- lowering `tfmc` stops the plume earlier, which
+        # moves the dump without changing where it must land.
+        for threshold in (258.16, 291.0, 290.0, 289.0, 288.0):
+            with mock.patch.object(bs, "_TFMC", threshold):
+                ascent = _run_column()
+            reached = np.asarray(ascent.active)
+            self.assertTrue(reached.any(), f"no ascent at _TFMC={threshold}")
+            top = int(np.max(np.where(reached)[0]))
+            for name in ("detrained_mass", "detrained_heat", "detrained_water",
+                         "detrained_condensate"):
+                above = np.asarray(getattr(ascent, name))[top + 1:]
+                self.assertEqual(float(np.sum(np.abs(above))), 0.0,
+                                 f"_TFMC={threshold}: {name} above level {top}")
+
+    def test_every_level_carrying_condensate_carries_a_phase(self):
+        # The phase travelled with the level, so misplacing the dump stranded
+        # it. `latent_heat` is what the driver splits liquid from ice on, and
+        # zero there reads as liquid at any temperature.
+        for threshold in (258.16, 291.0, 290.0, 289.0, 288.0):
+            with mock.patch.object(bs, "_TFMC", threshold):
+                ascent = _run_column()
+            det = np.asarray(ascent.detrained_condensate)
+            lhx = np.asarray(ascent.latent_heat)
+            unphased = (det > 0.0) & (lhx == 0.0)
+            self.assertFalse(unphased.any(),
+                             f"_TFMC={threshold}: condensate with no phase at "
+                             f"levels {np.where(unphased)[0].tolist()}")
+
+    def test_a_glaciated_plume_detrains_its_last_condensate_as_ice(self):
+        # Lower the threshold until the fixture's ~291 K parcel freezes before
+        # it stops, so the plume is demonstrably icy when it terminates, and
+        # the condensate it leaves behind must be ice.
+        with mock.patch.object(bs, "_TFMC", 289.0):
+            ascent = _run_column()
+        reached = np.asarray(ascent.active)
+        top = int(np.max(np.where(reached)[0]))
+        self.assertGreater(
+            float(np.asarray(ascent.detrained_condensate)[top]), 0.0,
+            "no condensate was left at the top, so nothing is pinned")
+        self.assertEqual(float(np.asarray(ascent.latent_heat)[top]), gt.LHS)
