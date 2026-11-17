@@ -104,7 +104,9 @@
   BOMEX's plume condensate — is handed to the cloud scheme as
   ``clouds.conv_detrainment_qc``/``_qi`` and as a qc/qi tracer tendency, the
   same handoff Tiedtke makes with ECHAM's ``pxtecl``/``pxteci``, with the phase
-  taken from the ``lhx`` the ascent condensed at. The environment it convects
+  taken from the ``lhx`` the ascent condensed at. A plume that stops leaves
+  what it still carries on the last level it reached, with that level's phase,
+  as ModelE's ``DM(LMAX)``/``LHXMC(L) = VLAT(L)`` do. The environment it convects
   is the running ``thermo_run`` view where a composition seeds one — the column
   after vertical diffusion and the surface exchange, which is what ECHAM hands
   ``cumastr`` and what ModelE's ``CLOUDS_DRV`` ordering gives ``MSTCNV`` — and
@@ -127,9 +129,11 @@
   more shortwave. Outgoing longwave does not move, so the bias is an albedo
   error. Total precipitation falls only 4.6 %, the stratiform pathway almost
   exactly compensating, so the global precipitation is not evidence the scheme
-  is approximately right. Closing that firing-rate gap is a precondition for
-  using the term in a coupled climate run. It also costs 13.1× the Tiedtke
-  preset for the same integration. Three of ModelE's inputs are
+  is approximately right. Closing that depth gap is a precondition for
+  using the term in a coupled climate run. It detrains 84 % less ice than
+  Tiedtke; 43 % of that was a phase the terminal dump had lost by landing one
+  level too high, now fixed, and the remainder is the same missing depth. It also costs 13.1× the
+  Tiedtke preset for the same integration. Three of ModelE's inputs are
   prognostic there and are read here as optional diagnostics defaulting to zero
   — the cold-pool fraction, the penetrative mass and the running cloud-top
   pressure — so a global configuration does not yet reproduce what the oracle

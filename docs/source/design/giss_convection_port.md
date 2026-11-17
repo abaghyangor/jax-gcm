@@ -388,11 +388,61 @@ upstream tendency before adding it back, so it enters the cloud scheme exactly
 once. The liquid water path rise is the physical consequence of under-convecting,
 not a plumbing defect.
 
+### The detrained-ice deficit is its own defect, not a consequence of the depth
+
 Against Tiedtke the port also detrains 58 % less liquid and **84 % less ice**,
-and tropical snow is 77.5 % lower. That is larger than the ~1.1 % the SCM
-attributes to the unported ice microphysics, so the
-`qci_detrainment_multiplier` branch is a candidate for more of the global error
-than the column cases suggest.
+and tropical snow is 77.5 % lower. A shallower plume would explain that on its
+own — a plume that stops warm never reaches the levels where its condensate
+freezes — but the run says the opposite. The port detrains **44.9 %** of its
+tropical condensate above the 258.16 K glaciation threshold against the
+control's 9.7 %: it detrains *more* in the cold, not less.
+
+What it detrains there is the wrong phase. The ice fraction of detrained
+condensate falls monotonically **upward** through the tropical troposphere —
+0.84 at 368 hPa, 0.55 at 235 hPa, 0.33 at 180 hPa, **0.004 at 91 hPa (191 K)** —
+where it must rise to 1. **23.4 %** of everything the port detrains is liquid at
+an environment below 240 K, which needs an 18 K parcel excess to be physical.
+
+The cause is one level of misplacement in `plume_ent_det_w2_bsort`. A level's
+detrained condensate is the buoyancy sort's share plus, where the plume stops,
+everything it is still carrying. The port emitted that terminal dump at the
+level whose entry test the plume **failed**; ModelE emits it one level lower,
+decrementing `lmax` to "the highest layer actually reached" (`:2163`) before
+`DM(LMAX) += MPLUME` and `DWM(LMAX) += WMP` (`:2205-2210`).
+
+The phase travels with the level, so the misplacement stranded it. `lhx` is
+recorded only on levels the plume survived — true of the level it reached,
+false of the one it failed — so the dump landed where `lhx` was 0, and the
+`latent_heat > ½(LHE+LHS)` test that splits liquid from ice reads 0 as liquid.
+Every plume's last and largest act of detrainment was published as liquid
+however cold it was. ModelE has no such gap: it assigns `LHXMC(L) = VLAT(L)`
+across the whole depth `lcl..lmax` (`:2334-2337`) *before* folding the dump into
+`detrQC` (`:2340`), applying one phase to the sort's share and the dump alike.
+Landing the dump on the level the plume reached fixes both at once, because that
+level condensed and therefore has a phase.
+
+`continuity_diag.txt` measures this directly, and nothing had read it — the
+Fortran's own comment records it as "the one part of the tendency chain never
+checked against its own oracle". On BOMEX step 1 the first plume runs levels
+10–16 in both codes, and ModelE puts all of `dm(16) = 16.8468` on its top level
+where the port split it 8.434 at level 16 and 8.413 at 17. The port now
+reproduces ModelE's `dm` on every level of that plume to 4 significant figures,
+and a test pins the whole row.
+
+The existing glaciation tests all masked on `ascent.active`, the survival mask,
+so they examined every level except the broken one.
+
+Splitting the deficit: of the 76 % shortfall in tropical detrained ice, **43 %
+is this phase defect** and **57 % is the missing condensate** — the latter
+genuinely downstream of the shallow plumes and closing only when the ascent
+termination criterion does. Reassigning every gram of sub-258.16 K liquid to
+ice takes the port from 0.24× the control's detrained ice to 0.57×, so 43 % is
+an upper bound on the phase share: the criterion is the environment's
+temperature, while the port decides on the parcel's, which runs a few kelvin
+warmer. Holding the parcel excess to an implausible 18 K still leaves 38 %.
+The realised figure needs a re-run of the A/B to measure; the fix also moves
+the detrained mass, heat and water down a level, so the 30-day numbers above
+are all superseded by it.
 
 **One diagnostic was published upside down.** `convection.dth_mc` and
 `dq_mc` were written in the plume code's own vertical frame — ModelE's, with
@@ -405,6 +455,16 @@ climate above is unaffected. The plume tops in this section are read from the
 corrected orientation. `TestTheDiagnosticsAreInTheStatesFrame` now pins both
 fields against the tendencies they are computed from, and against a plume
 being unable to heat the model top.
+
+Correcting it broke the single-column harness in the bridge repo, which had
+been reading `dth_mc`/`dq_mc` straight out of the term and scoring them against
+ModelE's surface-first columns — correct only for as long as the term published
+in ModelE's frame. Every profile the harness scored was then reversed: RICO's
+per-period heating correlation reads −0.07 against +0.989 flipped. Nothing in
+`jcm` can catch this, because the harness is the thing that holds the two
+conventions together; `TestCrossCaseAgreement` caught it, one commit late. The
+lesson for the port is that **the bridge suite is part of the gate for any
+change to a published convection field**, not only for changes to the physics.
 
 **Cost.** The term integrates 30 days in 157.4 min against the Tiedtke
 preset's 12.0 min on the same A100 — **13.1×**, or ~11 simulated days per hour
@@ -478,7 +538,9 @@ evaporates 40.9% of its production into the downdraft against ModelE's 44.3%.
    all-liquid, as is the melting/freezing heat redistribution. Measured at
    **1.1%** of the deficit — and that number is specific to a case where only
    12% of ModelE's rain falls at ice levels, so it must be re-sized before this
-   term is trusted outside the tropics. See `MIXED_PHASE_SUPPORTED`.
+   term is trusted outside the tropics. See `MIXED_PHASE_SUPPORTED`. The global
+   run's 84 % detrained-ice deficit is **not** this gap: 43 % of it was the
+   terminal dump's lost phase, now fixed, and the rest is the depth.
 2. **The terminating-level rain partition.** The port rains 0.650 of ModelE's
    condensate at the level a plume dies on and over-rains by 3.1% below, so the
    column total is 0.990 — a redistribution rather than a loss, worth ~1%. Its

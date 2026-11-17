@@ -16,6 +16,7 @@ NetCDF reader.
 
 import contextlib
 import unittest
+from unittest import mock
 from importlib import resources
 
 import jax
@@ -31,6 +32,7 @@ from jcm.physics.convection.giss_mstcnv import (
     GissConvection,
     cloud_base_closure_mass_flux,
 )
+from jcm.physics.convection import giss_bsort
 from jcm.physics.convection.giss_mass_flux import cloud_base_mass_flux_column
 from jcm.physics.convection.giss_thermodynamics import KAPA
 from jcm.physics.modele.params import GissConvectionParameters
@@ -303,7 +305,16 @@ class TestGissConvectionGridShapes(unittest.TestCase):
                            "the columns should not share one cloud base")
 
     def test_each_column_matches_the_same_column_run_alone(self):
-        """The broadcasting contract, on the full ``allow_mc`` chain."""
+        """The broadcasting contract, on the full ``allow_mc`` chain.
+
+        ``mcp`` is compared more loosely than the tendency. It is a pressure in
+        hPa carried through the whole sweep, so it accumulates the same float32
+        reordering that ``test_two_dimensional_block_matches_the_grid`` below
+        measures at 4e-5 relative -- here one of the six columns lands 0.0008
+        hPa apart on a value of 50. Under ``JAX_ENABLE_X64`` the two paths agree
+        to the last bit, which is what makes this rounding rather than a
+        divergence in the contract.
+        """
         term = GissConvection(allow_mc=True)
         state, diag = _moist_grid(self.GRID)
         grid_tend, grid_out = term(state, diag, None, None)
@@ -323,7 +334,7 @@ class TestGissConvectionGridShapes(unittest.TestCase):
                     np.testing.assert_allclose(
                         np.asarray(grid_out["convection"].mcp[i, j]),
                         np.asarray(one_out["convection"].mcp[0]),
-                        rtol=1e-5, atol=1e-12)
+                        rtol=1e-4, atol=1e-12)
 
     def test_two_dimensional_block_matches_the_grid(self):
         """``(nlev, ncols)`` and ``(nlev, nlon, nlat)`` are the same code.
@@ -332,9 +343,10 @@ class TestGissConvectionGridShapes(unittest.TestCase):
         trailing rank changes the array layout XLA picks, so the float32
         reductions inside the sweep accumulate in a different order. Measured,
         that moves one of the 72 tendencies by 1.5e-8 K/s on a value of
-        -3.9e-4 -- 4e-5 relative. The per-column comparison does not see this
-        because it holds the grid layout fixed and only varies which column is
-        read out.
+        -3.9e-4 -- 4e-5 relative. The per-column comparison above holds the
+        grid layout fixed and only varies which column is read out, so it sees
+        far less of this -- but not none, which is why its ``mcp`` comparison
+        carries its own looser tolerance.
         """
         term = GissConvection(allow_mc=True)
         grid_state, grid_diag = _moist_grid(self.GRID)
@@ -824,33 +836,48 @@ class TestDetrainedCondensate(unittest.TestCase):
         np.testing.assert_array_equal(
             np.asarray(out["clouds"].conv_detrainment_qi),
             np.asarray(tendency.tracers["qi"]))
+        # Non-vacuity. The fixture's plume rises from a 300 K surface to
+        # 217 hPa, so what it leaves behind is ice -- the total is what proves
+        # something was handed over, not the liquid slot alone.
         self.assertGreater(
-            float(jnp.sum(out["clouds"].conv_detrainment_qc)), 0.0)
+            float(jnp.sum(out["clouds"].conv_detrainment_qc)
+                  + jnp.sum(out["clouds"].conv_detrainment_qi)), 0.0)
 
     def test_the_detrainment_is_non_negative_and_phase_split(self):
-        """Warm column -> liquid only; the ice slot is the glaciated part.
+        """The split follows the ascent's own ``lhx``, and conserves the total.
 
-        The split is read back from the ascent's own ``lhx`` rather than from a
-        temperature test here, so a warm column proves the plumes never
-        glaciated and a cold one that the ice path is reachable at all.
+        Both fixtures convect to levels far below freezing -- the surface-300 K
+        column detrains at 217 hPa and 222 K -- so both must come back as ice.
+        Moving ``tfmc`` below the detraining level is what exercises the liquid
+        side, and it must move the same water between the slots rather than
+        change how much there is. Asserting liquid here instead was pinning a
+        defect: the terminal dump landed on the level the plume failed at,
+        which has no phase, and a missing phase reads as liquid.
         """
-        warm_state, warm_diag, _ = self._column()
-        _, warm = GissConvection(allow_mc=True)(
-            warm_state, warm_diag, None, None)
-        cold_state, cold_diag, _ = self._column(ice=True)
-        cold_tend, _ = GissConvection(allow_mc=True)(
-            cold_state, cold_diag, None, None)
+        for ice in (False, True):
+            state, diag, _ = self._column(ice=ice)
+            tendency, _ = GissConvection(allow_mc=True)(
+                state, diag, None, None)
+            qc, qi = tendency.tracers["qc"], tendency.tracers["qi"]
+            for name, value in (("qc", qc), ("qi", qi)):
+                self.assertTrue(bool(jnp.all(value >= 0.0)),
+                                f"ice={ice}: {name} detrainment went negative")
+                self.assertTrue(bool(jnp.all(jnp.isfinite(value))))
+            total = float(jnp.sum(qc) + jnp.sum(qi))
+            self.assertGreater(total, 0.0, f"ice={ice}: nothing detrained")
+            self.assertEqual(float(jnp.sum(qc)), 0.0,
+                             f"ice={ice}: a plume above its glaciation level "
+                             "detrained liquid")
 
-        warm_tend, _ = GissConvection(allow_mc=True)(
-            warm_state, warm_diag, None, None)
-        for name in ("qc", "qi"):
-            self.assertTrue(
-                bool(jnp.all(warm_tend.tracers[name] >= 0.0)),
-                f"{name} detrainment went negative")
-            self.assertTrue(bool(jnp.all(jnp.isfinite(cold_tend.tracers[name]))))
-        self.assertEqual(float(jnp.sum(warm_tend.tracers["qi"])), 0.0,
-                         "a column above freezing detrained ice")
-        del warm
+            # The same column with the threshold below every level it reaches:
+            # the port's rule now says water, and the total must not move.
+            with mock.patch.object(giss_bsort, "_TFMC", 150.0):
+                liquid, _ = GissConvection(allow_mc=True)(
+                    state, diag, None, None)
+            self.assertEqual(float(jnp.sum(liquid.tracers["qi"])), 0.0)
+            self.assertAlmostEqual(
+                float(jnp.sum(liquid.tracers["qc"])) / total, 1.0, places=5,
+                msg=f"ice={ice}: the phase split did not conserve the total")
 
     def test_it_advances_the_running_thermodynamic_state(self):
         """A pre-cloud term must leave ``thermo_run`` post-convection.
@@ -873,8 +900,11 @@ class TestDetrainedCondensate(unittest.TestCase):
             np.asarray(out["thermo_run"]["temperature"]),
             np.asarray(state.temperature + tendency.temperature * dt),
             rtol=1e-6)
-        self.assertGreater(float(jnp.sum(out["thermo_run"]["qc"])), 0.0,
-                           "the detrained condensate never reached thermo_run")
+        # This column detrains at 222 K, so the condensate arrives as ice.
+        self.assertGreater(
+            float(jnp.sum(out["thermo_run"]["qc"])
+                  + jnp.sum(out["thermo_run"]["qi"])), 0.0,
+            "the detrained condensate never reached thermo_run")
 
     def test_a_host_without_condensate_tracers_still_runs(self):
         """The idealised and SPEEDY stacks carry no qc/qi to detrain into."""
