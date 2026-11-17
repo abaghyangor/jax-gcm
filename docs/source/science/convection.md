@@ -132,7 +132,12 @@
   is approximately right. Closing that depth gap is a precondition for
   using the term in a coupled climate run. It detrains 84 % less ice than
   Tiedtke; 43 % of that was a phase the terminal dump had lost by landing one
-  level too high, now fixed, and the remainder is the same missing depth. It also costs 13.1× the
+  level too high, now fixed, and the remainder is the same missing depth.
+  Landing that dump on the level the plume reached also raises the convective
+  surface rain the single column delivers, from 0.981 to 0.994 of ModelE's on
+  BOMEX and from 0.995 to 1.095 on TWP-ICE: the old placement was
+  compensating, stabilising the air above each plume top against the next
+  candidate, and the deep case now over-rains. It also costs 13.1× the
   Tiedtke preset for the same integration. Three of ModelE's inputs are
   prognostic there and are read here as optional diagnostics defaulting to zero
   — the cold-pool fraction, the penetrative mass and the running cloud-top
