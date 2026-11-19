@@ -867,3 +867,59 @@ class TestTheTerminalDumpLandsOnTheLevelReached(unittest.TestCase):
             float(np.asarray(ascent.detrained_condensate)[top]), 0.0,
             "no condensate was left at the top, so nothing is pinned")
         self.assertEqual(float(np.asarray(ascent.latent_heat)[top]), gt.LHS)
+
+
+class TestTheTerminationReasonMatchesModelEsCode(unittest.TestCase):
+    """``termination_reason`` is ModelE's ``mc_why``, labelled the same way.
+
+    The point of the field is to be comparable with ``ascent_exit_diag.txt``
+    plume for plume, so what has to hold is the *labelling convention*: one
+    non-zero entry per plume, on the level whose entry test failed, carrying the
+    code of the **first** test that failed in ModelE's order
+    (``MSTCNV.F90:1843-1927``). A conjunction cannot be read backwards, so a
+    plume failing two tests at once is exactly the case that matters.
+    """
+
+    def test_exactly_one_level_carries_a_reason(self):
+        ascent = _run_column()
+        reason = np.asarray(ascent.termination_reason).squeeze()
+        self.assertEqual(int(np.count_nonzero(reason)), 1,
+                         f"one plume terminates once; got {np.nonzero(reason)}")
+        # It sits one above the top the plume reached, which is the level whose
+        # test it failed -- the same level ModelE sets `mc_why` on before
+        # decrementing `lmax` (`:2163`).
+        active = np.asarray(ascent.active).squeeze()
+        self.assertEqual(int(np.argmax(reason != 0)),
+                         int(np.max(np.nonzero(active))) + 1)
+
+    def test_a_plume_stopped_by_a_warm_lid_reports_the_overshoot_code(self):
+        """A lid leaves mass and velocity intact, so only test 5 can fire."""
+        warm = jnp.asarray(_column_profile("tvl", 300.0)).at[14:].add(8.0)
+        ascent = _run_column(environment_virtual_temperature=warm)
+        reason = np.asarray(ascent.termination_reason).squeeze()
+        self.assertEqual(int(reason[np.argmax(reason != 0)]), 5)
+
+    def test_the_first_failing_test_wins_when_several_fail_at_once(self):
+        """Priority, not coincidence: a stalled plume reports 1, not 2 or 5.
+
+        Driving the cloud-base mass to a sliver makes the mass tests fail too,
+        and a plume with no kinetic energy is also not buoyant -- ModelE exits
+        on ``wcu2(l-1) <= 0`` first and so must this.
+        """
+        ascent = _run_column(cloud_base_velocity=0.0)
+        reason = np.asarray(ascent.termination_reason).squeeze()
+        nonzero = np.nonzero(reason)[0]
+        self.assertEqual(reason[nonzero[0]], 1)
+
+    def test_the_margin_is_recorded_wherever_the_plume_rose(self):
+        """The margin is recorded wherever the plume rose.
+
+        ModelE writes it for every plume, not only the ones it fires on, so the
+        termination can be compared on the continuous quantity rather than only
+        on which test tripped. It must therefore be finite on every level.
+        """
+        ascent = _run_column()
+        margin = np.asarray(ascent.overshoot_margin).squeeze()
+        active = np.asarray(ascent.active).squeeze()
+        self.assertTrue(np.all(np.isfinite(margin)))
+        self.assertTrue(np.any(margin[active] != 0.0))
