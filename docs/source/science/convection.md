@@ -116,28 +116,36 @@
 
   It runs globally and stably — T63L47, 30 days, every field finite under the
   runner's health gates — but a 30-day A/B against the Tiedtke preset puts it
-  **−14.4 W/m² at top of atmosphere**, 29 times the local gate's threshold and
-  66 times the noise twin's drift. It removes 20.7 % less water as
+  **−14.9 W/m² at top of atmosphere**, 30 times the local gate's threshold and
+  69 times the noise twin's drift. It removes 19.7 % less water as
   convective rain — not by triggering too rarely, since it convects over more
   area than Tiedtke (70.9 % of columns against 54.1 %), but because its plumes
   stop too low. Its median tropical plume top is 405 hPa against Tiedtke's
   180 hPa, and 6.9 % of its convecting columns reach 150–50 hPa where 40.5 %
   of Tiedtke's do, so the area raining above 5 mm/day is halved. The
   termination criterion is what needs the work; the trigger and the closure
-  mass flux are not implicated. It leaves the column 6.0 % moister, and the stratiform scheme
-  condensing that excess lifts liquid water path 45.7 % and reflects 15 W/m²
-  more shortwave. Outgoing longwave does not move, so the bias is an albedo
-  error. Total precipitation falls only 4.6 %, the stratiform pathway almost
-  exactly compensating, so the global precipitation is not evidence the scheme
-  is approximately right. Closing that depth gap is a precondition for
-  using the term in a coupled climate run. It detrains 84 % less ice than
-  Tiedtke; 43 % of that was a phase the terminal dump had lost by landing one
-  level too high, now fixed, and the remainder is the same missing depth.
-  Landing that dump on the level the plume reached also raises the convective
+  mass flux are not implicated. It leaves the column 5.9 % moister, and the stratiform scheme
+  condensing that excess lifts liquid water path 43.4 % and reflects 13.9 W/m²
+  more shortwave, which is 93 % of the bias — an albedo error rather than a
+  greenhouse one. Outgoing longwave carries the remaining 1.0 W/m², and in the
+  opposite sense: the term emits *more* than Tiedtke, the same missing depth
+  read as missing high cloud. Total precipitation falls only 4.6 %, the
+  stratiform pathway almost exactly compensating, so the global precipitation
+  is not evidence the scheme is approximately right. Closing that depth gap is
+  a precondition for using the term in a coupled climate run. It detrains 84 %
+  less ice than Tiedtke; part of that was a phase the terminal dump had lost by
+  landing one level too high, now fixed, and the remainder is the same missing
+  depth. Correcting the placement removes the global ice water path bias
+  entirely, +6.2 % to −0.17 %, by *lowering* suspended ice: the stranded
+  condensate had been published as liquid at 190–240 K, which the stratiform
+  scheme froze and then held aloft. It also raises the convective
   surface rain the single column delivers, from 0.981 to 0.994 of ModelE's on
   BOMEX and from 0.995 to 1.095 on TWP-ICE: the old placement was
   compensating, stabilising the air above each plume top against the next
-  candidate, and the deep case now over-rains. It also costs 13.1× the
+  candidate, and the deep case now over-rains. Globally that correction is
+  worth about 1 W/m² in each direction at TOA and the two nearly cancel, so it
+  moves the net bias by only −0.5 W/m² and leaves the depth deficit as the one
+  defect with a measured climate effect. It also costs 13.1× the
   Tiedtke preset for the same integration. Three of ModelE's inputs are
   prognostic there and are read here as optional diagnostics defaulting to zero
   — the cold-pool fraction, the penetrative mass and the running cloud-top
