@@ -324,28 +324,36 @@ multiple of the noise twin's drift in the same quantity:
 
 | quantity | control | GISS | change | × noise |
 | --- | --- | --- | --- | --- |
-| TOA net | +3.9 W/m² | −10.5 W/m² | **−14.4 W/m²** | 66 |
-| TOA SW up | 98.0 W/m² | 112.8 W/m² | +15.2 % | 48 |
-| TOA OLR | 243.9 W/m² | 243.4 W/m² | −0.19 % | 5 |
-| liquid water path | 59.1 g/m² | 86.1 g/m² | +45.7 % | 176 |
-| convective precipitation | 1.954 mm/day | 1.549 mm/day | −20.7 % | 19 |
-| large-scale rain | 0.827 mm/day | 1.102 mm/day | +33.3 % | 418 |
-| total precipitation | 2.963 mm/day | 2.826 mm/day | −4.6 % | 6 |
-| near-surface humidity | 8.90 g/kg | 9.43 g/kg | +6.0 % | 81 |
-| near-surface temperature | 286.08 K | 286.04 K | −0.01 % | 1.2 |
+| TOA net | +3.9 W/m² | −11.0 W/m² | **−14.9 W/m²** | 69 |
+| TOA SW up | 98.0 W/m² | 111.9 W/m² | +14.2 % | 45 |
+| TOA OLR | 243.9 W/m² | 244.9 W/m² | +0.42 % | 11 |
+| liquid water path | 59.0 g/m² | 84.7 g/m² | +43.4 % | 167 |
+| ice water path | 26.6 g/m² | 26.5 g/m² | −0.17 % | 0.4 |
+| convective precipitation | 1.954 mm/day | 1.569 mm/day | −19.7 % | 18 |
+| large-scale rain | 0.827 mm/day | 1.088 mm/day | +31.5 % | 395 |
+| total precipitation | 2.963 mm/day | 2.828 mm/day | −4.6 % | 6 |
+| near-surface humidity | 8.90 g/kg | 9.42 g/kg | +5.9 % | 79 |
+| near-surface temperature | 286.08 K | 286.02 K | −0.02 % | 1.9 |
+
+Water paths are the vertical integral of the **state** tracers `qc`/`qi`, which
+is where `RRTMGPRadiation` reads condensate from (`rrtmgp.py`); the
+`clouds.qc` diagnostic gives +33.5 % rather than +43.4 % for the same run, and
+it is not the field the radiation sees.
 
 The gate asks for a 1 % global-mean move or 0.5 W/m² at TOA, at ≥3× the noise
-twin. This clears it on every row but temperature, the TOA term by a factor of
-29. The days 5–10 pre-divergence window agrees with the 30-day mean to 0.03
-percentage points on convective precipitation, so these are systematic
-properties of the scheme and not weather.
+twin. This clears it on every row but temperature and ice water path, the TOA
+term by a factor of 69. The days 5–10 pre-divergence window agrees with the
+30-day mean to 0.4 percentage points on convective precipitation, so these are
+systematic properties of the scheme and not weather.
 
-One chain explains all of it. The term removes 20.7 % less water as convective
-rain; the column it leaves behind is 6.0 % moister; the stratiform scheme
-condenses that excess, lifting liquid water path 45.7 % (81 % in the tropics)
-and large-scale rain 33.3 %; the resulting clouds reflect 15 W/m² more
-shortwave. OLR does not move at all, so the bias is purely shortwave — an
-albedo error, not a greenhouse one. Total precipitation falls only 4.6 %
+One chain explains nearly all of it. The term removes 19.7 % less water as
+convective rain; the column it leaves behind is 5.9 % moister; the stratiform
+scheme condenses that excess, lifting liquid water path 43.4 % and large-scale
+rain 31.5 %; the resulting clouds reflect 13.9 W/m² more shortwave. That is
+93 % of the TOA bias, so it is overwhelmingly an albedo error rather than a
+greenhouse one — OLR contributes the remaining 1.0 W/m², and in the opposite
+sense: the port emits *more* OLR than the control, which is the depth deficit
+read in a second channel (see below). Total precipitation falls only 4.6 %
 because the stratiform compensation is nearly complete, which is why a
 near-correct global precipitation here is a compensation artifact and must not
 be read as the scheme being approximately right.
@@ -442,9 +450,9 @@ ice takes the port from 0.24× the control's detrained ice to 0.57×, so 43 % is
 an upper bound on the phase share: the criterion is the environment's
 temperature, while the port decides on the parcel's, which runs a few kelvin
 warmer. Holding the parcel excess to an implausible 18 K still leaves 38 %.
-The realised figure needs a re-run of the A/B to measure; the fix also moves
-the detrained mass, heat and water down a level, so the 30-day numbers above
-are all superseded by it.
+The realised figure is now measured: the re-run below takes the global ice
+water path bias from +6.2 % to −0.17 %, i.e. the whole of it, by *removing*
+suspended ice rather than adding it.
 
 ### Landing the dump correctly costs surface rain on TWP-ICE
 
@@ -474,13 +482,64 @@ for the wrong reason. With that gone, deep convection rains too much on the
 case with the most plume terminations — and the effect scales with depth, which
 is why BOMEX moves 1 % and TWP-ICE 10 %.
 
-Which direction that runs globally is **not** settled by this. The 30-day A/B
-had convective precipitation 20.7 % *low*, so a scheme that now rains more may
-close much of that; but a single-step harness on ModelE's own column is not a
-free-running GCM, and the extrapolation is a guess until the A/B is re-run.
 What should not be concluded is that TWP-ICE's 0.995 was evidence of fidelity:
 it was a compensation, of the same kind as the near-correct global total
 precipitation above.
+
+### The re-run sizes the fix globally, and leaves the blocker where it was
+
+The A/B was re-run on the fixed term, reusing the `control` and `noise` arms —
+both `physics=echam`, so untouched by the change, and their global means come
+back bit-identical, which is what makes the two GISS arms comparable to each
+other. The table above is the post-fix run. Against the pre-fix one:
+
+| quantity | control | pre-fix | post-fix | what the fix did |
+| --- | --- | --- | --- | --- |
+| TOA net | +3.9 W/m² | −10.5 W/m² | −11.0 W/m² | **−0.5 W/m², the wrong way** |
+| TOA SW up | 98.0 W/m² | +15.2 % | +14.2 % | −1.0 W/m² of excess reflection |
+| TOA OLR | 243.9 W/m² | −0.19 % | +0.42 % | +1.5 W/m², overshooting the control |
+| liquid water path | 59.0 g/m² | +45.7 % | +43.4 % | −1.4 g/m² |
+| ice water path | 26.6 g/m² | +6.2 % | −0.17 % | **bias removed** |
+| convective precipitation | 1.954 mm/day | −20.7 % | −19.7 % | +1.0 pp of the deficit |
+| large-scale rain | 0.827 mm/day | +33.3 % | +31.5 % | −1.8 pp of the excess |
+
+Three readings, in descending confidence.
+
+**The ice water path bias is gone.** It was +6.2 % and is now −0.17 %, inside
+the noise twin's own drift. That is the fix doing exactly what the phase
+argument said it would, and it is the one row that moves decisively. Note the
+direction: *correcting* the phase to ice **lowered** the ice water path. The
+stranded condensate was being published as liquid at 190–240 K, where the
+stratiform scheme froze it anyway and then held it aloft; landing it a level
+lower, with the phase the level actually condensed at, puts it where it
+precipitates instead. The pre-fix +6.2 % was never ice the convection
+detrained — the port detrains 84 % *less* ice than Tiedtke — it was the
+stratiform scheme's repair of a misplaced liquid field.
+
+**The port now emits too much OLR, where before it matched.** +0.42 % at 30
+days and +0.51 % in the pre-divergence window, 11× and 20× the noise twin, so
+this is systematic. The sign is the same compensation seen on TWP-ICE surface
+rain: depositing each plume's terminal condensate one level above where the
+plume actually reached was putting high cloud at altitudes the port's plumes
+never attain, which masked the depth deficit in the longwave. With the mask
+removed, too-shallow plumes read as too little high cloud. The fix did not
+create this bias; it stopped hiding it.
+
+**The TOA bias is unchanged to slightly worse, and is still the blocker.**
+−14.4 → −14.9 W/m², which is 0.5 W/m² at 30 days and 1.0 W/m² in the
+pre-divergence window — small, but both windows agree on the sign and both
+exceed the noise twin's TOA drift (0.04 W/m² pre-divergence, 0.22 W/m² at 30
+days) by more than an order of magnitude, so it is not weather. The shortwave
+improvement that partly offsets it is **not** firm: it is 1.0 W/m² at 30 days
+but only 0.2 W/m² at days 5–10, and the two windows disagreeing that way is
+the signature of an adjustment rather than a systematic property.
+
+So the detrained-phase defect was real, is fixed, and is worth about 1 W/m² in
+each direction at TOA with the two nearly cancelling. It is not the −14.9 W/m²
+bias. That remains 93 % shortwave, driven by a liquid water path still 43 %
+high, which is downstream of the ascent terminating ~225 hPa too low. **The
+termination criterion is the merge blocker, and it is now the only one with a
+measured climate effect.**
 
 **One diagnostic was published upside down.** `convection.dth_mc` and
 `dq_mc` were written in the plume code's own vertical frame — ModelE's, with
@@ -577,8 +636,9 @@ evaporates 40.9% of its production into the downdraft against ModelE's 44.3%.
    **1.1%** of the deficit — and that number is specific to a case where only
    12% of ModelE's rain falls at ice levels, so it must be re-sized before this
    term is trusted outside the tropics. See `MIXED_PHASE_SUPPORTED`. The global
-   run's 84 % detrained-ice deficit is **not** this gap: 43 % of it was the
-   terminal dump's lost phase, now fixed, and the rest is the depth.
+   run's 84 % detrained-ice deficit is **not** this gap: part of it was the
+   terminal dump's lost phase, now fixed — worth the whole of the +6.2 % ice
+   water path bias — and the rest is the depth.
 2. **The terminating-level rain partition.** The port rains 0.650 of ModelE's
    condensate at the level a plume dies on and over-rains by 3.1% below, so the
    column total is 0.990 — a redistribution rather than a loss, worth ~1%. Its
@@ -591,9 +651,10 @@ evaporates 40.9% of its production into the downdraft against ModelE's 44.3%.
 **Not yet done.**
 
 1. The **convective intensity distribution**, which the 30-day A/B above
-   turned from an open question into the port's one blocking defect. The term
-   produces 20.7 % less convective rain, and that propagates to a −14.4 W/m²
-   TOA shortwave bias through a moister column and a brighter stratiform deck.
+   turned from an open question into the port's one blocking defect, and which
+   the post-fix re-run leaves untouched. The term produces 19.7 % less
+   convective rain, and that propagates to a −14.9 W/m² TOA bias — 93 % of it
+   shortwave — through a moister column and a brighter stratiform deck.
    It is not a triggering failure: the port convects over more area than
    Tiedtke and finds a cloud base in 70 % of columns. It is that the heavy
    events are missing — half the area above 5 mm/day — while the extreme tail
