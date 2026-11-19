@@ -33,6 +33,7 @@ from jcm.physics.convection.giss_mstcnv import (
     cloud_base_closure_mass_flux,
 )
 from jcm.physics.convection import giss_bsort
+from jcm.physics.convection import giss_mstcnv
 from jcm.physics.convection.giss_mass_flux import cloud_base_mass_flux_column
 from jcm.physics.convection.giss_thermodynamics import KAPA
 from jcm.physics.modele.params import GissConvectionParameters
@@ -135,6 +136,39 @@ class TestGissConvectionTerm(unittest.TestCase):
         )
         self.assertEqual(float(term.params.get_value().dtsrc), 900.0)
         self.assertTrue(term.allow_mc)
+        # Unspecified leaves keep their defaults, which is what lets a config
+        # override one tunable without restating the rest.
+        self.assertEqual(
+            float(term.params.get_value().max_dt_overshoot), 1.0)
+
+    def test_the_overshoot_threshold_reaches_the_ascent(self):
+        """A params override must change what the plume code is handed.
+
+        The term reads ``max_dt_overshoot`` off its params and passes it down
+        four call layers; asserting it on ``term.params`` alone would pass even
+        if the wiring were dropped, which is the mistake worth guarding here
+        since the whole point of the parameter is the global experiment.
+        """
+        from jcm.physics.convection import giss_plume_driver as drv
+
+        seen = {}
+        original = drv.convective_column
+
+        def spy(*a, **k):
+            seen["threshold"] = float(k["max_overshoot_dt"])
+            return original(*a, **k)
+
+        state, diag = self._moist_column()
+        term = GissConvection(
+            params=GissConvectionParameters(dtsrc=jnp.array(1800.0),
+                                            max_dt_overshoot=jnp.array(2.0862949)),
+            allow_mc=True)
+        drv.convective_column = giss_mstcnv.convective_column = spy
+        try:
+            term(state, diag, None, None)
+        finally:
+            drv.convective_column = giss_mstcnv.convective_column = original
+        self.assertAlmostEqual(seen["threshold"], 2.0862949, places=6)
 
     def _moist_column(self, nlev=12):
         # JCM order: index 0 = top, last = surface. Warm moist surface parcel
