@@ -126,10 +126,15 @@
   termination criterion is what needs the work; the trigger and the closure
   mass flux are not implicated. It leaves the column 5.9 % moister, and the stratiform scheme
   condensing that excess lifts liquid water path 43.4 % and reflects 13.9 W/m²
-  more shortwave, which is 93 % of the bias — an albedo error rather than a
-  greenhouse one. Outgoing longwave carries the remaining 1.0 W/m², and in the
-  opposite sense: the term emits *more* than Tiedtke, the same missing depth
-  read as missing high cloud. Total precipitation falls only 4.6 %, the
+  more shortwave, which is 93 % of the bias and almost entirely cloud radiative
+  effect (14.89 of 14.94 W/m² against the clear-sky flux) — an albedo error
+  rather than a greenhouse one. Outgoing longwave carries the remaining
+  1.0 W/m², and in the opposite sense: the term emits *more* than Tiedtke,
+  because the same shallow ascent leaves the upper troposphere too dry — its
+  tropical humidity is 35 % below Tiedtke's at 300 hPa while 9 % above it at
+  the surface, worth +2.4 W/m² of clear-sky OLR. Its longwave *cloud* effect is
+  1.2 W/m² too large rather than too small, so the near-zero all-sky OLR
+  difference it showed before the detrainment fix was two errors cancelling. Total precipitation falls only 4.6 %, the
   stratiform pathway almost exactly compensating, so the global precipitation
   is not evidence the scheme is approximately right. Closing that depth gap is
   a precondition for using the term in a coupled climate run. It detrains 84 %
