@@ -407,6 +407,7 @@ def run_plume(cloud_base: jnp.ndarray,
               iplume: jnp.ndarray = 2,
               source_dtheta: jnp.ndarray = 0.0,
               source_dq: jnp.ndarray = 0.0,
+              max_overshoot_dt: jnp.ndarray = bsort._MAX_OVERSHOOT_DT,
               phase: str = "water",
               geometry: ColumnGeometry = None) -> PlumeCycle:
     """Run one plume and return what it does to the environment.
@@ -508,6 +509,7 @@ def run_plume(cloud_base: jnp.ndarray,
         entrainment_efficiency=entrainment_efficiency,
         iplume=iplume,
         cloud_base_velocity=cloud_base_velocity,
+        max_overshoot_dt=max_overshoot_dt,
         phase=phase)
 
     nlev = layer_mass.shape[0]
@@ -1044,6 +1046,7 @@ def convective_column(potential_temperature: jnp.ndarray,
                       source_dq: jnp.ndarray = 0.0,
                       max_plumes: int = None,
                       cloud_base_closure_fn=None,
+                      max_overshoot_dt: jnp.ndarray = bsort._MAX_OVERSHOOT_DT,
                       phase: str = "water") -> ColumnConvection:
     """Run every candidate plume in ModelE's order, carrying the environment.
 
@@ -1176,6 +1179,7 @@ def convective_column(potential_temperature: jnp.ndarray,
             iplume=this_iplume,
             source_dtheta=source_dtheta,
             source_dq=source_dq,
+            max_overshoot_dt=max_overshoot_dt,
             phase=phase,
             geometry=frozen_geometry)
 

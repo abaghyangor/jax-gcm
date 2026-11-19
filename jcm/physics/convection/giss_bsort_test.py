@@ -25,6 +25,7 @@ import numpy as np
 
 from jcm.physics.convection import giss_bsort as bs
 from jcm.physics.convection import giss_thermodynamics as gt
+from jcm.physics.modele.params import GissConvectionParameters
 
 # level, mplume, ent, det, ma, mplume_lag, mplume_b, gzl, delz, buoy, bdzsum,
 # kew, frem
@@ -923,3 +924,79 @@ class TestTheTerminationReasonMatchesModelEsCode(unittest.TestCase):
         active = np.asarray(ascent.active).squeeze()
         self.assertTrue(np.all(np.isfinite(margin)))
         self.assertTrue(np.any(margin[active] != 0.0))
+
+
+class TestMaxOvershootIsATunableParameter(unittest.TestCase):
+    """``max_dt_overshoot`` is GISS's own tuning knob, not a fixed constant.
+
+    ``MSTCNV.F90:297`` defaults it to 1.0 and the instrumented SCM runs this
+    port is validated against used that value, so the default has to stay 1.0 or
+    every oracle number moves. But GISS's tuned presets set 1.59-2.09
+    (``:369``, ``:410``, ``:460``), and since exit 5 is what terminates every
+    deep plume, the global depth comparison cannot be run without being able to
+    set it. What these pin is the default and the *direction*.
+    """
+
+    def test_the_default_is_modeles_untuned_value(self):
+        self.assertEqual(
+            float(GissConvectionParameters.default().max_dt_overshoot), 1.0)
+        # The module constant is that default's source, so they cannot drift.
+        self.assertEqual(
+            float(GissConvectionParameters.default().max_dt_overshoot),
+            bs._MAX_OVERSHOOT_DT)
+
+    def test_the_default_argument_reproduces_the_constant(self):
+        """Passing the constant explicitly must change nothing at all."""
+        implicit = _run_column()
+        explicit = _run_column(max_overshoot_dt=bs._MAX_OVERSHOOT_DT)
+        np.testing.assert_array_equal(
+            np.asarray(implicit.plume_mass), np.asarray(explicit.plume_mass))
+
+    def test_a_larger_threshold_lets_the_plume_rise_further(self):
+        """The direction is the whole point: a bigger allowance means depth.
+
+        Exit 5 stops the plume once its buoyancy falls below
+        ``-max_dt_overshoot/tvl``, so raising the threshold lets it penetrate
+        further into negatively buoyant air before terminating.
+
+        The lid has to be chosen so the two thresholds straddle it. The test
+        compares a kelvin of virtual temperature against ``tvl``, so at 300 K
+        the two allow -0.0033 and -0.0070 of buoyancy; a lid strong enough to
+        put the parcel well below both stops the plume in the same place
+        whatever the threshold, and one too weak never reaches the test at all.
+        At +3 K the default stops the plume on exit 5 and GISS's tuned value
+        carries it a level further, where it runs out of kinetic energy
+        instead -- which is both halves of the contract in one column.
+        """
+        warm = jnp.asarray(_column_profile("tvl", 300.0)).at[14:].add(3.0)
+        tops, reasons = [], []
+        for threshold in (1.0, 2.0862949):
+            ascent = _run_column(environment_virtual_temperature=warm,
+                                 max_overshoot_dt=threshold)
+            active = np.asarray(ascent.active).squeeze()
+            why = np.asarray(ascent.termination_reason).squeeze()
+            tops.append(int(np.max(np.nonzero(active))))
+            reasons.append(int(why[np.argmax(why != 0)]))
+        self.assertGreater(
+            tops[1], tops[0],
+            f"GISS's tuned threshold must not stop the plume sooner: {tops}")
+        self.assertEqual(reasons[0], 5, "the default must stop on the "
+                         "overshoot test, or the lid is the wrong strength")
+        self.assertNotEqual(reasons[1], 5, "the tuned threshold must carry the "
+                            "plume past the test the default stopped it on")
+
+    def test_gradients_flow_through_the_threshold(self):
+        """It is a differentiable leaf, which is why it belongs in the params.
+
+        A numeric tunable held as a module constant is invisible to
+        ``jax.grad``; CLAUDE.md requires physics parameters to be pytree leaves.
+        """
+        warm = jnp.asarray(_column_profile("tvl", 300.0)).at[14:].add(8.0)
+
+        def total_mass(threshold):
+            ascent = _run_column(environment_virtual_temperature=warm,
+                                 max_overshoot_dt=threshold)
+            return jnp.sum(ascent.plume_mass)
+
+        grad = jax.grad(total_mass)(jnp.array(1.5))
+        self.assertTrue(np.isfinite(float(grad)))

@@ -128,9 +128,10 @@
   proportions as ModelE's, within 2 percentage points on each, with the median
   plume top one level apart. What the global run compares is the port against
   Tiedtke, and ``MSTCNV`` is not in it. Two configuration differences are the
-  open candidates — ``max_dt_overshoot`` is held at ModelE's untuned default of
-  1.0, the value the oracle ran at, where GISS's own tuned presets use
-  1.59–2.09, and the three prognostic inputs below are zero in a global run,
+  open candidates — ``max_dt_overshoot`` defaults to ModelE's untuned 1.0, the
+  value the oracle ran at, where GISS's own tuned presets use 1.59–2.09 (it is a
+  differentiable parameter, so that comparison is a configuration override), and
+  the three prognostic inputs below are zero in a global run,
   which moves the port's median single-column plume top from L22 to L46 and
   makes that overshoot test the terminating one on 80 % of plumes. It leaves the column 5.9 % moister, and the stratiform scheme
   condensing that excess lifts liquid water path 43.4 % and reflects 13.9 W/m²

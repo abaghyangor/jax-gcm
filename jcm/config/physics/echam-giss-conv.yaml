@@ -64,6 +64,23 @@ terms:
   giss_convection:
     _target_: jcm.physics.convection.giss_mstcnv.GissConvection
     allow_mc: true
+    # Named here so it is reachable from the command line -- a global
+    # experiment has to be a Hydra override, not a code edit. The value is the
+    # term's own default, so writing it here changes nothing.
+    #
+    # `max_dt_overshoot` bounds how far a
+    # plume may overshoot into negatively buoyant air before the ascent stops,
+    # and 1.0 is ModelE's *untuned* default -- the value the SCM runs this port
+    # is validated against used, so it is what reproduces the oracle. GISS's
+    # tuned presets use 1.5876319, 1.6188563 or 2.0862949, which carry plumes
+    # deeper. That test terminates ~30% of ModelE's plumes on the deep SCM case
+    # and ~80% once the prognostic inputs above are absent, as they are here, so
+    # it is the first thing to vary when comparing depth against Tiedtke:
+    #
+    #     python -m jcm.main physics=echam-giss-conv \
+    #       ++physics.terms.giss_convection.params.max_dt_overshoot=2.0862949
+    params:
+      max_dt_overshoot: 1.0
   echam_1m_microphysics:
     _target_: jcm.physics.clouds.echam_1m.Echam1MMicrophysics
   echam_surface_exchange:

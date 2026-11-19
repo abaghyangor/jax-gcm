@@ -563,6 +563,11 @@ _TFMC = 273.16 - 15.0
 # Plume termination thresholds (MSTCNV.F90, checked at the top of each level).
 _MIN_PLUME_FRACTION = 5.0e-4      # MINFRAC: mplume vs the layer's own mass
 _MIN_CLOUD_BASE_FRACTION = 0.01   # bsort-specific: mplume vs its cloud-base mass
+# ModelE's own *untuned* default (`MSTCNV.F90:297`), and the value the
+# instrumented SCM runs were made at, so it is what reproduces the oracle. It is
+# the default of `plume_ascent`'s `max_overshoot_dt` argument rather than the
+# value it uses, because GISS's tuned presets set 1.59-2.09 and this test is
+# what terminates every deep plume -- see `GissConvectionParameters`.
 _MAX_OVERSHOOT_DT = 1.0           # max_dt_overshoot [K], before /tvl
 
 # Distance below the current level at which `mplume_lag` is sampled.
@@ -667,6 +672,7 @@ def plume_ascent(cloud_base: jnp.ndarray,
                  droplet_number: jnp.ndarray = 60.0e6,
                  droplet_radius: jnp.ndarray = 10.0e-6,
                  iplume: jnp.ndarray = 2,
+                 max_overshoot_dt: jnp.ndarray = _MAX_OVERSHOOT_DT,
                  phase: str = "water") -> PlumeAscent:
     """Run one buoyancy-sorting plume from cloud base to termination.
 
@@ -907,7 +913,7 @@ def plume_ascent(cloud_base: jnp.ndarray,
             & (at_base | (previous_w > 0.0))
             & (mass > _MIN_PLUME_FRACTION * ma)
             & (mass > _MIN_CLOUD_BASE_FRACTION * cloud_base_mass)
-            & (buoyancy > -_MAX_OVERSHOOT_DT / tvl))
+            & (buoyancy > -max_overshoot_dt / tvl))
 
         # Which test failed, in ModelE's order. It exits on the first one that
         # fires (MSTCNV.F90:1843-1927) and a plume can fail several at once, so
@@ -919,7 +925,7 @@ def plume_ascent(cloud_base: jnp.ndarray,
                       jnp.where(
                           ~(mass > _MIN_CLOUD_BASE_FRACTION * cloud_base_mass),
                           3,
-                          jnp.where(~(buoyancy > -_MAX_OVERSHOOT_DT / tvl),
+                          jnp.where(~(buoyancy > -max_overshoot_dt / tvl),
                                     5, 0))))
 
         # When the plume fails its entry test, ModelE dumps everything it still

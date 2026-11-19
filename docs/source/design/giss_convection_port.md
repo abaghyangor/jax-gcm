@@ -423,13 +423,25 @@ not survive the measurement. What the global run compares is the port against
 Two configuration differences remain as candidates, and they are not the same
 claim as a defect in the ascent:
 
-- **`max_dt_overshoot` is hardcoded at the untuned default.** Exit 5 thresholds
-  the plume-environment temperature difference at `max_dt_overshoot`, which
-  `MSTCNV.F90:297` defaults to 1.0 — the value the SCM oracle ran at, so the
-  port's `_MAX_OVERSHOOT_DT = 1.0` is right for validation. GISS's own tuned
-  presets use **1.5876319, 1.6188563 and 2.0862949** (`:369`, `:410`, `:460`),
-  which allow a plume to overshoot further before stopping. It matters because
-  it is the binding test in a global configuration: see below.
+- **`max_dt_overshoot` is a tuning parameter, and it was hardcoded.** Exit 5
+  thresholds the plume-environment temperature difference at
+  `max_dt_overshoot`, which `MSTCNV.F90:297` defaults to 1.0 — the value the SCM
+  oracle ran at, confirmed in its printout, so 1.0 is what reproduces every
+  number in this document. GISS's own tuned presets use **1.5876319, 1.6188563
+  and 2.0862949** (`:369`, `:410`, `:460`), which allow a plume to overshoot
+  further before stopping. It is now a `GissConvectionParameters` leaf
+  defaulting to 1.0 rather than a module constant, so the comparison is a Hydra
+  override and not a code edit::
+
+      python -m jcm.main physics=echam-giss-conv \
+        ++physics.terms.giss_convection.params.max_dt_overshoot=2.0862949
+
+  Making it a leaf is also what the repo asks of any numeric tunable — a
+  constant is invisible to `jax.grad`. `TestMaxOvershootIsATunableParameter`
+  pins the default against the module constant, pins that passing the default
+  explicitly changes nothing, and pins the *direction*: against a 3 K lid the
+  default stops the plume on exit 5 and GISS's tuned value carries it a level
+  further, where it runs out of kinetic energy instead.
 - **The three prognostic inputs are zero in a global run.** The harness injects
   ModelE's `cold_pool_fraction`, `penetrative_mass` and
   `convective_cloud_top_pressure` from its dumps; `jcm` reads them as optional

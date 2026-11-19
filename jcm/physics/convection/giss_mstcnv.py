@@ -725,7 +725,8 @@ class GissConvection(PhysicsTerm):
             # (MSTCNV.F90:1535, inside the base loop whose plumes write back at
             # `:2454`). `cloud_base_mass` above is then only the fallback for
             # the paths that have no closure to hand.
-            cloud_base_closure_fn=candidate_closure)
+            cloud_base_closure_fn=candidate_closure,
+            max_overshoot_dt=self.params.get_value().max_dt_overshoot)
 
         dth_mc = safe_divide(column.heat, layer_mass) * _MODELE_THETA_SCALE
         dq_mc = safe_divide(column.water, layer_mass)
