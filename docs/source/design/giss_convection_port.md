@@ -379,11 +379,75 @@ having separate shallow and deep closures; the port is unimodal and
 mid-level. A plume that stops near 450 hPa cannot rain like one reaching the
 tropopause, and that is where the 3–30 mm/day band goes.
 
-This is the column-level diagnosis seen globally. The SCM cases attribute the
-production deficit to an ascent that terminates early; the global tops show
-exactly that, and give it a magnitude — the median plume is ~225 hPa short of
-where Tiedtke puts it. It is the termination criterion that needs the work,
-not the trigger, the closure mass flux, or the microphysics.
+The depth gap is robust to how the top is defined. The two arms publish
+*different* fields — the GISS term `convection.dth_mc`, Tiedtke
+`convection.heating_rate` — so an absolute cutoff would compare two quantities
+of different magnitude and measure the cutoff as much as the physics. Taking
+the highest level carrying more than a fixed fraction of each column's own peak
+heating, over the tropics in the pre-divergence window:
+
+| threshold | Tiedtke median top | GISS median top |
+| --- | --- | --- |
+| 1 % of column max | 132 hPa | 340 hPa |
+| 5 % | 156 hPa | 417 hPa |
+| 10 % | 181 hPa | 457 hPa |
+| 25 % | 376 hPa | 536 hPa |
+
+The gap survives every cutoff, so it is a property of the schemes.
+
+### But the port is not where the depth gap comes from
+
+`ascent_exit_diag.txt` records which of the five `cloud_top` exits ended each of
+ModelE's plumes, and `PlumeAscent.termination_reason` is the port's counterpart,
+labelled in the same order. ModelE runs 1.76 plumes per step on TWP-ICE and the
+port's single-column harness runs one, so its raw plume list carries shallow
+secondaries the port never attempts; reducing ModelE to the deepest plume per
+step is what makes the two populations comparable:
+
+| exit | ModelE, deepest per step | port |
+| --- | --- | --- |
+| 1 `wcu2(l-1) <= 0`, no kinetic energy | 52.7 % (median top L18) | 52.5 % (L16) |
+| 5 overshoot limit | 29.7 % (L46) | 27.5 % (L45) |
+| 3 `mplume <= 1 %` of base | 15.8 % (L22) | 16.1 % (L21) |
+| 2 `mplume <= minfrac*ma` | 1.7 % (L19) | 3.9 % (L12) |
+| **median top, all plumes** | **L23.0** | **L22.0** |
+
+751 ModelE plumes against 765 port plumes, and the termination mix agrees to
+within 2 percentage points on every exit with the median top one level apart.
+**On the deep case the port's ascent terminates where ModelE's does.** So the
+global gap is not the port failing to reproduce `MSTCNV`'s depth, and the
+earlier reading of it — that the termination criterion is a port defect — does
+not survive the measurement. What the global run compares is the port against
+*Tiedtke*; `MSTCNV` is not in it.
+
+Two configuration differences remain as candidates, and they are not the same
+claim as a defect in the ascent:
+
+- **`max_dt_overshoot` is hardcoded at the untuned default.** Exit 5 thresholds
+  the plume-environment temperature difference at `max_dt_overshoot`, which
+  `MSTCNV.F90:297` defaults to 1.0 — the value the SCM oracle ran at, so the
+  port's `_MAX_OVERSHOOT_DT = 1.0` is right for validation. GISS's own tuned
+  presets use **1.5876319, 1.6188563 and 2.0862949** (`:369`, `:410`, `:460`),
+  which allow a plume to overshoot further before stopping. It matters because
+  it is the binding test in a global configuration: see below.
+- **The three prognostic inputs are zero in a global run.** The harness injects
+  ModelE's `cold_pool_fraction`, `penetrative_mass` and
+  `convective_cloud_top_pressure` from its dumps; `jcm` reads them as optional
+  diagnostics defaulting to zero, and `cold_pool_fraction` feeds
+  `entrainment_efficiency` directly. Re-running the TWP-ICE tabulation with all
+  three zeroed moves the port's median plume top from **L22 to L46** and makes
+  the overshoot limit the terminating test on **80.5 %** of plumes, up from
+  27.5 %. So the missing inputs do not make the port shallow — they make it
+  *deeper*, and they move the termination onto the one test whose threshold is
+  set to an untuned default.
+
+Which of those explains the 457 hPa against Tiedtke's 181 hPa is not settled
+here, and one caveat bounds all of it: TWP-ICE is a single deep tropical
+monsoon case, while the global figure is a tropical median over 18,432 columns,
+so the SCM population may simply not cover what the global run samples. What
+can be said is that the port reproduces `MSTCNV` on the case where `MSTCNV` can
+be seen, and that the next measurement is a global A/B at GISS's own
+`max_dt_overshoot` rather than a rewrite of the ascent.
 
 An earlier reading of this run attributed the deficit to the term triggering
 too rarely, from an instantaneous one-day snapshot putting it at 0.3 % of
