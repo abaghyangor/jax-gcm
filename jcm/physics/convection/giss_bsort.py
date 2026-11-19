@@ -631,6 +631,21 @@ class PlumeAscent(NamedTuple):
     latent_heat: jnp.ndarray         # lhx [J/kg]
     removed_fraction: jnp.ndarray    # frem
     active: jnp.ndarray              # bool: this level was processed
+    # ModelE's `mc_why`: which of the entry tests ended this plume, non-zero
+    # only on the level whose test failed, so the port's termination mix can be
+    # compared directly with `ascent_exit_diag.txt` (MSTCNV.F90:2166-2187).
+    # 1 no kinetic energy, 2 below `MINFRAC` of the layer mass, 3 below 1% of
+    # the cloud-base mass, 5 past the overshoot limit, 0 reached the model top.
+    # There is deliberately no 4: ModelE's "parcel became unsaturated through
+    # entrainment of dry air" is an exit the port does not have, and leaving a
+    # hole in the numbering is what makes that gap visible in a comparison
+    # rather than silently folding those plumes into another reason.
+    termination_reason: jnp.ndarray   # mc_why, int
+    # The quantity the overshoot test thresholds, `(tvp-tvl)/tvl - wmp/mplume`,
+    # on every level the plume occupied. ModelE dumps it for every plume
+    # whatever ended it, so the termination can be compared on the continuous
+    # margin and not only on which test tripped.
+    overshoot_margin: jnp.ndarray
 
 
 def plume_ascent(cloud_base: jnp.ndarray,
@@ -894,6 +909,19 @@ def plume_ascent(cloud_base: jnp.ndarray,
             & (mass > _MIN_CLOUD_BASE_FRACTION * cloud_base_mass)
             & (buoyancy > -_MAX_OVERSHOOT_DT / tvl))
 
+        # Which test failed, in ModelE's order. It exits on the first one that
+        # fires (MSTCNV.F90:1843-1927) and a plume can fail several at once, so
+        # a conjunction cannot be read backwards -- the clauses have to be
+        # re-tested in sequence to label the plume the way the Fortran does.
+        reason = jnp.where(
+            ~(at_base | (previous_w > 0.0)), 1,
+            jnp.where(~(mass > _MIN_PLUME_FRACTION * ma), 2,
+                      jnp.where(
+                          ~(mass > _MIN_CLOUD_BASE_FRACTION * cloud_base_mass),
+                          3,
+                          jnp.where(~(buoyancy > -_MAX_OVERSHOOT_DT / tvl),
+                                    5, 0))))
+
         # When the plume fails its entry test, ModelE dumps everything it still
         # carries into that level (MSTCNV.F90, just after the ascent loop:
         # `DM(LMAX) += MPLUME`, `DSM(LMAX) += SMP`, ...). Without this the
@@ -1019,6 +1047,10 @@ def plume_ascent(cloud_base: jnp.ndarray,
                    keep(latent_heat_of(level_phase)),
                    keep(sorted_blends.removed_fraction),
                    survives,
+                   # `terminating` already excludes a plume that has dumped, so
+                   # exactly one level per plume carries a non-zero reason.
+                   jnp.where(terminating, reason, 0),
+                   keep(buoyancy),
                    # Shifted onto the level below once the scan has run; see
                    # `dump_below`. Not part of `PlumeAscent`.
                    dump_below(mass), dump_below(heat),
