@@ -350,10 +350,11 @@ One chain explains nearly all of it. The term removes 19.7 % less water as
 convective rain; the column it leaves behind is 5.9 % moister; the stratiform
 scheme condenses that excess, lifting liquid water path 43.4 % and large-scale
 rain 31.5 %; the resulting clouds reflect 13.9 W/m² more shortwave. That is
-93 % of the TOA bias, so it is overwhelmingly an albedo error rather than a
-greenhouse one — OLR contributes the remaining 1.0 W/m², and in the opposite
-sense: the port emits *more* OLR than the control, which is the depth deficit
-read in a second channel (see below). Total precipitation falls only 4.6 %
+93 % of the TOA bias, and the clear-sky fluxes put 14.89 of those 14.94 W/m² in
+the cloud radiative effect, so it is an albedo error rather than a greenhouse
+one. OLR contributes the remaining 1.0 W/m², and in the opposite sense: the
+port emits *more* OLR than the control, from an upper troposphere its shallow
+plumes leave too dry (see below). Total precipitation falls only 4.6 %
 because the stratiform compensation is nearly complete, which is why a
 near-correct global precipitation here is a compensation artifact and must not
 be read as the scheme being approximately right.
@@ -516,14 +517,31 @@ precipitates instead. The pre-fix +6.2 % was never ice the convection
 detrained — the port detrains 84 % *less* ice than Tiedtke — it was the
 stratiform scheme's repair of a misplaced liquid field.
 
-**The port now emits too much OLR, where before it matched.** +0.42 % at 30
-days and +0.51 % in the pre-divergence window, 11× and 20× the noise twin, so
-this is systematic. The sign is the same compensation seen on TWP-ICE surface
-rain: depositing each plume's terminal condensate one level above where the
-plume actually reached was putting high cloud at altitudes the port's plumes
-never attain, which masked the depth deficit in the longwave. With the mask
-removed, too-shallow plumes read as too little high cloud. The fix did not
-create this bias; it stopped hiding it.
+**The port now emits too much OLR, where before it matched — and the clear-sky
+fluxes say that is a cancellation coming apart, not a new defect.** +0.42 % at
+30 days and +0.51 % in the pre-divergence window, 11× and 20× the noise twin.
+Splitting the pre-divergence window with `toa_lw_up_clear`:
+
+| W/m² (pre-divergence, global) | control | pre-fix | post-fix |
+| --- | --- | --- | --- |
+| OLR, all-sky | 243.38 | 243.44 (+0.06) | 244.63 (+1.25) |
+| OLR, clear-sky | 260.56 | 262.74 (+2.18) | 262.96 (+2.40) |
+| LW cloud effect | 17.17 | 19.30 (+2.13) | 18.33 (+1.15) |
+
+The port's *clear-sky* OLR was already 2.18 W/m² high before the fix and the fix
+barely moves it (+0.22). What the fix changed is the cloud term: the longwave
+cloud effect was 2.13 W/m² **too large** and is now 1.15 — the excess is
+halved. Pre-fix all-sky OLR agreed with the control to 0.06 W/m² because those
+two errors, each about 2 W/m², very nearly cancelled. The fix corrected one of
+them, so the other is now visible.
+
+This is the compensation pattern seen on TWP-ICE surface rain, but the sign of
+the cloud term is the opposite of what a depth deficit alone would suggest: the
+port traps *more* longwave in cloud than Tiedtke, not less, because its
+suspended upper-level ice runs 3–7× the control's at 110–270 hPa even while its
+high cloud *fraction* is lower. Depositing each plume's terminal condensate one
+level above where the plume reached inflated that further, and landing it
+correctly removed half the excess.
 
 **The TOA bias is unchanged to slightly worse, and is still the blocker.**
 −14.4 → −14.9 W/m², which is 0.5 W/m² at 30 days and 1.0 W/m² in the
@@ -534,12 +552,32 @@ improvement that partly offsets it is **not** firm: it is 1.0 W/m² at 30 days
 but only 0.2 W/m² at days 5–10, and the two windows disagreeing that way is
 the signature of an adjustment rather than a systematic property.
 
+**The clear-sky OLR excess is the depth deficit in a third channel.** It is
+not a radiation or cloud defect at all: the port's tropical humidity profile is
+*moister than the control below 890 hPa* (+9 % at 993 hPa) and **drier through
+the whole mid and upper troposphere** — −14 % at 805 hPa, −35 % at 302 hPa,
+−37 % at 237 hPa. Upper-tropospheric water vapour is what sets clear-sky OLR,
+and convection that stops at 405 hPa does not put moisture above it. So the
+same defect now has three independent signatures: 19.7 % less convective rain,
+a 43 % liquid water path excess, and a dry upper troposphere worth +2.4 W/m² of
+clear-sky OLR. None of the three is a free parameter.
+
+The global run also confirms the phase fix directly, in the detrainment fields
+themselves. Tropical `clouds.conv_detrainment_qc` above 420 hPa was non-zero up
+to **74 hPa** before the fix — liquid detrained at 190–220 K, which is the
+defect — and is now **exactly zero** at every level above 452 hPa, while
+`conv_detrainment_qi` at 110–237 hPa rises from 0.17–0.68 to 0.54–0.99
+(×10⁻⁹). The port's detrainment phase structure now has the same shape as
+Tiedtke's: ice aloft, liquid only in the lower troposphere.
+
 So the detrained-phase defect was real, is fixed, and is worth about 1 W/m² in
 each direction at TOA with the two nearly cancelling. It is not the −14.9 W/m²
-bias. That remains 93 % shortwave, driven by a liquid water path still 43 %
-high, which is downstream of the ascent terminating ~225 hPa too low. **The
-termination criterion is the merge blocker, and it is now the only one with a
-measured climate effect.**
+bias. That remains overwhelmingly shortwave — of the +14.94 W/m² of extra
+reflection in the pre-divergence window, **+14.89 is cloud radiative effect**,
+so the albedo reading is exact rather than inferred — driven by a liquid water
+path still 43 % high, which is downstream of the ascent terminating ~225 hPa too
+low. **The termination criterion is the merge blocker, and it is now the only
+one with a measured climate effect.**
 
 **One diagnostic was published upside down.** `convection.dth_mc` and
 `dq_mc` were written in the plume code's own vertical frame — ModelE's, with
