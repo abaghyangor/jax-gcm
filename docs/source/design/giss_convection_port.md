@@ -489,6 +489,62 @@ the reading already applied to the detrainment fix's shortwave move in the
 section above. Applying it consistently here means the 30-day numbers cannot be
 claimed.
 
+### The plume tops did not move, and chasing why found the seed
+
+The mechanism was checked directly rather than inferred, on the tropical
+heating profiles of the third run against the second:
+
+| threshold | Tiedtke | GISS at 1.0 | GISS at 2.0862949 |
+| --- | --- | --- | --- |
+| 1 % of column max | 132 hPa | 340 hPa | 368 hPa |
+| 10 % | 181 hPa | 457 hPa | 458 hPa |
+| reaches above 200 hPa | 54.5 % of columns | 6.3 % | 6.6 % |
+| reaches above 150 hPa | 33.8 % | 2.5 % | 2.3 % |
+
+**Doubling the threshold moved the tops by one hectopascal.** The test is
+simply not binding in the global run, which also means the small 30-day moves
+above cannot have come through depth, and that the
+depth → rain → humidity → liquid water path → shortwave chain is untested by
+this experiment rather than contradicted by it.
+
+What *is* binding, then? In the global configuration the plumes are not
+overshoot-terminated, so they are dying on the kinetic-energy or mass floors —
+and the quantity that sets how fast those are reached is the cloud-base
+updraft seed. Two defects were found there, and neither is on the gap list
+above.
+
+**`boundary_layer_height` is published by nobody.** `GissConvection` reads it as
+a top-level diagnostic; `TteTkeVerticalDiffusion.provides` is
+`("vertical_diffusion", "surface", "mixed_layer_top")` and carries the PBL depth
+as `pbl_height` *inside* its record, which is how `mam4_jax` consumes it. So in
+every preset the lookup returned `None`. Recomputing `w*` from a global run's
+own saved fields (`surface.sensible_heat_flux`, `surface.evaporation`,
+`vertical_diffusion.pbl_height`, `surface_exchange.air_density`) gives a
+tropical median of **1.14 m/s**, and it exceeds the 0.5 m/s floor in **99.6 %**
+of tropical columns. `convective_velocity_scale` now falls back to the
+`vertical_diffusion` record, preferring an explicitly published top-level key so
+the oracle harness — which injects ModelE's own `pblht` — is untouched.
+
+**But the seed never reaches a buoyancy-sorting plume at all.** That fallback
+only feeds `_plume_seed`, whose only caller is `_convective_tendencies`, the
+`allow_mc and not bsort` single-plume path. The production path,
+`_bsort_tendencies`, calls `convective_column` **without**
+`cloud_base_velocity`, so every bsort plume in every configuration — global and
+single-column alike — is seeded at `giss_plume_driver._CLOUD_BASE_VELOCITY`,
+also 0.5, and the convective velocity scale is dead code for it.
+
+That second gap is the live hypothesis, and it is consistent with everything
+measured so far in a way the earlier candidates were not. The entrainment rate
+goes as `B/w**2`, so a seed of 0.5 where `w*` is 1.14 over-entrains by a median
+factor of **5.2** (9.5 at the 90th percentile), and an over-entrained plume
+dilutes and dies early — which is what the global tops show. It also explains
+why the single column does *not* show it: on BOMEX the observed cloud-base
+updraft is **0.57 m/s**, so there the 0.5 floor is very nearly right, and the
+port matches `MSTCNV` with it. The floor is a good approximation for the
+validation cases and a poor one for the global tropics. Wiring the seed into
+the bsort path will move the oracle numbers, so it is a change the bridge suite
+has to adjudicate rather than one to make silently.
+
 So **`max_dt_overshoot` is not the lever**: at GISS's own tuned value the term
 still carries essentially the whole −14.9 W/m² bias, and at best 2 % of it is
 recovered. The parameter remains the right shape for the code — it is a tuning
