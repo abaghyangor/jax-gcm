@@ -453,13 +453,49 @@ claim as a defect in the ascent:
   *deeper*, and they move the termination onto the one test whose threshold is
   set to an untuned default.
 
-Which of those explains the 457 hPa against Tiedtke's 181 hPa is not settled
-here, and one caveat bounds all of it: TWP-ICE is a single deep tropical
-monsoon case, while the global figure is a tropical median over 18,432 columns,
-so the SCM population may simply not cover what the global run samples. What
-can be said is that the port reproduces `MSTCNV` on the case where `MSTCNV` can
-be seen, and that the next measurement is a global A/B at GISS's own
-`max_dt_overshoot` rather than a rewrite of the ascent.
+One caveat bounds the SCM evidence: TWP-ICE is a single deep tropical monsoon
+case, while the global figure is a tropical median over 18,432 columns, so the
+SCM population may simply not cover what the global run samples. What can be
+said is that the port reproduces `MSTCNV` on the case where `MSTCNV` can be
+seen.
+
+### GISS's tuned overshoot threshold does not close the bias
+
+The A/B was re-run a third time with
+`++physics.terms.giss_convection.params.max_dt_overshoot=2.0862949`, the largest
+of GISS's tuned values, against the same `control` and `noise` arms. Judged the
+way the gate asks — the move against the noise twin's drift in the same
+quantity, in the pre-divergence window — raising the threshold does almost
+nothing:
+
+| pre-divergence | at 1.0 | at 2.0862949 | move | × noise |
+| --- | --- | --- | --- | --- |
+| TOA net | −11.18 W/m² | −11.39 W/m² | **−0.21 W/m²** | 5.4 |
+| TOA SW up | +15.29 % | +15.37 % | +0.07 W/m² | 2.9 |
+| liquid water path | +44.99 % | +45.71 % | +0.41 g/m² | 1.4 |
+| convective precipitation | −20.14 % | −19.42 % | +0.7 pp | 11.6 |
+
+The shortwave excess and the liquid water path — the two quantities the whole
+bias runs through — do not move at all, and the TOA net moves 0.21 W/m² the
+*wrong* way. The only clean improvement is the convective precipitation
+deficit, by 0.7 of its 20 percentage points.
+
+The 30-day window looks more favourable: SW up −1.01 W/m², liquid water path
+−2.25 g/m², large-scale rain −8.0 pp, and the TOA net better by 0.30 W/m². But
+the TOA net is the headline and that move is **1.4× the noise twin's drift**,
+which fails the gate's own 3× bar; and a change that is large at 30 days and
+absent in the pre-divergence window is the signature of an adjustment, which is
+the reading already applied to the detrainment fix's shortwave move in the
+section above. Applying it consistently here means the 30-day numbers cannot be
+claimed.
+
+So **`max_dt_overshoot` is not the lever**: at GISS's own tuned value the term
+still carries essentially the whole −14.9 W/m² bias, and at best 2 % of it is
+recovered. The parameter remains the right shape for the code — it is a tuning
+knob and now a differentiable leaf rather than a constant — but the hypothesis
+it was made to test is refuted. That leaves the three zeroed prognostic inputs
+as the one remaining configuration candidate, and the possibility that the
+depth difference against Tiedtke is simply what GISS convection does.
 
 An earlier reading of this run attributed the deficit to the term triggering
 too rarely, from an instantaneous one-day snapshot putting it at 0.3 % of
