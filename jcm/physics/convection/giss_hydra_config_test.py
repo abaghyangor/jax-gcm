@@ -75,3 +75,63 @@ class GissConvectionHydraConfigTest(unittest.TestCase):
         self.assertEqual(giss.checkpoint_terms, echam.checkpoint_terms)
         # Same term count: one convection scheme swapped for another.
         self.assertEqual(len(giss.terms), len(echam.terms))
+
+
+class TheClosureGetsItsBoundaryLayerTest(unittest.TestCase):
+    """The preset must actually supply the cloud-base seed's inputs.
+
+    This is the test that was missing. ``GissConvection`` reads every input
+    with ``.get()`` so it still runs as a scaffold, which means a diagnostic no
+    term publishes costs a silent fallback rather than an error. The cloud-base
+    updraft seed is the expensive one: with no boundary-layer depth it takes the
+    0.5 m/s floor instead of the convective velocity scale, ``w*`` recomputed
+    from a global run's own saved fields has a tropical median of 1.14 m/s, and
+    the entrainment rate goes as ``B/w**2`` -- so the floor over-entrains every
+    tropical plume by a median factor of 5.2.
+    """
+
+    PRESET = "physics=echam-giss-conv"
+
+    def _built(self):
+        from jcm import runners
+
+        terms = list(runners.build_physics(_cfg([self.PRESET])).terms)
+        names = [type(t).__name__ for t in terms]
+        index = names.index("GissConvection")
+        upstream = set()
+        for term in terms[:index]:
+            upstream |= set(getattr(term, "provides", ()))
+        return terms[index], upstream
+
+    def test_a_boundary_layer_depth_is_reachable(self):
+        giss, upstream = self._built()
+        self.assertTrue(
+            "boundary_layer_height" in upstream
+            or "vertical_diffusion" in upstream,
+            "nothing upstream offers a PBL depth, so the cloud-base seed "
+            "silently takes the 0.5 m/s floor")
+
+    def test_the_surface_record_is_reachable(self):
+        """The other half of the seed: without it the floor is taken too."""
+        _, upstream = self._built()
+        self.assertIn("surface", upstream)
+
+    def test_the_fallback_prefers_an_explicitly_published_depth(self):
+        """The oracle harness injects the top-level key, and must keep winning.
+
+        Every validated single-column number was measured with ModelE's own
+        ``pblht`` supplied that way, so the fallback must not shadow it.
+        """
+        giss, _ = self._built()
+
+        class Vdiff:
+            pbl_height = 1605.4
+
+        self.assertEqual(
+            giss._boundary_layer_height(
+                {"boundary_layer_height": 7.0, "vertical_diffusion": Vdiff()}),
+            7.0)
+        self.assertEqual(
+            giss._boundary_layer_height({"vertical_diffusion": Vdiff()}),
+            1605.4)
+        self.assertIsNone(giss._boundary_layer_height({}))

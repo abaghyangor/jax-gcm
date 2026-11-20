@@ -428,6 +428,10 @@ class GissConvection(PhysicsTerm):
         "surface", "boundary_layer_height", "mixed_layer_top",
         "cold_pool_fraction", "penetrative_mass", "melting_pressure",
         "convective_cloud_top_pressure",
+        # Read only for its `pbl_height`, and only when no term published
+        # `boundary_layer_height` directly -- which is every preset. See
+        # `_boundary_layer_height`.
+        "vertical_diffusion",
     )
     provides: ClassVar[tuple[str, ...]] = ("convection",)
 
@@ -1229,13 +1233,53 @@ class GissConvection(PhysicsTerm):
         q_source = jnp.sum(q_sf * weights, axis=0) + dq
 
         surface = diagnostics.get("surface")
-        pbl_height = diagnostics.get("boundary_layer_height")
+        pbl_height = self._boundary_layer_height(diagnostics)
         if surface is None or pbl_height is None:
             return theta_source, q_source, jnp.asarray(_CLOUD_BASE_W)
         w_base = convective_velocity_scale(
             surface.sensible_heat_flux, surface.evaporation, pbl_height,
             surface_density, theta_source, minimum=_CLOUD_BASE_W)
         return theta_source, q_source, w_base
+
+    @staticmethod
+    def _boundary_layer_height(diagnostics):
+        """Return the PBL depth for the cloud-base seed, from either publisher.
+
+        A top-level ``boundary_layer_height`` is preferred: that is what the
+        oracle harness injects (ModelE's own ``pblht``), so the single-column
+        path is untouched by this.
+
+        Otherwise take TTE-TKE's ``pbl_height`` out of its ``vertical_diffusion``
+        record -- the same quantity, ECHAM's ``zghabl/g`` in metres, which
+        ``mam4_jax`` already consumes the same way. **No term in any preset
+        publishes the top-level key**: ``TteTkeVerticalDiffusion.provides`` is
+        ``("vertical_diffusion", "surface", "mixed_layer_top")``, so before this
+        fallback existed every global run silently took the
+        ``_CLOUD_BASE_W = 0.5 m/s`` floor instead of the convective velocity
+        scale, in **99.6 %** of tropical columns -- where ``w*`` recomputed from
+        the saved fields has a median of **1.14 m/s**.
+
+        That is not a cosmetic default. ``convective_velocity_scale``'s own
+        docstring says the seed matters more than its size suggests because the
+        entrainment rate goes as ``B/w**2``: seeding 0.5 where ``w*`` is 1.14
+        over-entrains by ``(1.14/0.5)**2``, a median factor of **5.2** and 9.5 at
+        the 90th percentile, and an over-entrained plume dilutes and dies early.
+
+        **This only reaches the single-plume path.** Its one caller is
+        :meth:`_plume_seed`, which only :meth:`_convective_tendencies` uses --
+        the ``allow_mc and not bsort`` fallback. The production path,
+        :meth:`_bsort_tendencies`, calls ``convective_column`` **without**
+        ``cloud_base_velocity``, so every buoyancy-sorting plume in every
+        configuration is seeded at ``giss_plume_driver._CLOUD_BASE_VELOCITY``,
+        also 0.5, and the convective velocity scale never enters. That is the
+        larger defect and it is not fixed here; see
+        ``docs/source/design/giss_convection_port.md``.
+        """
+        height = diagnostics.get("boundary_layer_height")
+        if height is not None:
+            return height
+        vdiff = diagnostics.get("vertical_diffusion")
+        return None if vdiff is None else vdiff.pbl_height
 
     def _source_parcel_inputs(self, diagnostics, q_surface_first,
                               surface_density, nlev):

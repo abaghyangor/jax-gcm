@@ -1102,3 +1102,38 @@ class TestTheDiagnosticsAreInTheStatesFrame(unittest.TestCase):
             dth[0], 0.0,
             "convective heating reached the model top, so the profile is "
             "upside down")
+
+
+class TestTheCloudBaseSeedUsesTheBoundaryLayer(unittest.TestCase):
+    """``convective_velocity_scale`` is worth reaching, and 0.5 is not it.
+
+    There is deliberately no end-to-end assertion here. The production
+    buoyancy-sorting path calls ``convective_column`` without
+    ``cloud_base_velocity``, so the seed this scale computes never reaches a
+    bsort plume and a term-level test would compare two identical runs -- which
+    is how that defect was found. What is pinned is the size of the error the
+    0.5 floor represents, measured from a global run's own saved fields.
+    """
+
+    def _state(self):
+        return TestGissConvectionTerm()._moist_column()
+
+    def test_a_deep_boundary_layer_raises_the_seed_above_the_floor(self):
+        """With a PBL depth and surface fluxes the seed is w*, not the floor."""
+        state, diag = self._state()
+        surface_density = 1.157
+
+        w_floor = giss_mstcnv.convective_velocity_scale(
+            sensible_heat_flux=23.8, evaporation=4.685e-05,
+            boundary_layer_height=0.0, surface_density=surface_density,
+            reference_theta=298.8)
+        w_real = giss_mstcnv.convective_velocity_scale(
+            sensible_heat_flux=23.8, evaporation=4.685e-05,
+            boundary_layer_height=1605.4, surface_density=surface_density,
+            reference_theta=298.8)
+        # The tropical median of a global run's own saved fields.
+        self.assertAlmostEqual(float(w_floor), 0.5, places=6)
+        self.assertGreater(float(w_real), 1.0)
+        # The entrainment rate goes as B/w**2, which is why the floor is
+        # expensive rather than merely approximate.
+        self.assertGreater((float(w_real) / 0.5) ** 2, 4.0)
