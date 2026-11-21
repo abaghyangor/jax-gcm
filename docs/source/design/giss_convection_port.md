@@ -836,8 +836,13 @@ bias. That remains overwhelmingly shortwave — of the +14.94 W/m² of extra
 reflection in the pre-divergence window, **+14.89 is cloud radiative effect**,
 so the albedo reading is exact rather than inferred — driven by a liquid water
 path still 43 % high, which is downstream of the ascent terminating ~225 hPa too
-low. **The termination criterion is the merge blocker, and it is now the only
-one with a measured climate effect.**
+low. **That depth deficit is the merge blocker, and it is the only defect with a
+measured climate effect.** The sections below then rule out the termination
+criterion itself as its cause: the port's five exits fire in ModelE's
+proportions, GISS's tuned `max_dt_overshoot` moves the tops by 1 hPa, and
+seeding the plume from the real boundary layer deepens the deficit rather than
+closing it. The blocker is the depth, not any of the four mechanisms tested for
+it.
 
 **One diagnostic was published upside down.** `convection.dth_mc` and
 `dq_mc` were written in the plume code's own vertical frame — ModelE's, with
