@@ -1107,12 +1107,12 @@ class TestTheDiagnosticsAreInTheStatesFrame(unittest.TestCase):
 class TestTheCloudBaseSeedUsesTheBoundaryLayer(unittest.TestCase):
     """``convective_velocity_scale`` is worth reaching, and 0.5 is not it.
 
-    There is deliberately no end-to-end assertion here. The production
-    buoyancy-sorting path calls ``convective_column`` without
-    ``cloud_base_velocity``, so the seed this scale computes never reaches a
-    bsort plume and a term-level test would compare two identical runs -- which
-    is how that defect was found. What is pinned is the size of the error the
-    0.5 floor represents, measured from a global run's own saved fields.
+    Both halves are pinned: the size of the error the 0.5 floor represents,
+    measured from a global run's own saved fields, and that the seed actually
+    arrives at the plume. The second matters because it did not, for the whole
+    life of the port -- the production bsort path called ``convective_column``
+    without ``cloud_base_velocity`` and silently took the driver's own 0.5, so
+    the scale was dead code for the only path that runs.
     """
 
     def _state(self):
@@ -1137,3 +1137,48 @@ class TestTheCloudBaseSeedUsesTheBoundaryLayer(unittest.TestCase):
         # The entrainment rate goes as B/w**2, which is why the floor is
         # expensive rather than merely approximate.
         self.assertGreater((float(w_real) / 0.5) ** 2, 4.0)
+
+    def test_the_seed_reaches_the_plume_from_the_vdiff_record(self):
+        """End to end, on the production path, through the only publisher.
+
+        The spy sits on ``giss_plume_driver.run_plume``, where
+        ``convective_column`` calls it from: the term never names it, so
+        patching the term's own module would patch nothing and the test would
+        pass regardless. It reads the seed as passed rather than converting it,
+        because under ``jit`` it is a tracer -- an earlier version of this test
+        called ``float()`` on it and died in ``ConcretizationTypeError``.
+        """
+        from jcm.physics.convection import giss_plume_driver as drv
+
+        state, diag = self._state()
+
+        class Vdiff:
+            pbl_height = jnp.asarray([1605.4])
+
+        class Surface:
+            sensible_heat_flux = jnp.asarray([23.8])
+            evaporation = jnp.asarray([4.685e-05])
+            momentum_flux_u = jnp.asarray([0.05])
+            momentum_flux_v = jnp.asarray([0.0])
+
+        def seed_for(extra):
+            captured, original = [], drv.run_plume
+
+            def spy(*a, **k):
+                captured.append(k["cloud_base_velocity"])
+                return original(*a, **k)
+
+            drv.run_plume = spy
+            try:
+                GissConvection(allow_mc=True)(
+                    state, {**diag, "surface": Surface(), **extra}, None, None)
+            finally:
+                drv.run_plume = original
+            self.assertTrue(captured, "the plume driver was never reached")
+            return float(np.asarray(jnp.asarray(captured[0])).ravel()[0])
+
+        self.assertAlmostEqual(seed_for({}), 0.5, places=5)
+        # TTE-TKE's record is the only publisher in any preset, and these are
+        # a global run's tropical medians, so this is the seed a global plume
+        # should get -- against the 0.5 it was getting.
+        self.assertGreater(seed_for({"vertical_diffusion": Vdiff()}), 1.0)

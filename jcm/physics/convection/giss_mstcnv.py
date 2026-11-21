@@ -681,6 +681,31 @@ class GissConvection(PhysicsTerm):
         _, source_dtheta, source_dq = self._source_parcel_inputs(
             diagnostics, q, jnp.flip(density, axis=0)[0], nlev)
 
+        # The cloud-base updraft seed, which ModelE takes from its own boundary
+        # layer as `wbases = max(0.5, wturb)` (MSTCNV.F90:~2807). Until this was
+        # wired, `convective_column` fell through to its own
+        # `_CLOUD_BASE_VELOCITY = 0.5` on every call, so the scale was dead code
+        # for the only path that runs: `_plume_seed` has one other caller,
+        # `_convective_tendencies`, which is the `allow_mc and not bsort`
+        # fallback. The seed is not a detail -- the entrainment closure divides
+        # by w^2, so a plume seeded too slowly entrains hard, dilutes and dies
+        # early (see `convective_velocity_scale`).
+        #
+        # `theta_env` must be a REAL potential temperature here: the scale
+        # divides the buoyancy flux by it and scales the moisture flux by
+        # 0.61*theta. `theta_modele` a few lines below references `p/100`
+        # instead of `p/_P_REF` and so runs `_MODELE_THETA_SCALE` ~ 9.1 times
+        # larger, which would silently mis-set every seed. It is rebuilt on the
+        # SI Exner rather than reused.
+        #
+        # Only the velocity is taken. `_plume_seed` also returns the
+        # boundary-layer blend of theta and q, but the sort builds its own
+        # source parcel per candidate base inside `convective_column`, so those
+        # two would be the wrong parcel for it; the duplicated blend is one
+        # weighted sum.
+        _, _, cloud_base_velocity = self._plume_seed(
+            diagnostics, t / ((p / _P_REF) ** KAPA), q, layer_mass, nlev)
+
         # `qcl + qci`, the environment's own cloud condensate. It loads the
         # environment's virtual temperature in the downdraft's buoyancy test
         # (`svm1`, MSTCNV.F90:4573), so omitting it makes the environment look
@@ -730,6 +755,7 @@ class GissConvection(PhysicsTerm):
             # `:2454`). `cloud_base_mass` above is then only the fallback for
             # the paths that have no closure to hand.
             cloud_base_closure_fn=candidate_closure,
+            cloud_base_velocity=cloud_base_velocity,
             max_overshoot_dt=self.params.get_value().max_dt_overshoot)
 
         dth_mc = safe_divide(column.heat, layer_mass) * _MODELE_THETA_SCALE
