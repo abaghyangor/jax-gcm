@@ -533,8 +533,65 @@ only feeds `_plume_seed`, whose only caller is `_convective_tendencies`, the
 single-column alike — is seeded at `giss_plume_driver._CLOUD_BASE_VELOCITY`,
 also 0.5, and the convective velocity scale is dead code for it.
 
-That second gap is the live hypothesis, and it is consistent with everything
-measured so far in a way the earlier candidates were not. The entrainment rate
+### Wiring the seed: what the oracle says about it
+
+`_bsort_tendencies` now computes the seed through `_plume_seed` and passes it as
+`cloud_base_velocity`. One trap was waiting there: the production path carries
+`theta_modele`, built on ModelE's `p/100` Exner reference, which runs
+`_MODELE_THETA_SCALE` ≈ 9.1 times larger than SI potential temperature.
+`convective_velocity_scale` divides the buoyancy flux by that theta and scales
+the moisture flux by `0.61*theta`, so handing it the ModelE-frame value would
+have mis-set every seed by almost an order of magnitude while still returning a
+plausible number. It is rebuilt on the SI Exner for the seed alone.
+
+**ModelE's own seed says the floor was too low everywhere.** Read from
+`mass_budget.txt` as `wcu` at each plume's lowest dumped level, which is
+`wbases(iplume)` (`MSTCNV.F90:1764`):
+
+| case | ModelE's seed | above the 0.5 floor |
+| --- | --- | --- |
+| BOMEX | median 0.567 m/s (10th 0.462, 90th 0.590) | 83.3 % |
+| TWP-ICE | median 0.567, mean 0.710, 90th **1.332** | 64.7 % |
+
+The port's hardcoded 0.5 sits below ModelE's median on both cases and far below
+the deep tail, and the global tropical `w*` of 1.14 m/s falls *inside* ModelE's
+own TWP-ICE distribution rather than beyond it. So the change moves the seed
+toward the reference, which is the argument for it independent of what the
+precipitation metric does.
+
+**What it does to the oracle comparison** — the same script both ways, the
+floor forced back by patching `_plume_seed`, so the two arms differ only in the
+seed. These populations (48 BOMEX periods on the reconstructed entry column,
+283 TWP-ICE periods on the oracle one) compare only with each other, not with
+the ratios quoted elsewhere in this document:
+
+| case | | aggregate | median | >3× outliers | mean \|log\| |
+| --- | --- | --- | --- | --- | --- |
+| BOMEX | floored | 0.9959 | 1.0007 | 0 | 0.0103 |
+| BOMEX | wired | 0.9930 | 0.9978 | 0 | 0.0111 |
+| TWP-ICE | floored | 1.2993 | 1.0315 | 7 | 0.1611 |
+| TWP-ICE | wired | 1.3108 | 1.0322 | **6** | **0.1479** |
+
+BOMEX is neutral, as it should be: the floor was already within 12 % of
+ModelE's 0.567 there. Its 0.3 % drift is inside the buoyancy sort's own
+sensitivity — blend fates turn on ~1.7e-4 — so the sign of that move is not
+interpretable. On TWP-ICE per-period scatter improves **8.2 %** and one outlier
+goes, the median is unchanged, and the aggregate is 0.9 % worse; the aggregate
+is a mean of ratios and is carried by a few large-ratio tails, while
+`mean |log|` is the per-period measure. Both local suites stay green (702 in the
+convection suite, 73 tests and 145 subtests in the bridge).
+
+So the oracle neither vindicates nor forbids the change on precipitation. What
+decides it is that the seed itself is now ModelE's quantity rather than a
+constant, and that this is the only remaining difference between the validated
+single-column path and the global one. Whether it moves the global plume tops
+is the next measurement, and it is a global A/B, not something the single column
+can answer.
+
+### Why the seed is the live hypothesis
+
+That second gap is consistent with everything measured so far in a way the
+earlier candidates were not. The entrainment rate
 goes as `B/w**2`, so a seed of 0.5 where `w*` is 1.14 over-entrains by a median
 factor of **5.2** (9.5 at the 90th percentile), and an over-entrained plume
 dilutes and dies early — which is what the global tops show. It also explains

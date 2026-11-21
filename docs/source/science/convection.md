@@ -134,8 +134,16 @@
   unmoved in the pre-divergence window, recovering at most 2 % of the bias and
   that only at 30 days and at 1.4× the noise twin, below the gate's bar. It
   stays a differentiable parameter because it is a tuning knob, not because it
-  explains the bias. What remains is that the three prognostic inputs below are
-  zero in a global run,
+  explains the bias. What remains is the cloud-base updraft seed. ``MSTCNV`` takes it from
+  its own boundary layer as ``wbases = max(0.5, wturb)``; the port computes the
+  convective velocity scale from the surface buoyancy flux and the
+  boundary-layer depth, which its oracle dumps put at a median 0.567 m/s on
+  both single-column cases and up to 1.33 m/s on the deep one, against a
+  tropical ``w*`` of 1.14 m/s in a global run. Until this was wired the
+  buoyancy-sorting path passed no seed at all and every plume started at the
+  0.5 m/s floor, over-entraining by a median factor of 5.2 since the
+  entrainment closure divides by ``w**2``. Also that the three prognostic
+  inputs below are zero in a global run,
   which moves the port's median single-column plume top from L22 to L46 and
   makes that overshoot test the terminating one on 80 % of plumes. It leaves the column 5.9 % moister, and the stratiform scheme
   condensing that excess lifts liquid water path 43.4 % and reflects 13.9 W/m²
