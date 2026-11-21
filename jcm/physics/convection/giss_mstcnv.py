@@ -309,10 +309,18 @@ def convective_velocity_scale(sensible_heat_flux, evaporation,
     On BOMEX this gives ~0.6 m/s against the oracle's observed 0.57 -- the right
     scale, from inputs we actually have.
 
-    The seed matters more than its size suggests: the entrainment rate goes as
-    ``B/w**2``, so a plume seeded too slowly entrains hard, dilutes, and dies
-    early, while one that gets moving stays undilute. The ``max(0.5, ...)`` floor
-    is ModelE's.
+    The seed matters more than its size suggests, but **which way depends on the
+    ascent**. The single-plume path (``plume_ascent_column``, Gregory-style with
+    ``contce``) does entrain as ``B/w**2``, so there a slow seed entrains hard
+    and dies early. The buoyancy-sorting path does the opposite:
+    :func:`~jcm.physics.convection.giss_bsort.entrainment_rate` is
+    ``min(0.95, sqrt(kew/(bdzsum*mplume)) - 1)/delz`` with ``kew`` proportional
+    to ``w**2``, so a *faster* seed raises the entrainment rate -- the closure
+    dilutes the plume down to ``enteff`` of the velocity its buoyancy history
+    could have supported, and a faster start means more to dilute away. A
+    30-day global A/B confirmed the sign: wiring this seed into the bsort path
+    deepened the convective precipitation deficit from 20.1 % to 23.3 %. The
+    ``max(0.5, ...)`` floor is ModelE's.
     """
     heat_flux = sensible_heat_flux / (surface_density * SHA)     # K m/s
     moisture_flux = evaporation / surface_density                # kg/kg m/s
@@ -687,9 +695,16 @@ class GissConvection(PhysicsTerm):
         # `_CLOUD_BASE_VELOCITY = 0.5` on every call, so the scale was dead code
         # for the only path that runs: `_plume_seed` has one other caller,
         # `_convective_tendencies`, which is the `allow_mc and not bsort`
-        # fallback. The seed is not a detail -- the entrainment closure divides
-        # by w^2, so a plume seeded too slowly entrains hard, dilutes and dies
-        # early (see `convective_velocity_scale`).
+        # fallback.
+        #
+        # It is wired because ModelE seeds from its own boundary layer and its
+        # dumps put that seed at a median 0.567 m/s on both single-column
+        # cases, above the 0.5 floor -- fidelity to the reference, not a tuning
+        # choice. It does **not** improve the global bias: a 30-day A/B took
+        # the convective precipitation deficit from 20.1% to 23.3%, because in
+        # this closure a faster seed *raises* entrainment rather than lowering
+        # it (`giss_bsort.entrainment_rate`, and see
+        # `convective_velocity_scale` for the two paths' opposite signs).
         #
         # `theta_env` must be a REAL potential temperature here: the scale
         # divides the buoyancy flux by it and scales the moisture flux by
@@ -1285,11 +1300,14 @@ class GissConvection(PhysicsTerm):
         scale, in **99.6 %** of tropical columns -- where ``w*`` recomputed from
         the saved fields has a median of **1.14 m/s**.
 
-        That is not a cosmetic default. ``convective_velocity_scale``'s own
-        docstring says the seed matters more than its size suggests because the
-        entrainment rate goes as ``B/w**2``: seeding 0.5 where ``w*`` is 1.14
-        over-entrains by ``(1.14/0.5)**2``, a median factor of **5.2** and 9.5 at
-        the 90th percentile, and an over-entrained plume dilutes and dies early.
+        The gap is large: ``w*`` recomputed from a global run's saved fields has
+        a tropical median of 1.14 m/s against the 0.5 floor. Its sign is the
+        opposite of what an earlier reading of this code claimed -- in the
+        buoyancy-sorting closure a faster seed *raises* the entrainment rate
+        (``giss_bsort.entrainment_rate``, ``kew`` going as ``w**2``), so the
+        floor was under-entraining, and supplying the real depth deepens the
+        global convective deficit rather than closing it. It is wired for
+        fidelity to ModelE's own seed, not as a fix.
 
         **This only reaches the single-plume path.** Its one caller is
         :meth:`_plume_seed`, which only :meth:`_convective_tendencies` uses --
