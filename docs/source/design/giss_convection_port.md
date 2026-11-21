@@ -584,9 +584,44 @@ convection suite, 73 tests and 145 subtests in the bridge).
 So the oracle neither vindicates nor forbids the change on precipitation. What
 decides it is that the seed itself is now ModelE's quantity rather than a
 constant, and that this is the only remaining difference between the validated
-single-column path and the global one. Whether it moves the global plume tops
-is the next measurement, and it is a global A/B, not something the single column
-can answer.
+single-column path and the global one.
+
+**The global A/B then refuted it as a fix, and the sign of the mechanism was
+backwards.** Read on the pre-divergence window, which is the only valid one in
+that run (its GISS arm wrote four 5-day chunks, not six, so its "30-day" column
+averaged days 5–20 against the control's 5–30):
+
+| pre-divergence | no seed | seed wired | the seed alone |
+| --- | --- | --- | --- |
+| TOA net | −11.18 W/m² | −11.59 W/m² | −0.41, worse |
+| TOA SW up | +15.29 % | +14.19 % | −1.08 W/m², better |
+| TOA OLR | +0.51 % | +0.96 % | +1.09 W/m², worse |
+| liquid water path | +44.99 % | +48.08 % | +2.1 %, worse |
+| convective precipitation | −20.14 % | **−23.32 %** | −4.0 %, worse |
+| large-scale rain | +25.45 % | +29.93 % | worse |
+
+The verdict does not depend on which threshold that run used: against the
+tuned-threshold arm instead, convective precipitation falls 4.8 % and liquid
+water path rises 1.6 %, the same signs throughout.
+
+The reason is a contradiction inside this package that an earlier reading of it
+propagated. `convective_velocity_scale`'s docstring said the entrainment rate
+goes as ``B/w**2``, so that a slow seed entrains hard and dies early. That is
+true of the single-plume path's Gregory-style ascent and **false of the
+buoyancy-sorting closure**, whose own docstring says so outright:
+`entrainment_rate` is ``min(0.95, sqrt(kew/(bdzsum*mplume)) - 1)/delz`` with
+``kew`` proportional to ``w**2``, so a *faster* seed **raises** the entrainment
+rate — the closure dilutes the plume down to ``enteff`` of the velocity its
+buoyancy history could have supported, and a faster start leaves more to dilute
+away. So the 0.5 floor was *under*-entraining, and supplying the real
+boundary-layer depth deepens the convective deficit instead of closing it. The
+"over-entrains by a median factor of 5.2" figure recorded against this change is
+withdrawn; the two docstrings now state the opposite signs explicitly.
+
+The seed stays wired, for fidelity rather than for the bias: ModelE seeds from
+its own boundary layer, its dumps put that seed above the 0.5 floor on both
+single-column cases, and the port now computes the same quantity instead of a
+constant. The cost is recorded above so nobody reads it as an improvement.
 
 ### Why the seed is the live hypothesis
 

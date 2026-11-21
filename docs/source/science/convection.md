@@ -141,8 +141,10 @@
   both single-column cases and up to 1.33 m/s on the deep one, against a
   tropical ``w*`` of 1.14 m/s in a global run. Until this was wired the
   buoyancy-sorting path passed no seed at all and every plume started at the
-  0.5 m/s floor, over-entraining by a median factor of 5.2 since the
-  entrainment closure divides by ``w**2``. Also that the three prognostic
+  0.5 m/s floor. Wiring it is a fidelity choice and not an improvement: in this
+  closure the entrainment rate rises with the seed rather than falling, so
+  supplying the real boundary-layer depth deepens the global convective
+  precipitation deficit, from 20.1 % to 23.3 %. Also that the three prognostic
   inputs below are zero in a global run,
   which moves the port's median single-column plume top from L22 to L46 and
   makes that overshoot test the terminating one on 80 % of plumes. It leaves the column 5.9 % moister, and the stratiform scheme
