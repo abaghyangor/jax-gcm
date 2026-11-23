@@ -1285,7 +1285,17 @@ class TteTkeVerticalDiffusion(PhysicsTerm):
         # The closure counts levels top-first; column physics that works
         # surface-first (the GISS convection port, as ModelE does) wants the
         # same layer as a count up from the surface.
-        mixed_layer_top = (nlev - 1) - vdiff_diagnostics.boundary_layer_level
+        #
+        # Cast to int32 because this is published as a top-level diagnostic and
+        # so becomes part of the carried physics state. ``boundary_layer_level``
+        # is an argmax result, which JAX widens to int64 whenever
+        # ``jax_enable_x64`` is on; carrying that int64 index alongside float32
+        # physics breaks the int32 index discipline the ECHAM term list asserts
+        # (``echam_terms_test.TestSixtyFourBitMode``). ``nlev`` is a Python int
+        # from ``.shape`` and so is weakly typed — it is not the widening here.
+        mixed_layer_top = (
+            (nlev - 1) - vdiff_diagnostics.boundary_layer_level
+        ).astype(jnp.int32)
 
         return tendency, {**diagnostics, "vertical_diffusion": vdiff_out,
                           "surface": surface_out,
