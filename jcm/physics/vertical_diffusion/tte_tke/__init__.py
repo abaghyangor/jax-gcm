@@ -25,7 +25,6 @@ from .vertical_diffusion_types import (
 from .turbulence_coefficients import (
     compute_richardson_number,
     compute_surface_exchange_coefficients,
-    mixed_layer_level,
     compute_friction_velocity,
     compute_turbulence_diagnostics
 )
@@ -92,7 +91,6 @@ __all__ = [
     "interior_buoyancy_and_shear",
     "interior_buoyancy_terms",
     "richardson_number",
-    "mixed_layer_level",
     "compute_friction_velocity",
     "compute_turbulence_diagnostics",
 
