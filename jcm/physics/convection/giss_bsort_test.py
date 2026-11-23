@@ -517,11 +517,16 @@ class TestPlumeAscent(unittest.TestCase):
     def test_column_matches_vectorized(self):
         """One column and a 3-wide block must be the same computation.
 
-        Asserted in float64, where the answer is *exact* (0.0), rather than in
-        float32 against a hand-picked tolerance. The scheme ships in float32 and
-        there the two differ by ~1.3e-4 on a `plume_mass` of magnitude 52 --
+        Asserted in float64 against a few-ULP relative tolerance, rather than in
+        float32 against a hand-picked absolute one. The scheme ships in float32
+        and there the two differ by ~1.3e-4 on a `plume_mass` of magnitude 52 --
         1.9e-6 relative, which is XLA compiling the `(nlev,)` and `(nlev, 3)`
-        shapes to different reduction orders, not a broadcasting defect.
+        shapes to different reduction orders, not a broadcasting defect. float64
+        shrinks that disagreement by ~10 orders of magnitude but does not remove
+        it: the reduction orders still differ, so the residual is a couple of
+        ULPs and is hardware-dependent (bit-exact on arm64, 1.8e-14 on CI's
+        x86 runners). The tolerance below is ~12 orders of magnitude tighter
+        than a genuine axis-mixing bug, which would move these by O(1).
 
         The precision is set here rather than inherited. This test used to pass
         only when the whole directory ran in one process, because
@@ -559,12 +564,19 @@ class TestPlumeAscent(unittest.TestCase):
             exner=widen(_column_profile("plk", 7.0)),
             pressure=widen(_column_profile("pres", 9.0e4)),
             entrainment_efficiency=jnp.full((3,), _COLUMN["enteff"]))
-        # Exact: same inputs, same code, so any difference at all would mean the
-        # vertical scan reads a horizontal axis somewhere.
-        self.assertEqual(float(jnp.max(jnp.abs(
-            single.plume_mass[:, None] - block.plume_mass))), 0.0)
-        self.assertEqual(float(jnp.max(jnp.abs(
-            single.detrained_mass[:, None] - block.detrained_mass))), 0.0)
+        # Same inputs and same code, so the two agree to floating-point
+        # reassociation and nothing more. Compared relative to each field's own
+        # magnitude: if the vertical scan read a horizontal axis anywhere, these
+        # would differ by O(1), not by ULPs.
+        for name, one, many in (
+                ("plume_mass", single.plume_mass, block.plume_mass),
+                ("detrained_mass", single.detrained_mass,
+                 block.detrained_mass)):
+            scale = float(jnp.max(jnp.abs(one)))
+            self.assertGreater(scale, 0.0, msg=f"{name} is identically zero")
+            self.assertLess(
+                float(jnp.max(jnp.abs(one[:, None] - many))) / scale, 1e-12,
+                msg=name)
 
     def test_gradient_finite(self):
         def f(cloud_base_mass):
