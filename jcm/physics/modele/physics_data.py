@@ -46,6 +46,22 @@ class GissConvectionData:
             ModelE oracle's own diagnostic name and rate, which the
             single-column validation compares against directly. 1 mm of water
             is 1 kg/m^2, so they differ only by the 86400 s in a day.
+        precip_conv_snow: The snow part of ``precip_conv`` at the surface
+            [kg/m^2/s], ``(ncols,)`` -- ECHAM's ``ssfc``, which
+            ``surface_rain_and_snow`` subtracts from ``precip_conv`` to get
+            the rain part. **Identically zero**, and that is this port's
+            physics rather than a placeholder: ModelE redistributes melting
+            heat when the precipitation phase changes across a level, and
+            that block is deliberately outside the ported descent (see
+            ``giss_downdraft``: BOMEX is all-liquid on every oracle level,
+            ``lhx = LHE``, so it is inert there). The descent therefore
+            carries no snow phase for this field to report, and splitting
+            the flux here by a surface temperature would be a rule ModelE
+            does not apply at this point in the code -- the same reason
+            ``ktype`` below is not carried at all. The cost is that a
+            sub-freezing column's convective precipitation reaches the
+            surface as rain; a mixed-phase case needs the melting block
+            ported first.
 
     Not carried: ``ktype``, ECHAM's convective-type code, which radiation reads
     through ``lagged_convection_type`` to pick a cloud-inhomogeneity factor.
@@ -63,6 +79,7 @@ class GissConvectionData:
     cloud_base: jnp.ndarray
     cloud_base_mass_flux: jnp.ndarray
     precip_conv: jnp.ndarray
+    precip_conv_snow: jnp.ndarray
 
     @classmethod
     def zeros(cls, nodal_shape, nlev):
@@ -76,6 +93,7 @@ class GissConvectionData:
             cloud_base=jnp.zeros(nodal_shape, dtype=int),
             cloud_base_mass_flux=jnp.zeros(nodal_shape),
             precip_conv=jnp.zeros(nodal_shape),
+            precip_conv_snow=jnp.zeros(nodal_shape),
         )
 
     @classmethod
@@ -87,10 +105,12 @@ class GissConvectionData:
             cloud_base=jnp.ones(nodal_shape, dtype=int),
             cloud_base_mass_flux=jnp.ones(nodal_shape),
             precip_conv=jnp.ones(nodal_shape),
+            precip_conv_snow=jnp.ones(nodal_shape),
         )
 
     def copy(self, dq_mc=None, dth_mc=None, mcp=None, cloud_base=None,
-             cloud_base_mass_flux=None, precip_conv=None):
+             cloud_base_mass_flux=None, precip_conv=None,
+             precip_conv_snow=None):
         return GissConvectionData(
             dq_mc=dq_mc if dq_mc is not None else self.dq_mc,
             dth_mc=dth_mc if dth_mc is not None else self.dth_mc,
@@ -101,6 +121,9 @@ class GissConvectionData:
                                   else self.cloud_base_mass_flux),
             precip_conv=(precip_conv if precip_conv is not None
                          else self.precip_conv),
+            precip_conv_snow=(precip_conv_snow
+                              if precip_conv_snow is not None
+                              else self.precip_conv_snow),
         )
 
     def isnan(self):

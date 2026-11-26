@@ -570,6 +570,13 @@ class GissConvection(PhysicsTerm):
             # The same rain as a flux, which is what the rest of jcm reads:
             # `EchamSurfaceExchange` sums it into the total surface
             # precipitation. 1 mm of water is 1 kg/m^2.
+            #
+            # `precip_conv_snow` is left at the zero `zeros()` gave it, and
+            # that is deliberate: the melting/freezing block that would give
+            # the falling flux a snow phase is outside the ported descent
+            # (`giss_downdraft`), so this scheme has no snow to report and
+            # `surface_rain_and_snow` routes all of it as rain. See the field's
+            # own docstring in `GissConvectionData`.
             precip_conv=mcp / 86400.0)
 
         out = {**diagnostics, "convection": convection}

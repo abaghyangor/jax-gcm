@@ -57,7 +57,17 @@ _DAYS = 2.0
 
 
 def _physics(preset):
-    """Build a preset's term list, with the grey two-stream for radiation."""
+    """Build a preset's term list, with the grey two-stream for radiation.
+
+    ``land_model`` is forced to ``prescribed`` for every preset here. The
+    ECHAM presets run SLIM, whose surface properties ``forcing.slim_file=auto``
+    resolves only on the T63/T106/T127/T255 Gaussian grids, so a single RCE
+    column cannot satisfy it and ``SlimTerm.validate_forcing`` refuses the run.
+    Overriding it in one place keeps both arms on the same land, which is what
+    the comparison below needs; the presets themselves stay faithful to
+    ``echam.yaml``. (``slim_land: {}`` is falsy, so it does not trip the
+    "slim_land only composes with land_model='slim'" guard.)
+    """
     from hydra import compose, initialize_config_dir
 
     import jcm
@@ -67,7 +77,9 @@ def _physics(preset):
 
     config_dir = str(Path(jcm.__file__).resolve().parent / "config")
     with initialize_config_dir(config_dir=config_dir, version_base=None):
-        cfg = compose(config_name="config", overrides=[f"physics={preset}"])
+        cfg = compose(config_name="config",
+                      overrides=[f"physics={preset}",
+                                 "physics.land_model=prescribed"])
     physics = runners.build_physics(cfg)
     return physics.replace(
         "radiation",

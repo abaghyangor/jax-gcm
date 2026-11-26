@@ -39,6 +39,14 @@
 # Mirrors `echam.yaml`.
 vectorize_columns: true
 checkpoint_terms: true
+# SLIM is the ECHAM presets' land (upstream 030353fb); mirrored here so this
+# preset differs from `echam` in the convection slot and nothing else. A
+# single-column run cannot satisfy it -- `forcing.slim_file=auto` resolves
+# only on the T63/T106/T127/T255 Gaussian grids -- so the SCM integration
+# test overrides both arms to `prescribed` rather than letting the two
+# presets drift apart here.
+land_model: slim
+slim_land: {}
 
 terms:
   moist_air_state:
@@ -55,6 +63,15 @@ terms:
     _target_: jcm.physics.clouds.sundqvist.SundqvistCloudFraction
   rrtmgp_radiation:
     _target_: jcm.physics.radiation.rrtmgp.RRTMGPRadiation
+    # Mirrored from `echam.yaml` (upstream f26da60a): the measured A100
+    # optimum at T63L47. Performance only, no effect on the physics -- but
+    # left unset this preset would solve radiation differently from the
+    # control it is A/B'd against.
+    lw_solver: two_stream
+    gas_optics_mode: all_gpts
+    gpt_chunk: 64
+    use_scan: true
+    column_block: auto
   # ECHAM physc ordering, unchanged: vdiff (with the surface exchange in its
   # implicit solve) runs BEFORE convection, and echam_surface follows vdiff
   # directly because it only republishes the vdiff-delivered fluxes.
