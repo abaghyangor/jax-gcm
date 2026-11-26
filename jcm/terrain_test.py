@@ -597,6 +597,93 @@ class TestTerrainDataFromFile(unittest.TestCase):
             self.assertEqual(getattr(terrain, name).shape, expected_shape,
                              msg=name)
 
+    def test_from_file_coarse_sso_is_interpolated_not_discarded(self):
+        """A coarser file's SSO is regridded, not replaced by the heuristic.
+
+        Baines-Palmer needs source cells to aggregate per target cell and a
+        coarser file has none to give, so the only other option is the
+        mean-orography heuristic — which cannot recover the real
+        high-resolution topography the file's descriptors already carry.
+        The orientation also has to survive its wrap: ``orothe`` is axial
+        in (-90, 90], so +89 and -89 degrees are nearly the same ridge and
+        interpolating the angle itself would average them to ~0.
+        """
+        import tempfile
+
+        import numpy as np
+        import xarray as xr
+
+        # T31 source (96, 48) into a T42 model grid (128, 64).
+        coords = get_speedy_coords(layers=8, spectral_truncation=42)
+        lon = np.arange(0.0, 360.0, 360.0 / 96)
+        lat = np.linspace(-87.0, 87.0, 48)
+        rng = np.random.default_rng(1)
+        orog = np.abs(rng.normal(300.0, 200.0, (96, 48)))
+        orothe = np.empty((96, 48))
+        orothe[0::2, :] = 89.0
+        orothe[1::2, :] = -89.0
+        ds = xr.Dataset(
+            {"orog": (("lon", "lat"), orog),
+             "lsm": (("lon", "lat"), (orog > 350.0).astype(float)),
+             # A value the heuristic would never produce, so this test
+             # fails if the file's descriptors are dropped.
+             "orostd": (("lon", "lat"), np.full((96, 48), 777.0)),
+             "orothe": (("lon", "lat"), orothe),
+             **{name: (("lon", "lat"), np.full((96, 48), 0.25))
+                for name in ("orosig", "orogam", "oropic", "oroval")}},
+            coords={"lon": lon, "lat": lat})
+        with tempfile.NamedTemporaryFile(suffix=".nc") as f:
+            ds.to_netcdf(f.name)
+            terrain = TerrainData.from_file(f.name, coords=coords)
+
+        expected_shape = coords.horizontal.nodal_shape
+        self.assertEqual(expected_shape, (128, 64))
+        for name in ("orog", "fmask", "orostd", "orosig", "orogam",
+                     "orothe", "oropic", "oroval"):
+            self.assertEqual(getattr(terrain, name).shape, expected_shape,
+                             msg=name)
+        self.assertTrue(jnp.allclose(terrain.orostd, 777.0, rtol=1e-4))
+        self.assertTrue(jnp.allclose(terrain.orogam, 0.25, rtol=1e-4))
+        # Averaged across the wrap this would be ~0, not ~90.
+        self.assertGreater(float(jnp.min(jnp.abs(terrain.orothe))), 80.0)
+        self.assertLessEqual(float(jnp.max(jnp.abs(terrain.orothe))), 90.0)
+
+    def test_from_coords_interpolate_brings_the_sso_along(self):
+        """``interpolate=True`` regrids the file's SSO with its orography.
+
+        Without it ``TerrainData`` is built with orog/fmask on the model
+        grid and the six descriptors still on the file's, a mismatch that
+        only surfaces inside the first vmapped physics call (#578).
+        """
+        import tempfile
+
+        import numpy as np
+        import xarray as xr
+
+        coords = get_speedy_coords(layers=8, spectral_truncation=42)
+        lon = np.arange(0.0, 360.0, 360.0 / 96)
+        lat = np.linspace(-87.0, 87.0, 48)
+        rng = np.random.default_rng(2)
+        orog = np.abs(rng.normal(300.0, 200.0, (96, 48)))
+        ds = xr.Dataset(
+            {"orog": (("lon", "lat"), orog),
+             "lsm": (("lon", "lat"), (orog > 350.0).astype(float)),
+             **{name: (("lon", "lat"), np.full((96, 48), 0.25))
+                for name in ("orostd", "orosig", "orogam", "orothe",
+                             "oropic", "oroval")}},
+            coords={"lon": lon, "lat": lat})
+        with tempfile.NamedTemporaryFile(suffix=".nc") as f:
+            ds.to_netcdf(f.name)
+            terrain = TerrainData.from_coords(
+                coords, terrain_file=f.name, interpolate=True)
+
+        expected_shape = coords.horizontal.nodal_shape
+        for name in ("orog", "fmask", "orostd", "orosig", "orogam",
+                     "orothe", "oropic", "oroval"):
+            self.assertEqual(getattr(terrain, name).shape, expected_shape,
+                             msg=name)
+        self.assertTrue(jnp.allclose(terrain.orostd, 0.25, rtol=1e-4))
+
     def test_from_file_interpolates_to_different_resolution(self):
         """from_file should interpolate terrain when coords resolution differs."""
         from importlib import resources
