@@ -39,7 +39,7 @@ activity, and the validation boundary has moved with them:
 
 TWP-ICE is the case the port is now measured on, because it is the only one that
 exercises the deep plume and the phase change. Against it the port currently
-produces **0.910** of ModelE's convective rain and delivers **0.923** of its
+produces **0.910** of ModelE's convective rain and delivers **1.017** of its
 surface flux, with the cloud-base count per step (1.744 against 1.744) and the
 mean cloud top both matching.
 
@@ -57,6 +57,39 @@ cold-pool fraction `fcp`, the penetrative mass `mwpen`, and the running
 cloud-top pressure `pmct`. A port validated against TWP-ICE with those supplied
 is not yet a GCM-ready scheme, and that gap is a design question rather than a
 measurement one.
+
+### Reproducing the validation
+
+The port's own tests need nothing outside this repository:
+
+```sh
+JAX_PLATFORMS=cpu pytest jcm/physics/convection -q
+```
+
+The scorecards and comparison figures need the ModelE run directories, which are
+not committed, and are driven from the bridge repository:
+
+```sh
+SCM_CASE=twpice python -m modele_jcm_bridge.bomex_compare_plots out/
+```
+
+`SCM_CASE` takes `bomex`, `rico`, `dycoms` or `twpice`. Adding a case is two
+lines in the bridge's `CASES` table plus a ModelE rundeck -- nothing in the
+harness or the scoring is case-specific, which is the point.
+
+Regenerating the oracle itself runs ModelE:
+
+```sh
+MODELERC=$PWD/modelErc.bomex_scm.local gmake setup RUN=twpice_scm
+MODELERC=$PWD/modelErc.bomex_scm.local ../exec/runE twpice_scm -cold-restart -np 1
+```
+
+**`SCM_PlumeDiag=1` in the rundeck is what writes the plume-internal dumps**
+(`mass_budget.txt`, `blend_diag.txt`, `downdraft_diag.txt` and the rest). Those
+dumps, not SUBDD output, are what every measurement in section 6 rests on, and
+`gmake setup` regenerates the run directory's `I` from the rundeck -- so setting
+it to 0 there silently disables every dump on the next rebuild, and the
+comparison then scores against an oracle that is quietly missing its interior.
 
 ## 2. Repository layout (separation of concerns)
 

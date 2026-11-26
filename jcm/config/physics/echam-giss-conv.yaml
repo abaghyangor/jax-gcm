@@ -20,7 +20,7 @@
 # Validation status, so this is not mistaken for a tuned or supported preset.
 # The term is validated in **single column** against a ModelE SCM run of the
 # TWP-ICE case (Darwin, 766 timesteps) through `modele-jcm-bridge`. Against that
-# oracle it produces 0.910 of ModelE's convective rain and delivers 0.923 of its
+# oracle it produces 0.910 of ModelE's convective rain and delivers 1.017 of its
 # surface flux, with the cloud-base count per step and the mean cloud top both
 # matching. It has **never been run in a global configuration**. Known gaps, all
 # recorded in `docs/source/design/giss_convection_port.md`:

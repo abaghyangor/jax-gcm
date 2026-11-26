@@ -22,7 +22,8 @@ Validation status
 Structure is a faithful read of the Fortran. On the convectively active **BOMEX**
 oracle the closure produces physical values (``FPLUME ~ 0.04-0.14``,
 ``fmp2 ~ 2-8 kg/m^2``) for well-triggered columns, and the downstream ``dth_mc``
-lands at the right order of magnitude (see ``STATUS.md``). It is not a
+lands at the right order of magnitude (see
+``docs/source/design/giss_convection_port.md``). It is not a
 level-by-level Fortran match; the unit tests assert closure *behaviour* -- the
 bisection drives ``DMSE1`` toward zero, a more unstable column yields a larger
 mass flux -- rather than exact agreement.

@@ -7,7 +7,8 @@ convection *term* lives here under ``jcm/physics/convection/`` (named after the
 scheme); the parameter/diagnostic structs live under :mod:`jcm.physics.modele`.
 The ModelE oracle reading/conversion tooling lives in a *separate* repository;
 this repo only carries committed fixture arrays (``jcm/data/test/modele/``) for
-tests. See ``ARCHITECTURE.md`` for the full port design.
+tests. See ``docs/source/design/giss_convection_port.md`` for the
+full port design.
 
 Status: diagnostics always; full tendencies under ``allow_mc``
 -------------------------------------------------------------
@@ -834,10 +835,11 @@ class GissConvection(PhysicsTerm):
         # of its production into the downdraft against ModelE's 44.3%, and
         # replaying ModelE's own per-level shaft through `downdraft_descent`
         # reproduces its `dqevp` to **1.0002** over 1031 TWP-ICE downdrafts
-        # (1.0000 on all 52 of BOMEX's). So the surface ratio of 0.923 is the
-        # production deficit showing through, not an undersized sink. See
-        # section 128 of `BSORT_PORT_PLAN.md` in the bridge, and the replay
-        # test that pins it there.
+        # (1.0000 on all 52 of BOMEX's). So the 0.923 surface ratio that
+        # reconstructing the flux left was the production deficit showing
+        # through, not an undersized sink. See section 128 of
+        # `BSORT_PORT_PLAN.md` in the bridge, and the replay test that
+        # pins it there.
         #
         # The flux is therefore read off the descent rather than reconstructed
         # from the sums. Reconstructing it as `produced - evaporated` loses a
@@ -1364,7 +1366,8 @@ class GissConvection(PhysicsTerm):
 
         Without them the closure falls back to blending over the whole sub-cloud
         column with no surface enhancement, which under-computes the cloud-base
-        mass flux (see ``STATUS.md``).
+        mass flux (see
+        ``docs/source/design/giss_convection_port.md``).
         """
         boundary_layer_top = None
         mixed_layer_top = diagnostics.get("mixed_layer_top")
