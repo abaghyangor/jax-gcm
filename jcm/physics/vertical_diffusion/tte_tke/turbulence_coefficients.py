@@ -282,6 +282,7 @@ def compute_turbulence_diagnostics(
     boundary_layer_height: jnp.ndarray,
     richardson_number: jnp.ndarray,
     mixing_length: jnp.ndarray,
+    boundary_layer_level: jnp.ndarray | None = None,
 ) -> VDiffDiagnostics:
     """Compute the surface exchange and collect the turbulence diagnostics.
 
@@ -299,6 +300,13 @@ def compute_turbulence_diagnostics(
         boundary_layer_height: Height of the PBL extension [m] (ncol,)
         richardson_number: ``zri`` of the interior interfaces (ncol, nlev - 1)
         mixing_length: ``zmix`` of the interior interfaces [m] (ncol, nlev - 1)
+        boundary_layer_level: optional ``ihpbl``, the diagnosed PBL level,
+            top-first (ncol,). Omitted it falls back to the SURFACE level,
+            not to zero: zero is the model *top* in this frame, so a caller
+            that forgot the argument would publish a PBL filling the whole
+            column, and a consumer choosing a parcel from it would lift
+            from the stratosphere. The surface is the degenerate-but-safe
+            reading -- a boundary layer of no depth.
 
     Returns:
         Complete diagnostics structure
@@ -465,6 +473,11 @@ def compute_turbulence_diagnostics(
         surface_exchange_moisture=surface_exchange_moisture,
         surface_exchange_momentum=surface_exchange_momentum,
         boundary_layer_height=pbl_height,
+        boundary_layer_level=(
+            # The surface, not 0 — see the argument's docstring.
+            jnp.full(boundary_layer_height.shape,
+                     richardson_number.shape[-1], jnp.int32)
+            if boundary_layer_level is None else boundary_layer_level),
         friction_velocity=friction_velocity,
         convective_velocity=convective_velocity,
         surface_friction_velocity_tile=surface_friction_velocity_tile,

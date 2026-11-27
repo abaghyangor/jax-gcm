@@ -1,0 +1,408 @@
+"""GISS ModelE saturation thermodynamics and moist static energy.
+
+First ported pieces of the GISS moist-convection scheme (``MSTCNV``). These are
+the small, self-contained thermodynamic primitives the convective trigger and
+plume code build on. They are deliberate, faithful ports of the GISS Fortran:
+
+* ``saturation_vapor_pressure`` -- the Murphy & Koop (2005) expression in
+  ``wv_psat`` (``modelE/model/shared/Utilities.F90``). ModelE's default is
+  ``use_mk2005 = .true.``, which the verified DYCOMS oracle run used, so we port
+  that branch (not the older Clausius-Clapeyron form).
+* ``saturation_specific_humidity`` -- ModelE ``QSAT(TM, LH, PR) = mrat *
+  wv_psat(TM, LH) / PR`` (same file).
+* ``moist_static_energy`` -- dry static energy ``sha*T + geopotential`` plus the
+  latent term ``L*q``, matching how ``MSTCNV`` forms moist static energy from
+  ``SHA``, geopotential, and ``LHE``/``LHS``.
+
+Why GISS-specific constants (not :mod:`jcm.constants`)
+-----------------------------------------------------
+To reproduce the ModelE oracle, these functions must use ModelE's own constant
+values (e.g. ``sha = rgas/kapa`` works out to ~1002.9 J/kg/K, slightly different
+from JCM's ``cpd``). We therefore define the GISS constant set here, derived from
+the same base values as ``modelE/model/shared/Constants_mod.F90``. This mirrors
+how the SPEEDY port keeps its scheme-specific ``alhc`` separate from the shared
+SI constant. General-purpose JCM code should still use :mod:`jcm.constants`.
+
+Units (ModelE-native; convert at the term boundary)
+---------------------------------------------------
+* temperature: K
+* pressure: **Pa** (ModelE ``QSAT`` takes Pa; the oracle ``p_3d`` is hPa, so
+  multiply by 100 before calling)
+* specific humidity: kg/kg (JCM ``PhysicsState`` uses g/kg -- convert at the edge)
+* geopotential: m^2/s^2 (= g * height)
+
+Differentiability note
+----------------------
+We do **not** port ModelE's analytic ``DLNQSATDT`` -- JAX provides
+``d(qsat)/dT`` (and any other derivative) by autodiff straight through
+``saturation_specific_humidity``. That is the whole point of the JAX port and is
+exercised by the gradient tests.
+
+Following the convention of :mod:`jcm.physics.convection.saturation`, these
+functions are not ``@jit``-ed (they are inlined into the model's outer jit).
+
+``phase`` is normally the static Python string ``"water"`` or ``"ice"``, resolved
+at trace time so the unused branch is never built. It may also be a **traced
+boolean array**, true where the ice branch applies, which is what the plume
+ascent needs: ModelE sets ``lhx`` per level from the parcel's own temperature
+against ``tfmc`` (``MSTCNV.F90:1849-1854``), and which level that happens on is
+not known at trace time. Both branches are then evaluated and selected
+elementwise -- the saturation fits are two closed forms and each clips its own
+argument, so neither can contaminate the other's value or gradient.
+"""
+
+import jax.numpy as jnp
+
+# --- GISS / ModelE constants, derived exactly as in Constants_mod.F90 ---------
+_GASC = 8.314510          # universal gas constant [J/mol/K]
+_MAIR = 28.9655           # molar mass of dry air [g/mol]
+_MWAT = 18.015            # molar mass of water [g/mol]
+_SRAT = 1.401             # c_p/c_v for dry air
+
+RGAS = 1e3 * _GASC / _MAIR        # dry-air gas constant [J/kg/K]  (~287.05)
+RVAP = 1e3 * _GASC / _MWAT        # water-vapour gas constant [J/kg/K] (~461.52)
+MRAT = _MWAT / _MAIR              # molar-mass ratio (~0.62194)
+KAPA = (_SRAT - 1.0) / _SRAT      # R/c_p (~0.28622)
+SHA = RGAS / KAPA                 # dry-air specific heat at const p [J/kg/K] (~1002.9)
+GRAV = 9.80665                    # gravitational acceleration [m/s^2]
+LHE = 2.5e6                       # latent heat of evaporation [J/kg]
+LHM = 3.34e5                      # latent heat of melting [J/kg]
+LHS = LHE + LHM                   # latent heat of sublimation [J/kg]
+DELTX = _MAIR / _MWAT - 1.0       # virtual-temperature humidity coeff. (~0.6078)
+
+# Murphy & Koop (2005) fit validity limits used by ModelE wv_psat.
+_MK_WATER_TMIN, _MK_WATER_TMAX = 123.0, 332.0
+_MK_ICE_TMIN = 110.0
+
+
+def _phase_select(phase, water_value, ice_value):
+    """Pick the water or ice branch, statically or elementwise.
+
+    Args:
+        phase: ``"water"``, ``"ice"``, or a traced boolean array that is true
+            where the ice branch applies.
+        water_value: The water branch. For a traced ``phase`` this must already
+            be evaluated, so pass a value, not a thunk.
+        ice_value: The ice branch.
+
+    Returns:
+        The selected value.
+
+    """
+    if isinstance(phase, str):
+        if phase == "water":
+            return water_value
+        if phase == "ice":
+            return ice_value
+        raise ValueError(f"phase must be 'water' or 'ice', got {phase!r}")
+    return jnp.where(phase, ice_value, water_value)
+
+
+def latent_heat_of(phase) -> jnp.ndarray:
+    """Latent heat for a phase [J/kg]: ``LHE`` over water, ``LHS`` over ice.
+
+    ModelE's ``lhx``. Accepts a traced ``phase``, in which case the result is an
+    array -- which is how a freezing level inside one plume ascent is expressed.
+
+    Args:
+        phase: ``"water"``, ``"ice"``, or a traced boolean array.
+
+    Returns:
+        ``LHE``, ``LHS``, or an array of the two.
+
+    """
+    return _phase_select(phase, LHE, LHS)
+
+
+def saturation_vapor_pressure(temperature: jnp.ndarray,
+                              phase: str = "water") -> jnp.ndarray:
+    """Saturation vapour pressure [Pa], Murphy & Koop (2005).
+
+    Faithful port of the ``use_mk2005 = .true.`` branch of ModelE ``wv_psat``
+    (``modelE/model/shared/Utilities.F90``). Temperature is clipped to the fit's
+    validity range exactly as the Fortran does.
+
+    Args:
+        temperature: Temperature [K].
+        phase: ``"water"`` (uses ``LHE`` branch) or ``"ice"`` (``LHS``
+            branch), or a traced boolean array true where ice applies.
+
+    Returns:
+        Saturation vapour pressure [Pa].
+
+    """
+    def over_water():
+        tn = jnp.clip(temperature, _MK_WATER_TMIN, _MK_WATER_TMAX)
+        ln_tn = jnp.log(tn)
+        return jnp.exp(
+            54.842763 - 6763.22 / tn - 4.210 * ln_tn + 0.000367 * tn
+            + jnp.tanh(0.0415 * (tn - 218.8))
+            * (53.878 - 1331.22 / tn - 9.44523 * ln_tn + 0.014025 * tn)
+        )
+
+    def over_ice():
+        tn = jnp.maximum(temperature, _MK_ICE_TMIN)
+        return jnp.exp(
+            9.550426 - 5723.265 / tn + 3.53068 * jnp.log(tn) - 0.00728332 * tn
+        )
+
+    # A static phase builds only its own branch; a traced one needs both, and
+    # each clips its own argument so the discarded branch stays finite.
+    if isinstance(phase, str):
+        return _phase_select(phase, over_water, over_ice)()
+    return _phase_select(phase, over_water(), over_ice())
+
+
+def saturation_specific_humidity(temperature: jnp.ndarray,
+                                 pressure: jnp.ndarray,
+                                 phase: str = "water") -> jnp.ndarray:
+    """Saturation specific humidity [kg/kg], ModelE ``QSAT``.
+
+    ``QSAT(TM, LH, PR) = mrat * wv_psat(TM, LH) / PR``
+    (``modelE/model/shared/Utilities.F90``).
+
+    Args:
+        temperature: Temperature [K].
+        pressure: Air pressure [**Pa**] (oracle ``p_3d`` is hPa -> *100).
+        phase: ``"water"``, ``"ice"``, or a traced boolean array.
+
+    Returns:
+        Saturation specific humidity [kg/kg].
+
+    """
+    return MRAT * saturation_vapor_pressure(temperature, phase) / pressure
+
+
+def moist_static_energy(temperature: jnp.ndarray,
+                        geopotential: jnp.ndarray,
+                        specific_humidity: jnp.ndarray,
+                        phase: str = "water") -> jnp.ndarray:
+    """Moist static energy [J/kg]: ``sha*T + geopotential + L*q``.
+
+    Matches how ``MSTCNV`` forms moist static energy from the dry static energy
+    (``SHA*T`` plus geopotential) and the latent contribution, with ``L = LHE``
+    for the water phase and ``LHS`` for ice.
+
+    Args:
+        temperature: Temperature [K].
+        geopotential: Geopotential [m^2/s^2] (= g * height).
+        specific_humidity: Specific humidity [kg/kg].
+        phase: ``"water"`` (``LHE``), ``"ice"`` (``LHS``), or a traced
+            boolean array true where ice applies.
+
+    Returns:
+        Moist static energy [J/kg].
+
+    """
+    latent_heat = latent_heat_of(phase)
+    return SHA * temperature + geopotential + latent_heat * specific_humidity
+
+
+def d_ln_qsat_dt(temperature: jnp.ndarray, phase: str = "water") -> jnp.ndarray:
+    """``d(ln qsat)/dT = L / (RVAP * T^2)`` -- ModelE ``DLNQSATDT``.
+
+    Port of ModelE ``DLNQSATDT`` (``shared/Utilities.F90``), used by the
+    cloud-base mass-flux closure's saturation-adjustment terms. Note ModelE uses
+    this Clausius-Clapeyron form (with ``C = 1/RVAP``) even when ``wv_psat`` is
+    the Murphy & Koop expression -- a deliberate approximation we reproduce.
+
+    (Elsewhere we let JAX autodiff differentiate ``qsat`` directly; this analytic
+    form exists specifically to match the closure's Fortran arithmetic.)
+
+    Args:
+        temperature: Temperature [K].
+        phase: ``"water"`` (``LHE``), ``"ice"`` (``LHS``), or a traced
+            boolean array true where ice applies.
+
+    Returns:
+        ``d(ln qsat)/dT`` [1/K].
+
+    """
+    latent_heat = latent_heat_of(phase)
+    return latent_heat / (RVAP * temperature ** 2)
+
+
+def virtual_temperature(temperature: jnp.ndarray,
+                        specific_humidity: jnp.ndarray,
+                        condensate: jnp.ndarray = 0.0) -> jnp.ndarray:
+    """Virtual (density) temperature [K]: ``T * (1 + DELTX*q - wm)``.
+
+    This is the buoyancy variable ``MSTCNV`` uses in the cloud-base closure
+    (``SVDN = SDN*(1 + DELTX*QDN - WMDN)``): water vapour makes a parcel lighter
+    (``+DELTX*q``) while suspended condensate loads it down (``-wm``). Applying
+    the same multiplicative factor to potential temperature instead of ``T``
+    yields the virtual *potential* temperature used for the edge values
+    ``SVUP``/``SVDN``.
+
+    Args:
+        temperature: Temperature (or potential temperature) [K].
+        specific_humidity: Water-vapour specific humidity [kg/kg].
+        condensate: Suspended condensate (liquid + ice) mixing ratio [kg/kg].
+            Defaults to 0 (no condensate loading).
+
+    Returns:
+        Virtual temperature [K] (or virtual potential temperature, matching the
+        input).
+
+    """
+    return temperature * (1.0 + DELTX * specific_humidity - condensate)
+
+
+# `get_dq_evap` runs a fixed three-iteration Newton solve. The trip count is
+# part of the scheme's definition, not a convergence criterion -- ModelE stops
+# after three regardless of the residual -- so it is reproduced verbatim rather
+# than replaced by an iterate-to-tolerance loop, which would change answers.
+_EVAP_ITERATIONS = 3
+_TEENY = 1e-20
+
+
+def condensate_evaporation(dry_static_energy: jnp.ndarray,
+                           water_mass: jnp.ndarray,
+                           exner: jnp.ndarray,
+                           mass: jnp.ndarray,
+                           pressure: jnp.ndarray,
+                           condensate: jnp.ndarray,
+                           phase: str = "water"):
+    """Evaporate condensate toward saturation -- ModelE ``get_dq_evap``.
+
+    Port of ``modelE/model/CLOUDS_COM.F90:903``. Given an air parcel holding
+    ``condensate``, find how much of it evaporates as the parcel relaxes toward
+    saturation, cooling as it goes. The buoyancy-sorting plume calls this on
+    every updraft/environment blend before testing the blend's buoyancy
+    (``MSTCNV.F90``, ``plume_ent_det_w2_bsort``), which is what lets an
+    entraining mixture become negatively buoyant through evaporative cooling --
+    the mechanism that drives most of the plume's mass loss.
+
+    The Newton step solves ``q - mass*qsat(T) = 0`` with ``T`` responding to the
+    latent heating, linearised through ``d(ln qsat)/dT``:
+
+        dq = (q - mass*qsat(T)) / (1 + (L/cp)*qsat(T)*dlnqsatdt(T))
+
+    Evaporation is ``dq < 0`` (the parcel is subsaturated), which accumulates as
+    a positive ``dqsum``; the result is clipped to ``[0, condensate]`` so a
+    supersaturated blend neither condenses here nor evaporates more than it has.
+
+    Args:
+        dry_static_energy: ``SM``, potential-temperature-like heat content,
+            such that ``T = dry_static_energy*exner/mass`` [K * mass units].
+        water_mass: ``QM``, water-vapour content in the same mass units.
+        exner: ``PLK``, ModelE's ``p[mb]**KAPA``. Note this is *not* normalised
+            by a reference pressure -- see the module docstring.
+        mass: ``MASS``, air mass of the parcel. The plume calls this with
+            ``mass = 1`` and intensive ``sm``/``qm``.
+        pressure: Air pressure [**Pa**]. ModelE passes ``pres(l)`` in mb; the
+            caller must convert, since this module's ``qsat`` is Pa-based.
+        condensate: Available condensate, the cap on evaporation [same units as
+            ``water_mass``].
+        phase: ``"water"`` (``LHE``), ``"ice"`` (``LHS``), or a traced
+            boolean array true where ice applies. ModelE
+            selects this per level via ``vlat(l)``.
+
+    Returns:
+        ``(dqsum, fevp)`` -- the evaporated water (>= 0, capped by
+        ``condensate``) and the fraction of the condensate it represents.
+
+    """
+    dqsum = _saturation_adjustment(
+        dry_static_energy, water_mass, exner, mass, pressure, phase)
+    # Evaporation is the subsaturated direction, i.e. negative `dq`; the clip
+    # therefore also rules out condensing here.
+    dqsum = jnp.clip(-dqsum, 0.0, condensate)
+    fevp = _safe_ratio(dqsum, condensate)
+    return dqsum, fevp
+
+
+def _safe_ratio(numerator, denominator):
+    """``numerator/denominator`` where positive, else zero -- gradient-safe."""
+    usable = denominator > 0.0
+    return jnp.where(usable, numerator / jnp.where(usable, denominator, 1.0),
+                     0.0)
+
+
+def _saturation_adjustment(dry_static_energy, water_mass, exner, mass,
+                           pressure, phase):
+    """Signed water change from ModelE's three-step saturation relaxation.
+
+    ``get_dq_cond`` and ``get_dq_evap`` (``CLOUDS_COM.F90``) run the *same*
+    Newton loop and differ only in sign convention and in what they clip the
+    result against, so the loop lives here once. Positive means the parcel is
+    supersaturated and water condenses; negative means it is subsaturated and
+    condensate may evaporate.
+
+    The trip count of three is part of the scheme's definition, not a
+    convergence criterion -- ModelE stops there regardless of the residual --
+    so it is reproduced verbatim.
+    """
+    latent_heat = latent_heat_of(phase)
+    slh = latent_heat / SHA
+
+    # `saturation_vapor_pressure` clips its argument to the fit's valid range,
+    # but `d_ln_qsat_dt = L/(Rv*T^2)` does not, and a caller can legitimately
+    # hand this routine a degenerate parcel (a zero-mass blend, an inactive
+    # column). At T -> 0 that term is infinite: harmless in value, since it only
+    # divides, but it makes the gradient NaN and the NaN survives being masked
+    # out downstream. Clip to the same floor the saturation fit uses.
+    parcel_t = jnp.maximum(dry_static_energy * exner / mass, _MK_ICE_TMIN)
+    remaining_water = water_mass
+    dqsum = jnp.zeros_like(parcel_t)
+
+    for _ in range(_EVAP_ITERATIONS):
+        qst = saturation_specific_humidity(parcel_t, pressure, phase)
+        dq = ((remaining_water - mass * qst)
+              / (1.0 + slh * qst * d_ln_qsat_dt(parcel_t, phase)))
+        parcel_t = parcel_t + slh * dq / mass
+        remaining_water = remaining_water - dq
+        dqsum = dqsum + dq
+    return dqsum
+
+
+def condensation(dry_static_energy: jnp.ndarray,
+                 water_mass: jnp.ndarray,
+                 exner: jnp.ndarray,
+                 mass: jnp.ndarray,
+                 pressure: jnp.ndarray,
+                 phase: str = "water"):
+    """Condense supersaturated vapour -- ModelE ``get_dq_cond``.
+
+    Port of ``modelE/model/CLOUDS_COM.F90:861``, the counterpart to
+    :func:`condensate_evaporation`. The plume calls this on arrival at each new
+    level: its conserved heat and water are carried up unchanged, so the colder
+    ambient pressure leaves it supersaturated, and this returns how much vapour
+    condenses out (releasing latent heat as it does).
+
+    Args:
+        dry_static_energy: ``SM``, extensive heat content.
+        water_mass: ``QM``, extensive water vapour -- **all** of the parcel's
+            water, since ModelE evaporates any existing condensate back in
+            before calling this.
+        exner: ``PLK``.
+        mass: Parcel air mass.
+        pressure: [**Pa**].
+        phase: ``"water"``, ``"ice"``, or a traced boolean array.
+
+    Returns:
+        ``(dqsum, fcond)`` -- condensed water (>= 0, at most ``water_mass``) and
+        the fraction of the vapour it represents.
+
+    """
+    dqsum = _saturation_adjustment(
+        dry_static_energy, water_mass, exner, mass, pressure, phase)
+    dqsum = jnp.clip(dqsum, 0.0, water_mass)
+    return dqsum, _safe_ratio(dqsum, water_mass)
+
+
+def safe_divide(numerator, denominator, fallback=0.0):
+    """Divide only where the denominator is strictly positive.
+
+    The usual ``x / maximum(d, tiny)`` guard is finite in *value* but carries a
+    derivative of order ``1/tiny``, which overflows to NaN under ``grad`` and
+    then survives every downstream mask. Selecting the branch on both sides
+    keeps the degenerate case out of the gradient entirely.
+
+    Degenerate denominators are routine in the convection scheme rather than
+    exceptional: a terminated plume, an inactive column, an empty blend and a
+    condensate-free parcel all reach these expressions with zero.
+    """
+    usable = denominator > 0.0
+    return jnp.where(usable, numerator / jnp.where(usable, denominator, 1.0),
+                     fallback)

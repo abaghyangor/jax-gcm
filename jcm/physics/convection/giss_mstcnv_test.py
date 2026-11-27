@@ -1,0 +1,1184 @@
+"""Tests for the GISS convection PhysicsTerm scaffold.
+
+Milestone 1: the term returns zero tendencies. These tests verify the
+composable-physics interface contract (shapes, ``provides`` diagnostics,
+composition, differentiability) and -- explicitly as a *trivial* check -- that
+zero output matches the inactive moist convection in the DYCOMS-II RF02 case.
+They do NOT claim a validated physics port (see giss_mstcnv.py).
+
+Reference arrays come from a committed, deterministic fixture
+``jcm/data/test/modele/dycoms_period24.npz`` (one DYCOMS column + its
+moist-convective targets), mirroring how the SPEEDY convection tests load
+``.npy`` oracle arrays. The fixture is produced offline by the separate ModelE
+reading/conversion tooling; this repo holds only the committed arrays, not the
+NetCDF reader.
+"""
+
+import contextlib
+import unittest
+from unittest import mock
+from importlib import resources
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from flax import nnx
+
+from jcm.physics_interface import PhysicsState, PhysicsTendency
+from jcm.forcing import ForcingData
+from jcm.terrain import TerrainData
+from jcm.physics.composable_physics import ComposablePhysics
+from jcm.physics.convection.giss_mstcnv import (
+    GissConvection,
+    cloud_base_closure_mass_flux,
+)
+from jcm.physics.convection import giss_bsort
+from jcm.physics.convection import giss_mstcnv
+from jcm.physics.convection.giss_mass_flux import cloud_base_mass_flux_column
+from jcm.physics.convection.giss_thermodynamics import KAPA
+from jcm.physics.modele.params import GissConvectionParameters
+from jcm.physics.modele.physics_data import GissConvectionData
+
+_G = 9.80665      # geopotential height (m) -> geopotential (m^2/s^2)
+_P0_HPA = 1013.25
+
+
+def _make_terrain(shape):
+    zero = jnp.zeros(shape)
+    return TerrainData(
+        orog=zero, phis0=zero, fmask=zero, lfluxland=jnp.bool_(False),
+        orostd=zero, orosig=zero, orogam=zero,
+        orothe=zero, oropic=zero, oroval=zero,
+    )
+
+
+def _load_dycoms_fixture():
+    path = resources.files("jcm.data.test") / "modele" / "dycoms_period24.npz"
+    return np.load(str(path))
+
+
+class TestGissConvectionTerm(unittest.TestCase):
+    def setUp(self):
+        self.nlev, self.ncols = 63, 1
+        self.shape = (self.nlev, self.ncols)
+        self.term = GissConvection()
+
+    def test_metadata(self):
+        self.assertEqual(GissConvection.category, "convection")
+        self.assertEqual(GissConvection.provides, ("convection",))
+        self.assertEqual(GissConvection.requires, ())
+
+    def test_returns_zero_and_writes_convection(self):
+        state = PhysicsState.ones(self.shape)
+        tend, diag = self.term(state, {}, None, None)
+        self.assertIsInstance(tend, PhysicsTendency)
+        self.assertEqual(tend.temperature.shape, self.shape)
+        self.assertTrue(jnp.all(tend.temperature == 0))
+        self.assertTrue(jnp.all(tend.specific_humidity == 0))
+        self.assertIn("convection", diag)
+        conv = diag["convection"]
+        self.assertIsInstance(conv, GissConvectionData)
+        self.assertEqual(conv.dq_mc.shape, self.shape)
+        self.assertEqual(conv.mcp.shape, (self.ncols,))
+        self.assertTrue(jnp.all(conv.dq_mc == 0))
+        self.assertTrue(jnp.all(conv.dth_mc == 0))
+        self.assertTrue(jnp.all(conv.mcp == 0))
+
+    def test_grad_through_state_no_nan(self):
+        # Differentiability smoke w.r.t. state inputs (gradients are zero but
+        # must be defined and finite, not error/NaN).
+        state = PhysicsState.ones(self.shape)
+
+        def loss(s):
+            tend, _ = self.term(s, {}, None, None)
+            return jnp.sum(tend.temperature ** 2) + jnp.sum(
+                tend.specific_humidity ** 2
+            )
+
+        g = jax.grad(loss)(state)
+        self.assertTrue(jnp.all(jnp.isfinite(g.temperature)))
+        self.assertTrue(jnp.all(jnp.isfinite(g.specific_humidity)))
+
+    def test_cloud_base_sentinel_without_pressure(self):
+        # With no pressure_full diagnostic the term is a pure scaffold: the
+        # cloud base is the "no cloud base" sentinel (nlev) and tendencies zero.
+        state = PhysicsState.ones(self.shape)
+        _, diag = self.term(state, {}, None, None)
+        self.assertTrue(jnp.all(diag["convection"].cloud_base == self.nlev))
+
+    def test_cloud_base_from_pressure_full(self):
+        # Provide a realistic column (JCM order: index 0 = top, last = surface)
+        # with a moist surface parcel; the term should find a cloud base.
+        nlev = 12
+        # pressure_full increases top -> surface (Pa).
+        pfull = jnp.linspace(20000.0, 100000.0, nlev)[:, None]   # (nlev, 1)
+        temperature = jnp.linspace(230.0, 298.0, nlev)[:, None]
+        # kg/kg: PhysicsState's units since jax-gcm#824. This read 14.0 --
+        # the old g/kg value -- which is 14 kg of vapour per kg of air, so
+        # the surface parcel was saturated before it was lifted and the
+        # cloud base came back at level 0.
+        specific_humidity = jnp.full((nlev, 1), 0.014)
+        state = PhysicsState.zeros(
+            (nlev, 1), temperature=temperature,
+            specific_humidity=specific_humidity)
+
+        _, diag = self.term(state, {"pressure_full": pfull}, None, None)
+        cb = diag["convection"].cloud_base
+        self.assertEqual(cb.shape, (1,))
+        cb0 = int(cb[0])
+        self.assertGreater(cb0, 0)        # surface parcel not saturated at surface
+        self.assertLess(cb0, nlev)        # ...but condenses below model top
+
+    def test_custom_params(self):
+        term = GissConvection(
+            params=GissConvectionParameters(dtsrc=jnp.array(900.0)),
+            allow_mc=True,
+        )
+        self.assertEqual(float(term.params.get_value().dtsrc), 900.0)
+        self.assertTrue(term.allow_mc)
+        # Unspecified leaves keep their defaults, which is what lets a config
+        # override one tunable without restating the rest.
+        self.assertEqual(
+            float(term.params.get_value().max_dt_overshoot), 1.0)
+
+    def test_the_overshoot_threshold_reaches_the_ascent(self):
+        """A params override must change what the plume code is handed.
+
+        The term reads ``max_dt_overshoot`` off its params and passes it down
+        four call layers; asserting it on ``term.params`` alone would pass even
+        if the wiring were dropped, which is the mistake worth guarding here
+        since the whole point of the parameter is the global experiment.
+        """
+        from jcm.physics.convection import giss_plume_driver as drv
+
+        seen = {}
+        original = drv.convective_column
+
+        def spy(*a, **k):
+            seen["threshold"] = float(k["max_overshoot_dt"])
+            return original(*a, **k)
+
+        state, diag = self._moist_column()
+        term = GissConvection(
+            params=GissConvectionParameters(dtsrc=jnp.array(1800.0),
+                                            max_dt_overshoot=jnp.array(2.0862949)),
+            allow_mc=True)
+        drv.convective_column = giss_mstcnv.convective_column = spy
+        try:
+            term(state, diag, None, None)
+        finally:
+            drv.convective_column = giss_mstcnv.convective_column = original
+        self.assertAlmostEqual(seen["threshold"], 2.0862949, places=6)
+
+    def _moist_column(self, nlev=12):
+        # JCM order: index 0 = top, last = surface. Warm moist surface parcel
+        # under a cooler troposphere -> a real cloud base.
+        pfull = jnp.linspace(20000.0, 100000.0, nlev)[:, None]        # (nlev, 1) Pa
+        temperature = jnp.linspace(230.0, 298.0, nlev)[:, None]
+        specific_humidity = jnp.full((nlev, 1), 16.0)                 # g/kg
+        state = PhysicsState.zeros(
+            (nlev, 1), temperature=temperature,
+            specific_humidity=specific_humidity)
+        # air_density = p/(Rd T); layer_thickness chosen so density*thickness =
+        # |dp|/g (a physical layer mass ~ tens-hundreds kg/m^2).
+        density = pfull / (287.0 * temperature)
+        dp = jnp.abs(jnp.gradient(pfull, axis=0))
+        thickness = dp / (_G * density)
+        diagnostics = {"pressure_full": pfull, "layer_thickness": thickness,
+                       "air_density": density}
+        return state, diagnostics
+
+    def test_mass_flux_zero_without_layer_mass(self):
+        # With pressure but no layer-mass diagnostics: cloud base is found but the
+        # closure mass flux stays zero (degraded diagnostic).
+        state, diag = self._moist_column()
+        _, out = self.term(state, {"pressure_full": diag["pressure_full"]}, None, None)
+        conv = out["convection"]
+        self.assertLess(int(conv.cloud_base[0]), 12)                  # cloud base found
+        self.assertTrue(jnp.all(conv.cloud_base_mass_flux == 0.0))    # but no mass flux
+
+    def test_mass_flux_with_full_diagnostics(self):
+        # With pressure + layer mass, the closure runs and returns a finite,
+        # non-negative cloud-base mass flux of the right shape.
+        state, diag = self._moist_column()
+        _, out = self.term(state, diag, None, None)
+        fmp2 = out["convection"].cloud_base_mass_flux
+        self.assertEqual(fmp2.shape, (1,))
+        self.assertTrue(jnp.all(jnp.isfinite(fmp2)))
+        self.assertTrue(jnp.all(fmp2 >= 0.0))
+
+    # --- allow_mc tendency path (structural; magnitudes not validated) ---
+    def test_allow_mc_off_returns_zero_tendency(self):
+        state, diag = self._moist_column()
+        tend, _ = GissConvection(allow_mc=False)(state, diag, None, None)
+        self.assertTrue(jnp.all(tend.temperature == 0))
+        self.assertTrue(jnp.all(tend.specific_humidity == 0))
+
+    def test_allow_mc_produces_finite_heating(self):
+        # With convection on, the term produces finite tendencies and net
+        # heating somewhere in the column (compensating subsidence warms).
+        state, diag = self._moist_column()
+        tend, out = GissConvection(allow_mc=True)(state, diag, None, None)
+        self.assertTrue(jnp.all(jnp.isfinite(tend.temperature)))
+        self.assertTrue(jnp.all(jnp.isfinite(tend.specific_humidity)))
+        self.assertGreater(float(jnp.max(tend.temperature)), 0.0)
+        self.assertTrue(jnp.any(out["convection"].dth_mc != 0))
+
+    def test_allow_mc_zero_without_layer_mass(self):
+        # The tendency path needs layer-mass diagnostics; without them it is zero
+        # even though allow_mc is set (cloud base is still diagnosed).
+        state, diag = self._moist_column()
+        tend, out = GissConvection(allow_mc=True)(
+            state, {"pressure_full": diag["pressure_full"]}, None, None)
+        self.assertTrue(jnp.all(tend.temperature == 0))
+        self.assertLess(int(out["convection"].cloud_base[0]), 12)
+
+    def test_allow_mc_differentiable(self):
+        state, diag = self._moist_column()
+        term = GissConvection(allow_mc=True)
+
+        def loss(temperature):
+            s = state.copy(temperature=temperature)
+            tend, _ = term(s, diag, None, None)
+            return jnp.sum(tend.temperature ** 2)
+
+        g = jax.grad(loss)(state.temperature)
+        self.assertTrue(jnp.all(jnp.isfinite(g)))
+
+
+def _moist_grid(shape, nlev=12):
+    """Build a convecting column over ``shape``, with per-column variety.
+
+    Shaped like ``TestGissConvectionTerm._moist_column`` but over arbitrary
+    trailing (horizontal) axes, with the humidity varied column to column so the
+    columns take genuinely different paths through the scheme: measured on the
+    ``(3, 2)`` grid used below, the two driest do not convect at all and the four
+    that do take cloud bases at four different levels.
+
+    Unlike ``_moist_column`` the humidity here is in **kg/kg**, the unit
+    ``PhysicsState.specific_humidity`` is actually in. That fixture passes the
+    number 16 with a ``g/kg`` comment, i.e. 16 kg/kg -- a column
+    supersaturated by three orders of magnitude. It is harmless there, since
+    every test using it asserts only shapes, finiteness and differentiability
+    ("structural; magnitudes not validated"), but it would make the
+    column-to-column variety this file needs meaningless: every column
+    convects, and ``mcp`` comes out at 10^5 mm/day.
+    """
+    horiz = (1,) * len(shape)
+    pfull = jnp.linspace(20000.0, 100000.0, nlev).reshape((nlev,) + horiz)
+    temperature = jnp.linspace(230.0, 298.0, nlev).reshape((nlev,) + horiz)
+    pfull = jnp.broadcast_to(pfull, (nlev,) + shape)
+    temperature = jnp.broadcast_to(temperature, (nlev,) + shape)
+    # 2 g/kg to 16 g/kg across the columns: the dry end cannot convect.
+    spread = jnp.linspace(0.002, 0.016, int(np.prod(shape))).reshape(shape)
+    humidity = jnp.broadcast_to(spread, (nlev,) + shape)
+    state = PhysicsState.zeros((nlev,) + shape, temperature=temperature,
+                               specific_humidity=humidity)
+    density = pfull / (287.0 * temperature)
+    dp = jnp.abs(jnp.gradient(pfull, axis=0))
+    diagnostics = {"pressure_full": pfull,
+                   "layer_thickness": dp / (_G * density),
+                   "air_density": density}
+    return state, diagnostics
+
+
+class TestGissConvectionGridShapes(unittest.TestCase):
+    """The ``allow_mc`` path on a real grid, and column by column.
+
+    ``TestGissConvectionComposition`` below runs the term on a
+    ``(nlev, nlon, nlat)`` state but with ``allow_mc`` at its default of
+    ``False``, so it only ever exercised the zero path. The whole ported scheme
+    -- the sweep, the buoyancy sort, the descent -- had never run in anything
+    but a single column, while ``physics=echam-giss-conv`` sets
+    ``allow_mc: true``. That is the configuration a global run would use, so
+    these tests run it.
+
+    The contract being pinned is the one in ``CLAUDE.md``: a column-physics term
+    puts the vertical on axis 0 and lets the trailing axes broadcast, so the
+    identical code must give the identical answer for a column whether it is run
+    alone, in a ``(nlev, ncols)`` block or in a ``(nlev, nlon, nlat)`` grid. A
+    rank assumption, a reduction over the wrong axis or an integer index that
+    fails to broadcast all show up here and nowhere else.
+    """
+
+    GRID = (3, 2)
+
+    def test_runs_on_a_three_dimensional_grid(self):
+        state, diag = _moist_grid(self.GRID)
+        tend, out = GissConvection(allow_mc=True)(state, diag, None, None)
+        conv = out["convection"]
+        self.assertEqual(tend.temperature.shape, state.temperature.shape)
+        self.assertEqual(conv.mcp.shape, self.GRID)
+        self.assertEqual(conv.dth_mc.shape, state.temperature.shape)
+        self.assertTrue(jnp.all(jnp.isfinite(tend.temperature)))
+        self.assertTrue(jnp.all(jnp.isfinite(tend.specific_humidity)))
+        self.assertTrue(jnp.all(jnp.isfinite(conv.mcp)))
+        self.assertTrue(jnp.all(conv.mcp >= 0.0),
+                        "surface precipitation must never be negative")
+
+    def test_some_columns_convect_and_some_do_not(self):
+        """Otherwise the agreement below could be an agreement about zeros.
+
+        The grid is built so this is a real mixture: the two driest columns get
+        no cloud-base mass flux and rain nothing, the other four rain. Several
+        distinct cloud-base levels appear, which is what makes the
+        column-by-column comparison test the integer index handling rather than
+        one level repeated six times.
+        """
+        state, diag = _moist_grid(self.GRID)
+        _, out = GissConvection(allow_mc=True)(state, diag, None, None)
+        conv = out["convection"]
+        mcp = np.asarray(conv.mcp)
+        self.assertGreater((mcp > 0.0).sum(), 0, "no column convected")
+        self.assertGreater((mcp == 0.0).sum(), 0, "every column convected")
+        # A dry column must be zero in both the closure and the rain, not just
+        # one of them.
+        dry = np.asarray(conv.cloud_base_mass_flux) == 0.0
+        np.testing.assert_array_equal(mcp[dry], 0.0)
+        self.assertGreater(len(np.unique(np.asarray(conv.cloud_base))), 2,
+                           "the columns should not share one cloud base")
+
+    def test_each_column_matches_the_same_column_run_alone(self):
+        """The broadcasting contract, on the full ``allow_mc`` chain.
+
+        ``mcp`` is compared more loosely than the tendency. It is a pressure in
+        hPa carried through the whole sweep, so it accumulates the same float32
+        reordering that ``test_two_dimensional_block_matches_the_grid`` below
+        measures at 4e-5 relative -- here one of the six columns lands 0.0008
+        hPa apart on a value of 50. Under ``JAX_ENABLE_X64`` the two paths agree
+        to the last bit, which is what makes this rounding rather than a
+        divergence in the contract.
+        """
+        term = GissConvection(allow_mc=True)
+        state, diag = _moist_grid(self.GRID)
+        grid_tend, grid_out = term(state, diag, None, None)
+        for i in range(self.GRID[0]):
+            for j in range(self.GRID[1]):
+                one_state = PhysicsState.zeros(
+                    (state.temperature.shape[0], 1),
+                    temperature=state.temperature[:, i, j][:, None],
+                    specific_humidity=state.specific_humidity[:, i, j][:, None])
+                one_diag = {k: v[:, i, j][:, None] for k, v in diag.items()}
+                one_tend, one_out = term(one_state, one_diag, None, None)
+                with self.subTest(column=(i, j)):
+                    np.testing.assert_allclose(
+                        np.asarray(grid_tend.temperature[:, i, j]),
+                        np.asarray(one_tend.temperature[:, 0]),
+                        rtol=1e-5, atol=1e-12)
+                    np.testing.assert_allclose(
+                        np.asarray(grid_out["convection"].mcp[i, j]),
+                        np.asarray(one_out["convection"].mcp[0]),
+                        rtol=1e-4, atol=1e-12)
+
+    def test_two_dimensional_block_matches_the_grid(self):
+        """``(nlev, ncols)`` and ``(nlev, nlon, nlat)`` are the same code.
+
+        Looser than the per-column test above, and deliberately so: changing the
+        trailing rank changes the array layout XLA picks, so the float32
+        reductions inside the sweep accumulate in a different order. Measured,
+        that moves one of the 72 tendencies by 1.5e-8 K/s on a value of
+        -3.9e-4 -- 4e-5 relative. The per-column comparison above holds the
+        grid layout fixed and only varies which column is read out, so it sees
+        far less of this -- but not none, which is why its ``mcp`` comparison
+        carries its own looser tolerance.
+        """
+        term = GissConvection(allow_mc=True)
+        grid_state, grid_diag = _moist_grid(self.GRID)
+        flat_state, flat_diag = _moist_grid((int(np.prod(self.GRID)),))
+        grid_tend, _ = term(grid_state, grid_diag, None, None)
+        flat_tend, _ = term(flat_state, flat_diag, None, None)
+        np.testing.assert_allclose(
+            np.asarray(grid_tend.temperature).reshape(
+                grid_tend.temperature.shape[0], -1),
+            np.asarray(flat_tend.temperature), rtol=2e-4, atol=1e-12)
+
+    def test_composes_with_allow_mc_on(self):
+        """The term inside ``ComposablePhysics``, actually convecting."""
+        state, diag = _moist_grid(self.GRID)
+        physics = ComposablePhysics(terms=[GissConvection(allow_mc=True)],
+                                    checkpoint_terms=False)
+        tend, out = physics.compute_tendencies(
+            state, ForcingData.zeros(self.GRID), _make_terrain(self.GRID),
+            prev_physics_data=diag)
+        self.assertTrue(jnp.all(jnp.isfinite(tend.temperature)))
+        self.assertTrue(jnp.any(out["convection"].dth_mc != 0.0))
+
+    def test_gradient_on_a_grid_is_finite(self):
+        term = GissConvection(allow_mc=True)
+        state, diag = _moist_grid(self.GRID)
+
+        def loss(temperature):
+            tend, _ = term(state.copy(temperature=temperature), diag,
+                           None, None)
+            return jnp.sum(tend.temperature ** 2)
+
+        g = jax.grad(loss)(state.temperature)
+        self.assertEqual(g.shape, state.temperature.shape)
+        self.assertTrue(jnp.all(jnp.isfinite(g)))
+
+
+class TestGissConvectionComposition(unittest.TestCase):
+    """The term must compose and run inside ComposablePhysics."""
+
+    def setUp(self):
+        self.shape3d = (4, 6, 8)   # (nlev, nlon, nlat)
+        self.grid = self.shape3d[1:]
+
+    def _state(self):
+        return PhysicsState.ones(self.shape3d)
+
+    def test_compose_and_run(self):
+        physics = ComposablePhysics(
+            terms=[GissConvection()], checkpoint_terms=False,
+        )
+        tend, diag = physics.compute_tendencies(
+            self._state(), ForcingData.zeros(self.grid), _make_terrain(self.grid),
+        )
+        self.assertEqual(tend.temperature.shape, self.shape3d)
+        self.assertTrue(jnp.all(tend.temperature == 0))
+        self.assertIn("convection", diag)
+
+    def test_nnx_grad_runs(self):
+        # nnx.grad through composable physics must run and stay finite. The
+        # scaffold's loss is identically zero, so parameter gradients are zero
+        # (defined, finite) -- the point is the autodiff plumbing works.
+        physics = ComposablePhysics(
+            terms=[GissConvection()], checkpoint_terms=False,
+        )
+        state = self._state()
+        forcing = ForcingData.zeros(self.grid)
+        terrain = _make_terrain(self.grid)
+
+        def loss(physics):
+            tend, _ = physics.compute_tendencies(state, forcing, terrain)
+            return jnp.sum(tend.temperature ** 2)
+
+        self.assertEqual(float(loss(physics)), 0.0)
+        grads = nnx.grad(loss)(physics)
+        dtsrc_grad = grads.terms[0].params.get_value().dtsrc
+        self.assertTrue(jnp.all(jnp.isfinite(dtsrc_grad)))
+
+
+class TestGissScaffoldVsDycomsFixture(unittest.TestCase):
+    """Trivial consistency: scaffold zeros match the inactive-MC DYCOMS column.
+
+    This is a *no-convection* regression check against committed oracle arrays,
+    NOT validation of physics. The DYCOMS moist-convective targets
+    (dq_mc/dth_mc/mcp) are identically zero -- a convectively active case
+    (BOMEX/RICO) is required to validate real physics. When that lands, this
+    fixture is replaced with nonzero targets and the same test shape applies.
+    """
+
+    def test_scaffold_matches_dycoms_mc_targets(self):
+        data = _load_dycoms_fixture()
+        nlev, ncols = data["temperature"].shape
+
+        state = PhysicsState.zeros(
+            (nlev, ncols),
+            temperature=jnp.asarray(data["temperature"]),
+            specific_humidity=jnp.asarray(data["specific_humidity"]),  # g/kg
+            geopotential=jnp.asarray(data["geopotential_height"]) * _G,
+            normalized_surface_pressure=jnp.asarray(data["pressure_hpa"][0] / _P0_HPA),
+        )
+
+        term = GissConvection()
+        tend, diag = term(state, {}, None, None)
+        conv = diag["convection"]
+
+        # Sanity: the committed DYCOMS targets really are inactive convection.
+        self.assertTrue(np.all(data["dq_mc"] == 0))
+
+        self.assertTrue(np.allclose(np.asarray(conv.dq_mc).ravel(),
+                                    data["dq_mc"].ravel()))
+        self.assertTrue(np.allclose(np.asarray(conv.dth_mc).ravel(),
+                                    data["dth_mc"].ravel()))
+        self.assertTrue(np.allclose(np.asarray(conv.mcp).ravel(),
+                                    data["mcp"].ravel()))
+        self.assertTrue(jnp.all(tend.temperature == 0))
+
+
+class TestCloudBaseClosureMassFlux(unittest.TestCase):
+    """The (nlev,...) gather wrapper around the MASS_FLUX2 closure."""
+
+    def setUp(self):
+        # Surface-first column (index 0 = surface). A convectively unstable
+        # profile: well-mixed moist boundary layer under a sharp inversion, so
+        # the blended source parcel is supersaturated when lifted -- which is
+        # what makes the MASS_FLUX2 closure return a real plume rather than
+        # bottoming out at its lower bisection bound.
+        self.nlev = 8
+        self.t = jnp.array(
+            [299., 298.4, 297.8, 297.2, 292., 290., 288., 286.])[:, None]
+        self.q = jnp.array(
+            [0.0180, 0.0178, 0.0176, 0.0173, 0.0100, 0.0080, 0.0060,
+             0.0050])[:, None]
+        self.p = jnp.linspace(101000.0, 80000.0, self.nlev)[:, None]
+        self.air_mass = jnp.full((self.nlev, 1), 100.0)
+
+    def test_matches_column_closure(self):
+        # The wrapper delegates to the multi-source (nlpi>1) MASS_FLUX2 closure,
+        # so it must agree with calling that directly on the same column.
+        cloud_base = jnp.array([2])
+        _, fmp2 = cloud_base_closure_mass_flux(
+            self.t, self.q, self.p, self.air_mass, cloud_base)
+
+        exner = (self.p / 100000.0) ** KAPA
+        theta = self.t / exner
+        _, fmp2_expected, _ = cloud_base_mass_flux_column(
+            theta, self.q, self.air_mass, exner, self.p, cloud_base)
+
+        self.assertAlmostEqual(float(fmp2[0]), float(fmp2_expected[0]), places=5)
+
+    def test_boundary_layer_top_limits_source_blend(self):
+        # Restricting the source blend to the boundary layer excludes the drier
+        # air just below cloud base, giving a moister (more unstable) parcel and
+        # so a larger closure mass flux.
+        cloud_base = jnp.array([3])
+        _, fmp2_all = cloud_base_closure_mass_flux(
+            self.t, self.q, self.p, self.air_mass, cloud_base)
+        _, fmp2_bl = cloud_base_closure_mass_flux(
+            self.t, self.q, self.p, self.air_mass, cloud_base,
+            boundary_layer_top=jnp.array([2]))
+        self.assertGreater(float(fmp2_bl[0]), float(fmp2_all[0]))
+
+    def test_source_boost_increases_mass_flux(self):
+        # The tstar/qstar source-parcel enhancement makes the parcel warmer and
+        # moister, hence more unstable, hence a larger closure mass flux.
+        cloud_base = jnp.array([3])
+        _, plain = cloud_base_closure_mass_flux(
+            self.t, self.q, self.p, self.air_mass, cloud_base)
+        _, boosted = cloud_base_closure_mass_flux(
+            self.t, self.q, self.p, self.air_mass, cloud_base,
+            source_dtheta=0.05, source_dq=3.0e-4)
+        self.assertGreater(float(boosted[0]), float(plain[0]))
+
+    def test_no_cloud_base_is_zero(self):
+        # Sentinel cloud base (== nlev) => no cloud => zero mass flux.
+        cloud_base = jnp.array([self.nlev])
+        fplume, fmp2 = cloud_base_closure_mass_flux(
+            self.t, self.q, self.p, self.air_mass, cloud_base)
+        self.assertEqual(float(fmp2[0]), 0.0)
+        self.assertEqual(float(fplume[0]), 0.0)
+
+    def test_broadcasting_matches_single_column(self):
+        cloud_base = jnp.array([2, 3])
+        t = jnp.concatenate([self.t, self.t + 1.0], axis=1)
+        q = jnp.concatenate([self.q, self.q], axis=1)
+        p = jnp.concatenate([self.p, self.p], axis=1)
+        am = jnp.concatenate([self.air_mass, self.air_mass], axis=1)
+        _, fmp2 = cloud_base_closure_mass_flux(t, q, p, am, cloud_base)
+        self.assertEqual(fmp2.shape, (2,))
+        # Column 0 must match running that single column alone.
+        _, fmp2_col0 = cloud_base_closure_mass_flux(
+            self.t, self.q, self.p, self.air_mass, jnp.array([2]))
+        self.assertAlmostEqual(float(fmp2[0]), float(fmp2_col0[0]), places=5)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+@contextlib.contextmanager
+def _float64():
+    """Run the block in float64, then restore whatever was set before.
+
+    Scoped on purpose. ``giss_plume_driver_test`` enables x64 at *module
+    import*, and leaking precision that way once made ``giss_bsort_test``'s
+    vectorised-agreement check pass only when the whole directory ran in one
+    process; that test now sets its own precision. A finite-difference check
+    genuinely needs float64, but it should not silently change the precision
+    every other test in the process runs at.
+    """
+    previous = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", previous)
+
+
+class TestGissConvectionGradient(unittest.TestCase):
+    """Gradients on a *convecting* column, against finite differences.
+
+    The deliverable for this port is a differentiable ``PhysicsTerm``, and the
+    other gradient tests here take ``PhysicsState.ones(...)`` -- a state where
+    convection never fires, every tendency is zero, and so every gradient is
+    legitimately zero too. Those check that the autodiff plumbing survives the
+    trace; they cannot distinguish a correct gradient from no gradient at all.
+    This one runs the column that actually convects.
+
+    **What this does and does not establish.** The scheme is piecewise smooth:
+    the buoyancy sort routes each blend by a threshold test roughly 7e-4 wide
+    in relative buoyancy, and the downdraft takes a three-way branch. Those
+    decisions are ``jnp.where`` on comparisons, so the derivative *through a
+    branch choice* is zero -- moving a blend across the threshold changes the
+    answer discontinuously and no gradient sees it coming. What is verified
+    here is the derivative *within* a piece, which is what gradient-based
+    fitting actually consumes, and which finite differences can confirm.
+    """
+
+    def _setup(self):
+        term = GissConvection(allow_mc=True)
+        holder = TestGissConvectionTerm("test_allow_mc_differentiable")
+        holder.setUp()
+        state, diag = holder._moist_column()
+        return term, state, diag
+
+    @staticmethod
+    def _loss(term, state, diag):
+        # Heating in K/day rather than K/s. The scaling is not cosmetic: in
+        # K/s the loss is ~1e-10 and a central difference is below float
+        # resolution long before the step is small enough to be a derivative.
+        def loss(temperature):
+            tendency, _ = term(state.copy(temperature=temperature), diag,
+                               None, None)
+            return jnp.sum((tendency.temperature * 86400.0) ** 2)
+        return loss
+
+    def test_gradient_is_nonzero_where_the_column_convects(self):
+        term, state, diag = self._setup()
+        tendency, _ = term(state, diag, None, None)
+        self.assertGreater(float(jnp.max(jnp.abs(tendency.temperature))), 0.0,
+                           "fixture must actually convect for this to mean anything")
+        grad = jax.grad(self._loss(term, state, diag))(state.temperature)
+        self.assertTrue(bool(jnp.all(jnp.isfinite(grad))))
+        # A zero gradient here would pass the older finiteness-only tests.
+        self.assertGreater(int(jnp.sum(grad != 0.0)), 3)
+
+    def test_gradient_matches_finite_differences(self):
+        with _float64():
+            term = GissConvection(allow_mc=True)
+            holder = TestGissConvectionTerm("test_allow_mc_differentiable")
+            holder.setUp()
+            state, diag = holder._moist_column()
+            state = state.copy(
+                temperature=jnp.asarray(state.temperature, jnp.float64))
+            loss = self._loss(term, state, diag)
+            grad = np.asarray(jax.grad(loss)(state.temperature)).squeeze()
+            base = np.asarray(state.temperature).squeeze()
+
+            checked = 0
+            for level in np.argsort(-np.abs(grad))[:4]:
+                if abs(grad[level]) < 1e-8:
+                    continue
+                step = 1e-5
+                up, down = base.copy(), base.copy()
+                up[level] += step
+                down[level] -= step
+                shape = state.temperature.shape
+                forward = float(loss(jnp.asarray(up).reshape(shape)))
+                backward = float(loss(jnp.asarray(down).reshape(shape)))
+                secant = (forward - backward) / (2.0 * step)
+                self.assertAlmostEqual(
+                    grad[level] / secant, 1.0, places=3,
+                    msg=f"autodiff vs finite difference at level {level}")
+                checked += 1
+            self.assertGreaterEqual(checked, 3)
+
+
+class TestEnvironmentCondensate(unittest.TestCase):
+    """The term forwards the environment's cloud condensate from the tracers.
+
+    ModelE loads the environment's virtual temperature with `qcl + qci` when it
+    decides whether the downdraft detrains (`svm1`, MSTCNV.F90:4573). BOMEX
+    cannot test this at all: `qcl + qci` is identically zero on every oracle
+    level and every step, so a port ignoring the term would match the oracle
+    exactly -- and this one did, until the wiring was added.
+
+    **The physics is verified in `giss_downdraft_test`, not here.** The
+    idealised column in this module seeds no downdraft, so the condensate has
+    no consumer and cannot change the answer whatever value it takes; asserting
+    otherwise here would be a test that can only ever pass. What this class
+    checks is the wiring: tracers of either name are accepted, combined as a
+    sum, and treated as zero when absent.
+    """
+
+    def setUp(self):
+        holder = TestGissConvectionTerm("test_allow_mc_differentiable")
+        holder.setUp()
+        self.state, self.diag = holder._moist_column()
+        self.term = GissConvection(allow_mc=True)
+
+    def _heating(self, state):
+        tendency, _ = self.term(state, self.diag, None, None)
+        return tendency.temperature
+
+    def test_runs_with_condensate_tracers(self):
+        cloudy = self._heating(self.state.copy(tracers={
+            "qc": jnp.full_like(self.state.temperature, 5.0e-4),
+            "qi": jnp.full_like(self.state.temperature, 2.0e-4),
+        }))
+        self.assertTrue(bool(jnp.all(jnp.isfinite(cloudy))))
+        self.assertEqual(cloudy.shape, self.state.temperature.shape)
+
+    def test_absent_tracers_behave_as_zero(self):
+        bare = self._heating(self.state)
+        explicit_zero = self._heating(self.state.copy(tracers={
+            "qc": jnp.zeros_like(self.state.temperature),
+            "qi": jnp.zeros_like(self.state.temperature),
+        }))
+        np.testing.assert_allclose(np.asarray(bare),
+                                   np.asarray(explicit_zero),
+                                   rtol=1e-6, atol=1e-12)
+
+
+class TestPhaseAssumption(unittest.TestCase):
+    """All-liquid, a stated limit of the port rather than an oversight.
+
+    ModelE picks the latent heat per level from the *parcel* temperature against
+    `tfmc` and latches it once ice forms (MSTCNV.F90:1716-1721), tracks a second
+    phase for the precipitation, and redistributes the melting heat where the two
+    differ. None of that is ported.
+
+    BOMEX cannot show the difference -- it is all-liquid on every level of every
+    step -- so these tests pin the assumption instead of testing physics they
+    cannot reach: the scheme must stay finite on a sub-freezing column rather
+    than producing nonsense, and the flag must stay honest about what is
+    supported.
+    """
+
+    def setUp(self):
+        holder = TestGissConvectionTerm("test_allow_mc_differentiable")
+        holder.setUp()
+        self.state, self.diag = holder._moist_column()
+        self.term = GissConvection(allow_mc=True)
+
+    def test_flag_states_the_limitation(self):
+        from jcm.physics.convection import giss_bsort, giss_mstcnv
+        # The *condensation* phase is chosen per level now; the precipitation
+        # phase and the ice microphysics are not, so the term as a whole is
+        # still not mixed-phase.
+        self.assertTrue(giss_mstcnv.MIXED_PHASE_CONDENSATION)
+        self.assertFalse(giss_mstcnv.MIXED_PHASE_PRECIPITATION)
+        self.assertFalse(giss_mstcnv.MIXED_PHASE_SUPPORTED)
+        # `tf - 15` with ModelE's `tf = 273.16`, recovered from the oracle: the
+        # level its dumped `lhx` switches on straddles this on 186 of 186
+        # TWP-ICE steps. One value, shared with the ascent that acts on it.
+        self.assertAlmostEqual(giss_mstcnv._FREEZING_THRESHOLD, 258.16,
+                               places=6)
+        self.assertIs(giss_mstcnv._FREEZING_THRESHOLD, giss_bsort._TFMC)
+
+    def test_sub_freezing_column_stays_finite(self):
+        """A cold column still has to stay finite.
+
+        Its condensation is now ice-phase, but its precipitation is not, so the
+        answer below `tfmc` is still not ModelE's. The requirement here is only
+        that the scheme degrades quietly rather than returning NaN, so a global
+        run cannot be poisoned by a cold column.
+        """
+        from jcm.physics.convection import giss_mstcnv
+        cold = self.state.copy(
+            temperature=self.state.temperature - 40.0)
+        self.assertLess(float(jnp.min(cold.temperature)),
+                        giss_mstcnv._FREEZING_THRESHOLD)
+        tendency, _ = self.term(cold, self.diag, None, None)
+        self.assertTrue(bool(jnp.all(jnp.isfinite(tendency.temperature))))
+        self.assertTrue(bool(jnp.all(jnp.isfinite(tendency.specific_humidity))))
+
+    def test_sub_freezing_column_is_differentiable(self):
+        """A cold column must not break the gradient either."""
+        cold = self.state.copy(temperature=self.state.temperature - 40.0)
+
+        def loss(temperature):
+            tendency, _ = self.term(cold.copy(temperature=temperature),
+                                    self.diag, None, None)
+            return jnp.sum((tendency.temperature * 86400.0) ** 2)
+
+        grad = jax.grad(loss)(cold.temperature)
+        self.assertTrue(bool(jnp.all(jnp.isfinite(grad))))
+
+
+class TestDetrainedCondensate(unittest.TestCase):
+    """The condensate the plumes detrain, and the column water budget.
+
+    ``MSTCNV`` splits what a plume condenses three ways: the rain it sheds
+    (``condpr``), the condensate the buoyancy sort carries into the downdraft
+    (``wmdnl``) and the condensate it detrains into the environment as cloud
+    (``dwm``, accumulated into ``detrQC`` and handed to ``LSCOND``,
+    ``MSTCNV.F90:2294``). Measured from ``dwm`` in the oracle's
+    ``sweep_state_diag.txt``, that third part is **27%** of what the plumes
+    condense on BOMEX and **13%** on TWP-ICE.
+
+    The term computed it and then dropped it: it is condensate, so it is not in
+    ``dq_mc`` (the vapour budget), and nothing else carried it. A
+    ``physics=echam-giss-conv`` run therefore detrained no condensate anywhere
+    on the globe -- ``clouds.conv_detrainment_qc`` was identically zero over
+    all 18,432 columns -- and the water left the column altogether. These tests
+    pin the budget rather than the magnitude.
+    """
+
+    def _column(self, nlev=24, ice=False):
+        """Build a convecting column that carries the condensate tracers."""
+        pfull = jnp.linspace(10000.0, 100000.0, nlev)[:, None]
+        base = 300.0 - 40.0 * float(ice)
+        temperature = jnp.linspace(base - 90.0, base, nlev)[:, None]
+        humidity = jnp.linspace(0.00002, 0.018, nlev)[:, None]
+        state = PhysicsState.zeros(
+            (nlev, 1), temperature=temperature, specific_humidity=humidity,
+            tracers={"qc": jnp.zeros((nlev, 1)), "qi": jnp.zeros((nlev, 1))})
+        density = pfull / (287.0 * temperature)
+        dp = jnp.abs(jnp.gradient(pfull, axis=0))
+        diagnostics = {"pressure_full": pfull,
+                       "layer_thickness": dp / (_G * density),
+                       "air_density": density}
+        return state, diagnostics, np.asarray(dp[:, 0]) / _G
+
+    def test_the_column_water_budget_closes(self):
+        """Vapour removed = rain delivered + condensate detrained.
+
+        Everything the plumes take out of the vapour has to leave the column as
+        surface rain or stay in it as cloud; rain that evaporates on the way
+        down is already back in ``dq_mc``. Before the detrained condensate was
+        published this residual was the whole of it.
+        """
+        state, diag, layer_mass = self._column()
+        term = GissConvection(allow_mc=True)
+        tendency, out = term(state, diag, None, None)
+        dt = float(term.params.get_value().dtsrc)
+
+        vapour = float(np.sum(np.asarray(tendency.specific_humidity[:, 0])
+                              * dt * layer_mass))
+        condensate = float(np.sum(
+            (np.asarray(tendency.tracers["qc"][:, 0])
+             + np.asarray(tendency.tracers["qi"][:, 0])) * dt * layer_mass))
+        rain = float(np.asarray(out["convection"].mcp)[0]) / 86400.0 * dt
+
+        self.assertLess(vapour, -1e-3, "this column has to actually convect")
+        self.assertGreater(condensate, 0.0, "nothing detrained")
+        self.assertLess(abs(vapour + condensate + rain),
+                        1e-4 * abs(vapour),
+                        "the column's water budget does not close")
+
+    def test_the_cloud_scheme_is_handed_the_detrainment(self):
+        """``conv_detrainment_qc``/``_qi`` carry it, as ECHAM's pxtecl/pxteci.
+
+        ``cloud_inputs.cloud_scheme_inputs`` takes these two out of the running
+        condensate tendency and passes them to the cloud scheme separately, so
+        they must equal the tracer tendencies exactly -- the same identity
+        ``TiedtkeConvection`` maintains.
+        """
+        from jcm.physics.clouds.cloud_data import CloudData
+
+        state, diag, _ = self._column()
+        nlev = state.temperature.shape[0]
+        diag = {**diag, "clouds": CloudData.zeros((1,), nlev)}
+        tendency, out = GissConvection(allow_mc=True)(state, diag, None, None)
+
+        np.testing.assert_array_equal(
+            np.asarray(out["clouds"].conv_detrainment_qc),
+            np.asarray(tendency.tracers["qc"]))
+        np.testing.assert_array_equal(
+            np.asarray(out["clouds"].conv_detrainment_qi),
+            np.asarray(tendency.tracers["qi"]))
+        # Non-vacuity. The fixture's plume rises from a 300 K surface to
+        # 217 hPa, so what it leaves behind is ice -- the total is what proves
+        # something was handed over, not the liquid slot alone.
+        self.assertGreater(
+            float(jnp.sum(out["clouds"].conv_detrainment_qc)
+                  + jnp.sum(out["clouds"].conv_detrainment_qi)), 0.0)
+
+    def test_the_detrainment_is_non_negative_and_phase_split(self):
+        """The split follows the ascent's own ``lhx``, and conserves the total.
+
+        Both fixtures convect to levels far below freezing -- the surface-300 K
+        column detrains at 217 hPa and 222 K -- so both must come back as ice.
+        Moving ``tfmc`` below the detraining level is what exercises the liquid
+        side, and it must move the same water between the slots rather than
+        change how much there is. Asserting liquid here instead was pinning a
+        defect: the terminal dump landed on the level the plume failed at,
+        which has no phase, and a missing phase reads as liquid.
+        """
+        for ice in (False, True):
+            state, diag, _ = self._column(ice=ice)
+            tendency, _ = GissConvection(allow_mc=True)(
+                state, diag, None, None)
+            qc, qi = tendency.tracers["qc"], tendency.tracers["qi"]
+            for name, value in (("qc", qc), ("qi", qi)):
+                self.assertTrue(bool(jnp.all(value >= 0.0)),
+                                f"ice={ice}: {name} detrainment went negative")
+                self.assertTrue(bool(jnp.all(jnp.isfinite(value))))
+            total = float(jnp.sum(qc) + jnp.sum(qi))
+            self.assertGreater(total, 0.0, f"ice={ice}: nothing detrained")
+            self.assertEqual(float(jnp.sum(qc)), 0.0,
+                             f"ice={ice}: a plume above its glaciation level "
+                             "detrained liquid")
+
+            # The same column with the threshold below every level it reaches:
+            # the port's rule now says water, and the total must not move.
+            with mock.patch.object(giss_bsort, "_TFMC", 150.0):
+                liquid, _ = GissConvection(allow_mc=True)(
+                    state, diag, None, None)
+            self.assertEqual(float(jnp.sum(liquid.tracers["qi"])), 0.0)
+            self.assertAlmostEqual(
+                float(jnp.sum(liquid.tracers["qc"])) / total, 1.0, places=5,
+                msg=f"ice={ice}: the phase split did not conserve the total")
+
+    def test_it_advances_the_running_thermodynamic_state(self):
+        """A pre-cloud term must leave ``thermo_run`` post-convection.
+
+        Otherwise the cloud scheme's saturation balance condenses against the
+        column as it was before this term ran
+        (``moist_air_state.advance_thermo_run``).
+        """
+        state, diag, _ = self._column()
+        nlev = state.temperature.shape[0]
+        thermo = {"temperature": state.temperature,
+                  "specific_humidity": state.specific_humidity,
+                  "qc": jnp.zeros((nlev, 1)), "qi": jnp.zeros((nlev, 1))}
+        tendency, out = GissConvection(allow_mc=True)(
+            state, {**diag, "thermo_run": thermo}, None, None)
+        dt = float(GissConvection(allow_mc=True)
+                   .params.get_value().dtsrc)
+
+        np.testing.assert_allclose(
+            np.asarray(out["thermo_run"]["temperature"]),
+            np.asarray(state.temperature + tendency.temperature * dt),
+            rtol=1e-6)
+        # This column detrains at 222 K, so the condensate arrives as ice.
+        self.assertGreater(
+            float(jnp.sum(out["thermo_run"]["qc"])
+                  + jnp.sum(out["thermo_run"]["qi"])), 0.0,
+            "the detrained condensate never reached thermo_run")
+
+    def test_a_host_without_condensate_tracers_still_runs(self):
+        """The idealised and SPEEDY stacks carry no qc/qi to detrain into."""
+        state, diag, _ = self._column()
+        bare = PhysicsState.zeros(
+            state.temperature.shape, temperature=state.temperature,
+            specific_humidity=state.specific_humidity)
+        tendency, _ = GissConvection(allow_mc=True)(bare, diag, None, None)
+        self.assertEqual(tendency.tracers, {})
+        self.assertTrue(bool(jnp.all(jnp.isfinite(tendency.specific_humidity))))
+
+
+class TestTheEnvironmentIsThePostDiffusionColumn(unittest.TestCase):
+    """The term convects the column the terms before it left, not step-start.
+
+    ECHAM hands ``cumastr`` the provisional ``ztp1 = ptm1 + ptte·dt`` — the
+    column after vertical diffusion and the surface exchange have run
+    (``physc``) — and ModelE's ordering is the same, ``MSTCNV`` being called
+    from ``CLOUDS_DRV`` downstream of the boundary layer. Convection is driven
+    by boundary-layer instability, so a term reading the step-start state never
+    sees the heat and moisture the surface supplied on the step it is
+    convecting. ``TiedtkeConvection`` reads ``thermo_run`` for exactly this
+    reason; this term now does too.
+
+    The fallback matters as much as the read: the oracle harness, the single
+    column and every test but this one supply no ``thermo_run``, so they are
+    unaffected and the SCM validation still measures what it measured.
+    """
+
+    def _column(self, nlev=24, humidity_scale=1.0):
+        pfull = jnp.linspace(10000.0, 100000.0, nlev)[:, None]
+        temperature = jnp.linspace(210.0, 300.0, nlev)[:, None]
+        humidity = jnp.linspace(0.00002, 0.012, nlev)[:, None] * humidity_scale
+        state = PhysicsState.zeros(
+            (nlev, 1), temperature=temperature, specific_humidity=humidity)
+        density = pfull / (287.0 * temperature)
+        dp = jnp.abs(jnp.gradient(pfull, axis=0))
+        return state, {"pressure_full": pfull,
+                       "layer_thickness": dp / (_G * density),
+                       "air_density": density}
+
+    def test_a_moistened_running_state_is_what_convects(self):
+        """A ``thermo_run`` wetter than the state must change the closure.
+
+        Built as the physical case rather than an arbitrary perturbation: the
+        state is the dry step-start column, ``thermo_run`` is that column after
+        an upstream term moistened the boundary layer, and the test is that
+        convection responds to the moistening.
+        """
+        dry, diag = self._column(humidity_scale=1.0)
+        wet, _ = self._column(humidity_scale=1.6)
+        term = GissConvection(allow_mc=True)
+
+        _, without = term(dry, diag, None, None)
+        thermo = {"temperature": wet.temperature,
+                  "specific_humidity": wet.specific_humidity}
+        _, with_run = term(dry, {**diag, "thermo_run": thermo}, None, None)
+
+        # Read on the rain and the cloud base, not on ``fmp2``: in a column
+        # this unstable the closure sits on its own limiter (199.3148 kg/m^2
+        # for every humidity from 0.5x to 1.6x of this profile), so the mass
+        # flux cannot register the difference even when everything else does.
+        self.assertGreater(
+            float(jnp.sum(with_run["convection"].mcp)),
+            float(jnp.sum(without["convection"].mcp)),
+            "the rain ignored the moisture the upstream term supplied")
+        self.assertLess(
+            int(np.asarray(with_run["convection"].cloud_base)[0]),
+            int(np.asarray(without["convection"].cloud_base)[0]),
+            "a moistened boundary layer must lower the cloud base")
+
+    def test_without_a_running_state_nothing_changes(self):
+        """The oracle harness supplies none, so its numbers must not move."""
+        state, diag = self._column()
+        term = GissConvection(allow_mc=True)
+        tendency, out = term(state, diag, None, None)
+
+        # The same column handed a thermo_run that IS the state must give the
+        # identical answer -- which is what makes the fallback a fallback
+        # rather than a second code path.
+        thermo = {"temperature": state.temperature,
+                  "specific_humidity": state.specific_humidity}
+        same_tendency, same_out = term(
+            state, {**diag, "thermo_run": thermo}, None, None)
+        np.testing.assert_array_equal(
+            np.asarray(tendency.specific_humidity),
+            np.asarray(same_tendency.specific_humidity))
+        np.testing.assert_array_equal(
+            np.asarray(out["convection"].mcp),
+            np.asarray(same_out["convection"].mcp))
+
+
+class TestTheDiagnosticsAreInTheStatesFrame(unittest.TestCase):
+    """``dth_mc``/``dq_mc`` are published in the frame the state uses.
+
+    The plume code works in ModelE's own vertical frame and returns these two
+    there, while the tendency it returns alongside them is flipped back. A
+    publication that skipped that flip put a deep plume's convective heating
+    maximum in the mesosphere and left the whole troposphere reading as
+    exactly zero. The model integrates the tendency and never these, so no
+    budget, conservation check or column case could see it; it took plotting a
+    global run's heating against pressure. These tests read the two fields
+    against each other so the frames cannot drift apart again.
+    """
+
+    def _column(self, nlev=24):
+        """Build a column unstable enough to convect over part of its depth."""
+        pfull = jnp.linspace(10000.0, 100000.0, nlev)[:, None]
+        temperature = jnp.linspace(210.0, 300.0, nlev)[:, None]
+        humidity = jnp.linspace(0.00002, 0.018, nlev)[:, None]
+        state = PhysicsState.zeros(
+            (nlev, 1), temperature=temperature, specific_humidity=humidity)
+        density = pfull / (287.0 * temperature)
+        dp = jnp.abs(jnp.gradient(pfull, axis=0))
+        return state, {"pressure_full": pfull,
+                       "layer_thickness": dp / (_G * density),
+                       "air_density": density}
+
+    def _run(self):
+        state, diagnostics = self._column()
+        term = GissConvection(allow_mc=True)
+        tendency, out = term(state, diagnostics, None, None)
+        return tendency, out
+
+    def test_the_heating_diagnostic_shares_the_tendencys_frame(self):
+        tendency, out = self._run()
+        dth = np.asarray(out["convection"].dth_mc)[:, 0]
+        dtemp = np.asarray(tendency.temperature)[:, 0]
+        self.assertTrue(np.any(dth != 0.0), "the column did not convect")
+        # Without this the test would pass on a column whose active levels
+        # happen to be symmetric about the middle, where a flip is invisible.
+        self.assertFalse(
+            np.array_equal(dth != 0.0, (dth != 0.0)[::-1]),
+            "this column is vertically symmetric, so it cannot detect a flip")
+        np.testing.assert_array_equal(
+            dth != 0.0, dtemp != 0.0,
+            "dth_mc is not in the same vertical frame as the temperature "
+            "tendency computed from it")
+
+    def test_the_moistening_diagnostic_shares_the_tendencys_frame(self):
+        tendency, out = self._run()
+        dq = np.asarray(out["convection"].dq_mc)[:, 0]
+        dq_dt = np.asarray(tendency.specific_humidity)[:, 0]
+        self.assertTrue(np.any(dq != 0.0), "the column did not convect")
+        np.testing.assert_array_equal(
+            dq != 0.0, dq_dt != 0.0,
+            "dq_mc is not in the same vertical frame as the humidity "
+            "tendency computed from it")
+
+    def test_convective_heating_stays_out_of_the_model_top(self):
+        """A plume cannot heat the top of the atmosphere.
+
+        The frame tests above pin the two fields to each other; this one
+        pins them to physical reality, so that flipping *both* consistently
+        in the wrong direction would still fail.
+        """
+        _, out = self._run()
+        dth = np.asarray(out["convection"].dth_mc)[:, 0]
+        # The column is top-first, so index 0 is the model top.
+        self.assertEqual(
+            dth[0], 0.0,
+            "convective heating reached the model top, so the profile is "
+            "upside down")
+
+
+class TestTheCloudBaseSeedUsesTheBoundaryLayer(unittest.TestCase):
+    """``convective_velocity_scale`` is worth reaching, and 0.5 is not it.
+
+    Both halves are pinned: the size of the error the 0.5 floor represents,
+    measured from a global run's own saved fields, and that the seed actually
+    arrives at the plume. The second matters because it did not, for the whole
+    life of the port -- the production bsort path called ``convective_column``
+    without ``cloud_base_velocity`` and silently took the driver's own 0.5, so
+    the scale was dead code for the only path that runs.
+    """
+
+    def _state(self):
+        return TestGissConvectionTerm()._moist_column()
+
+    def test_a_deep_boundary_layer_raises_the_seed_above_the_floor(self):
+        """With a PBL depth and surface fluxes the seed is w*, not the floor."""
+        state, diag = self._state()
+        surface_density = 1.157
+
+        w_floor = giss_mstcnv.convective_velocity_scale(
+            sensible_heat_flux=23.8, evaporation=4.685e-05,
+            boundary_layer_height=0.0, surface_density=surface_density,
+            reference_theta=298.8)
+        w_real = giss_mstcnv.convective_velocity_scale(
+            sensible_heat_flux=23.8, evaporation=4.685e-05,
+            boundary_layer_height=1605.4, surface_density=surface_density,
+            reference_theta=298.8)
+        # The tropical median of a global run's own saved fields.
+        self.assertAlmostEqual(float(w_floor), 0.5, places=6)
+        self.assertGreater(float(w_real), 1.0)
+        # The entrainment rate goes as B/w**2, which is why the floor is
+        # expensive rather than merely approximate.
+        self.assertGreater((float(w_real) / 0.5) ** 2, 4.0)
+
+    def test_the_seed_reaches_the_plume_from_the_vdiff_record(self):
+        """End to end, on the production path, through the only publisher.
+
+        The spy sits on ``giss_plume_driver.run_plume``, where
+        ``convective_column`` calls it from: the term never names it, so
+        patching the term's own module would patch nothing and the test would
+        pass regardless. It reads the seed as passed rather than converting it,
+        because under ``jit`` it is a tracer -- an earlier version of this test
+        called ``float()`` on it and died in ``ConcretizationTypeError``.
+        """
+        from jcm.physics.convection import giss_plume_driver as drv
+
+        state, diag = self._state()
+
+        class Vdiff:
+            pbl_height = jnp.asarray([1605.4])
+
+        class Surface:
+            sensible_heat_flux = jnp.asarray([23.8])
+            evaporation = jnp.asarray([4.685e-05])
+            momentum_flux_u = jnp.asarray([0.05])
+            momentum_flux_v = jnp.asarray([0.0])
+
+        def seed_for(extra):
+            captured, original = [], drv.run_plume
+
+            def spy(*a, **k):
+                captured.append(k["cloud_base_velocity"])
+                return original(*a, **k)
+
+            drv.run_plume = spy
+            try:
+                GissConvection(allow_mc=True)(
+                    state, {**diag, "surface": Surface(), **extra}, None, None)
+            finally:
+                drv.run_plume = original
+            self.assertTrue(captured, "the plume driver was never reached")
+            return float(np.asarray(jnp.asarray(captured[0])).ravel()[0])
+
+        self.assertAlmostEqual(seed_for({}), 0.5, places=5)
+        # TTE-TKE's record is the only publisher in any preset, and these are
+        # a global run's tropical medians, so this is the seed a global plume
+        # should get -- against the 0.5 it was getting.
+        self.assertGreater(seed_for({"vertical_diffusion": Vdiff()}), 1.0)

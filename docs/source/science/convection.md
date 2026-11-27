@@ -1,6 +1,6 @@
 # Convection
 
-**What we do.** Three interchangeable convection schemes:
+**What we do.** Four interchangeable convection schemes:
 
 - **Tiedtke-Nordeng mass-flux**
   (``jcm/physics/convection/tiedtke_nordeng/tiedtke_nordeng.py::TiedtkeConvection``)
@@ -61,6 +61,133 @@
   (Frierson 2007 Simplified Betts-Miller), relaxing T and q toward a moist-adiabatic
   reference at RH ``rhbm`` over ``tau_bm``, with ``do_shallower`` / ``do_changeqref``
   siblings. Written broadcasting-native (vertical on axis 0).
+
+- **GISS ModelE moist convection**
+  (``jcm/physics/convection/giss_mstcnv.py::GissConvection``) — a port of
+  ModelE's ``MSTCNV`` ``plume_ent_det_w2_bsort`` branch, the one
+  ``bsort_entdet`` selects by default. A **buoyancy-sorting** scheme, which is
+  what distinguishes it from the other three: entrainment and detrainment are
+  not prescribed rates but *emergent* from a sort. Each level sets an
+  entrainment rate from an energy closure (``ent = min(0.95,
+  sqrt(kew/(bdzsum·mplume)) − 1)/delz``, floored and capped at 4e-3 m⁻¹), uses
+  it only to size the air set aside for mixing, builds a spectrum of blends of
+  that air with the environment, and gives each blend one of three fates on its
+  virtual buoyancy — rejoin the updraft above ``+0.05/tvl``, seed the downdraft
+  below ``−0.2/tvl`` unless the plume is already overshooting, or detrain
+  locally. The cloud-base mass flux comes from ModelE's ``MASS_FLUX2``
+  bisection over a multi-level source blend, and the condensation phase is
+  chosen **per level** from the parcel's own temperature against ``tfmc`` =
+  258.16 K, re-booking the latent heat of the whole condensate reservoir when
+  it crosses — which is worth 1.7 K of buoyancy at the transition and 1.5
+  levels of cloud top.
+
+  *Science:* it is the scheme a ModelE-faithful configuration needs, and the
+  buoyancy sort represents the entrainment/detrainment asymmetry that fixed
+  rates cannot. *Compute:* the candidate sweep over cloud bases and the plume
+  ascent are both ``lax.scan``s with static trip counts, so the cost is set by
+  ``_MAX_PLUME_CANDIDATES`` (16) rather than by how much the column convects.
+  *Differentiability:* the sort's three-way fate is a thresholded decision, so
+  the scheme is differentiable in its magnitudes but its *decisions* are
+  piecewise — which also means its per-period agreement with ModelE cannot
+  exceed the precision of its inputs, and aggregate rather than per-period
+  agreement is the right acceptance measure.
+
+  **Validated in single column only**, against an instrumented ModelE SCM run
+  of TWP-ICE: 0.910 of ModelE's convective rain produced, 1.017 of its surface
+  flux delivered, cloud bases per step 1.744 against 1.744, mean cloud-top bias
+  −0.08 levels. The surface flux is the depleted falling flux the downdraft
+  descent carries out of the column — what ModelE accumulates into ``prcpmc`` —
+  rather than production minus the evaporation terms, which omits the
+  condensate the buoyancy sort routes into the shaft (42% of BOMEX's
+  production). The condensate a plume detrains into the environment as cloud —
+  ModelE's ``detrQC``, which it passes to its stratiform scheme, and 27% of
+  BOMEX's plume condensate — is handed to the cloud scheme as
+  ``clouds.conv_detrainment_qc``/``_qi`` and as a qc/qi tracer tendency, the
+  same handoff Tiedtke makes with ECHAM's ``pxtecl``/``pxteci``, with the phase
+  taken from the ``lhx`` the ascent condensed at. A plume that stops leaves
+  what it still carries on the last level it reached, with that level's phase,
+  as ModelE's ``DM(LMAX)``/``LHXMC(L) = VLAT(L)`` do. The environment it convects
+  is the running ``thermo_run`` view where a composition seeds one — the column
+  after vertical diffusion and the surface exchange, which is what ECHAM hands
+  ``cumastr`` and what ModelE's ``CLOUDS_DRV`` ordering gives ``MSTCNV`` — and
+  the raw state otherwise, which is what the single column and the oracle
+  harness supply. It advances ``thermo_run`` in turn, so the cloud
+  microphysics downstream of it condenses against the post-convection column.
+
+  It runs globally and stably — T63L47, 30 days, every field finite under the
+  runner's health gates — but a 30-day A/B against the Tiedtke preset puts it
+  **−14.9 W/m² at top of atmosphere**, 30 times the local gate's threshold and
+  69 times the noise twin's drift. It removes 19.7 % less water as
+  convective rain — not by triggering too rarely, since it convects over more
+  area than Tiedtke (70.9 % of columns against 54.1 %), but because its plumes
+  stop too low. Its median tropical plume top is 405 hPa against Tiedtke's
+  180 hPa, and 6.9 % of its convecting columns reach 150–50 hPa where 40.5 %
+  of Tiedtke's do, so the area raining above 5 mm/day is halved. That depth
+  difference is not the port failing to reproduce ``MSTCNV``: on the deep
+  single-column case the port's five ascent termination exits fire in the same
+  proportions as ModelE's, within 2 percentage points on each, with the median
+  plume top one level apart. What the global run compares is the port against
+  Tiedtke, and ``MSTCNV`` is not in it. Two configuration differences are the
+  open candidates. ``max_dt_overshoot`` is **not** one of them: it defaults to
+  ModelE's untuned 1.0, the value the oracle ran at, and a third 30-day A/B at
+  GISS's tuned 2.0862949 leaves the shortwave excess and the liquid water path
+  unmoved in the pre-divergence window, recovering at most 2 % of the bias and
+  that only at 30 days and at 1.4× the noise twin, below the gate's bar. It
+  stays a differentiable parameter because it is a tuning knob, not because it
+  explains the bias. What remains is the cloud-base updraft seed. ``MSTCNV`` takes it from
+  its own boundary layer as ``wbases = max(0.5, wturb)``; the port computes the
+  convective velocity scale from the surface buoyancy flux and the
+  boundary-layer depth, which its oracle dumps put at a median 0.567 m/s on
+  both single-column cases and up to 1.33 m/s on the deep one, against a
+  tropical ``w*`` of 1.14 m/s in a global run. Until this was wired the
+  buoyancy-sorting path passed no seed at all and every plume started at the
+  0.5 m/s floor. Wiring it is a fidelity choice and not an improvement: in this
+  closure the entrainment rate rises with the seed rather than falling, so
+  supplying the real boundary-layer depth deepens the global convective
+  precipitation deficit, from 20.1 % to 23.3 %. Also that the three prognostic
+  inputs below are zero in a global run,
+  which moves the port's median single-column plume top from L22 to L46 and
+  makes that overshoot test the terminating one on 80 % of plumes. It leaves the column 5.9 % moister, and the stratiform scheme
+  condensing that excess lifts liquid water path 43.4 % and reflects 13.9 W/m²
+  more shortwave, which is 93 % of the bias and almost entirely cloud radiative
+  effect (14.89 of 14.94 W/m² against the clear-sky flux) — an albedo error
+  rather than a greenhouse one. Outgoing longwave carries the remaining
+  1.0 W/m², and in the opposite sense: the term emits *more* than Tiedtke,
+  because the same shallow ascent leaves the upper troposphere too dry — its
+  tropical humidity is 35 % below Tiedtke's at 300 hPa while 9 % above it at
+  the surface, worth +2.4 W/m² of clear-sky OLR. Its longwave *cloud* effect is
+  1.2 W/m² too large rather than too small, so the near-zero all-sky OLR
+  difference it showed before the detrainment fix was two errors cancelling. Total precipitation falls only 4.6 %, the
+  stratiform pathway almost exactly compensating, so the global precipitation
+  is not evidence the scheme is approximately right. Closing that depth gap is
+  a precondition for using the term in a coupled climate run. It detrains 84 %
+  less ice than Tiedtke; part of that was a phase the terminal dump had lost by
+  landing one level too high, now fixed, and the remainder is the same missing
+  depth. Correcting the placement removes the global ice water path bias
+  entirely, +6.2 % to −0.17 %, by *lowering* suspended ice: the stranded
+  condensate had been published as liquid at 190–240 K, which the stratiform
+  scheme froze and then held aloft. It also raises the convective
+  surface rain the single column delivers, from 0.981 to 0.994 of ModelE's on
+  BOMEX and from 0.995 to 1.095 on TWP-ICE: the old placement was
+  compensating, stabilising the air above each plume top against the next
+  candidate, and the deep case now over-rains. Globally that correction is
+  worth about 1 W/m² in each direction at TOA and the two nearly cancel, so it
+  moves the net bias by only −0.5 W/m² and leaves the depth deficit as the one
+  defect with a measured climate effect. It also costs 13.1× the
+  Tiedtke preset for the same integration. Three of ModelE's inputs are
+  prognostic there and are read here as optional diagnostics defaulting to zero
+  — the cold-pool fraction, the penetrative mass and the running cloud-top
+  pressure — so a global configuration does not yet reproduce what the oracle
+  validated. The precipitation phase is all-liquid and the ice microphysics
+  (``PRECIPICE_GAMMA`` and the graupel blend) is unported, measured at 1.1% of
+  the production deficit on a case where only 12% of ModelE's rain falls at ice
+  levels; and the terminating-level rain partition redistributes 35% of a
+  plume's top-level rain downward at a column cost of ~1%. The downdraft
+  descent, by contrast, is exact: replayed on ModelE's own per-level shaft it
+  reproduces the precipitation evaporated into the downdraft to 1.0000 on BOMEX
+  and 1.0002 over 1,031 TWP-ICE downdrafts. Run it with
+  ``physics=echam-giss-conv``; see ``docs/source/design/giss_convection_port.md``
+  for the measurements behind each number.
 
 **Tiedtke's decisions are ECHAM's.** Whether a column convects, which plume it
 carries, where the plume stops and where it rains are hard comparisons in

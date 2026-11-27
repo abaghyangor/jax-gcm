@@ -277,19 +277,37 @@ def get_terrain(orography: jnp.ndarray = None, fmask: jnp.ndarray = None, nodal_
 _SSO_NAMES = ("orostd", "orosig", "orogam", "orothe", "oropic", "oroval")
 
 
-def _load_sso_from_file(terrain_file):
+def _load_sso_from_file(terrain_file, grid: HorizontalGridTypes = None):
     """Load SSO descriptor fields from a JCM-canonical terrain file if present.
 
     Returns a dict of the six SSO arrays, or ``None`` if the file lacks any
     of them. Use ``utils/convert_echam_bc.py`` to translate ECHAM-style
     boundary files (uppercase ``OROSTD``/…, ``(lat, lon)``-ordered) into
     the canonical JCM layout that this loader expects.
+
+    Args:
+        terrain_file: Path to the terrain file.
+        grid: Target horizontal grid. When given and the file's fields do
+            not already sit on it, they are regridded with
+            :func:`jcm.data.bc.interpolate.upsample_sso_ds` — which
+            interpolates ``orothe``'s double-angle vector rather than the
+            angle itself, since the principal axis is axial in (-90, 90]
+            and averaging across that wrap turns a ridge just east of
+            north and one just west of north into a ridge pointing east.
+            Left at ``None`` the fields come back on the file's own grid,
+            and the caller is responsible for the mismatch (#578).
+
     """
     import xarray as xr
-    ds = xr.open_dataset(terrain_file)
-    if not all(name in ds for name in _SSO_NAMES):
-        return None
-    return {name: jnp.asarray(ds[name]) for name in _SSO_NAMES}
+    with xr.open_dataset(terrain_file) as ds:
+        if not all(name in ds for name in _SSO_NAMES):
+            return None
+        sso_ds = ds[list(_SSO_NAMES)]
+        if grid is not None and (
+                sso_ds.sizes["lon"], sso_ds.sizes["lat"]) != grid.nodal_shape:
+            from jcm.data.bc.interpolate import upsample_sso_ds
+            sso_ds = upsample_sso_ds(sso_ds, grid=grid)
+        return {name: jnp.asarray(sso_ds[name]) for name in _SSO_NAMES}
 
 
 @tree_math.struct
@@ -364,7 +382,16 @@ class TerrainData:
                 six should be; missing ones are derived by
                 :func:`get_simplified_sso_descriptors`. If none provided and
                 ``terrain_file`` includes them, those are used; otherwise
-                all six are derived from the mean orography.
+                all six are derived from the mean orography. With
+                ``interpolate`` the file's descriptors are regridded onto
+                the model grid along with its orography. That is the right
+                move coming from a COARSER file, which carries real
+                high-resolution topography the target grid cannot recover
+                on its own; coming from a FINER one, prefer
+                :meth:`from_file`, which recomputes Baines-Palmer
+                statistics per target cell
+                (:func:`derive_sso_descriptors`) instead of averaging
+                aggregates that have already been aggregated once.
             fmask_threshold (optional): Fraction of a cell below which the smaller of
                 land and sea is dropped (see :func:`get_terrain`); 0 keeps every fraction.
 
@@ -400,8 +427,14 @@ class TerrainData:
                         orothe=orothe, oropic=oropic, oroval=oroval)
         sso_user_provided = {k: v for k, v in sso_user.items() if v is not None}
 
-        sso_from_file = (_load_sso_from_file(terrain_file)
-                         if terrain_file is not None else None)
+        # ``interpolate`` put orog/fmask on the model grid; the file's SSO
+        # fields have to follow, or TerrainData is built with its six
+        # descriptors still on the file's grid and the mismatch only
+        # surfaces deep inside a vmapped physics call (#578).
+        sso_from_file = (
+            _load_sso_from_file(
+                terrain_file, grid=coords.horizontal if interpolate else None)
+            if terrain_file is not None else None)
         sso_derived = get_simplified_sso_descriptors(orog)
 
         sso = dict(sso_derived)
@@ -494,20 +527,60 @@ class TerrainData:
 
         # Pick the best available SSO source.
         sso = _load_sso_from_file(terrain_file) if src_has_sso else None
+        # BOTH axes, deliberately: re-deriving Baines-Palmer statistics needs
+        # several source cells inside each target cell to take the variance
+        # OVER, and a grid finer in longitude but coarser in latitude supplies
+        # them in one direction only. Such a mixed source is therefore treated
+        # like a coarser one and interpolated, which is the conservative
+        # choice -- it keeps the descriptors the file already carries instead
+        # of computing a variance from a single row of cells. It does mean the
+        # axis that is being coarsened is point-sampled rather than
+        # aggregated, so its between-cell variance is lost; no shipped terrain
+        # file is mixed this way, and a file that is would be better
+        # regridded to a common resolution before it gets here.
+        source_is_finer = (src_lat_n > target_shape[1]
+                           and src_lon_n > target_shape[0])
         if sso is not None and any(
             v.shape != target_shape for v in sso.values()
         ):
             # File SSO is at a different resolution than the model grid —
             # using it raw would crash deep inside a vmapped physics call
-            # (#578). Fall through to deriving from the source orography.
-            logger.warning(
-                "terrain file %s carries SSO fields at %s, not the model's "
-                "%s — ignoring them and deriving SSO from the source "
-                "orography instead", terrain_file,
-                next(iter(sso.values())).shape, target_shape)
-            sso = None
+            # (#578).
+            if source_is_finer:
+                # Downsampling: these descriptors are already subgrid
+                # aggregates, so area-averaging them would drop the
+                # variance BETWEEN the source cells that the coarser cell
+                # now contains. Fall through and recompute Baines-Palmer
+                # statistics from the source heights instead.
+                logger.warning(
+                    "terrain file %s carries SSO fields at %s, finer than "
+                    "the model's %s — ignoring them and deriving SSO from "
+                    "the source orography instead", terrain_file,
+                    next(iter(sso.values())).shape, target_shape)
+                sso = None
+            else:
+                # Upsampling: Baines-Palmer needs source cells to
+                # aggregate and there are not enough of them, so the
+                # alternative is the mean-orography heuristic — which
+                # cannot recover the real high-resolution topography the
+                # file's descriptors already carry. Regrid them instead.
+                logger.info(
+                    "terrain file %s carries SSO fields at %s, not finer than "
+                    "the model's %s on both axes — interpolating them onto "
+                    "the model grid", terrain_file,
+                    next(iter(sso.values())).shape, target_shape)
+                sso = _load_sso_from_file(terrain_file, grid=target_grid)
+                if any(v.shape != target_shape for v in sso.values()):
+                    # Belt and braces: never hand a mismatch downstream,
+                    # whatever the file's axes looked like.
+                    logger.warning(
+                        "regridding the SSO fields of %s landed on %s, not "
+                        "the model's %s — deriving SSO instead",
+                        terrain_file,
+                        next(iter(sso.values())).shape, target_shape)
+                    sso = None
         if sso is None:
-            if src_lat_n > target_shape[1] and src_lon_n > target_shape[0]:
+            if source_is_finer:
                 target_lat_deg = target_grid.latitudes * 180.0 / jnp.pi
                 target_lon_deg = target_grid.longitudes * 180.0 / jnp.pi
                 sso = derive_sso_descriptors(

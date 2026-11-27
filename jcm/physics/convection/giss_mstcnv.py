@@ -1,0 +1,1395 @@
+"""GISS ModelE moist convection as a composable PhysicsTerm.
+
+The JCM landing zone for the GISS ModelE moist convection routine ``MSTCNV``
+(``modelE/model/MSTCNV.F90``, called from ``CONDSE_column`` in
+``modelE/model/CLOUDS_DRV.F90``). Per the repo's by-process organization the
+convection *term* lives here under ``jcm/physics/convection/`` (named after the
+scheme); the parameter/diagnostic structs live under :mod:`jcm.physics.modele`.
+The ModelE oracle reading/conversion tooling lives in a *separate* repository;
+this repo only carries committed fixture arrays (``jcm/data/test/modele/``) for
+tests. See ``docs/source/design/giss_convection_port.md`` for the
+full port design.
+
+Status: diagnostics always; full tendencies under ``allow_mc``
+-------------------------------------------------------------
+:class:`GissConvection` always *diagnoses* two things from the state (when the
+column pressure / layer-mass diagnostics are present):
+
+1. ``cloud_base`` -- the convective cloud base (lifting condensation level) of a
+   surface parcel, via :func:`~jcm.physics.convection.giss_cloud_base.lifting_condensation_level`.
+2. ``cloud_base_mass_flux`` -- the ``MASS_FLUX2`` closure plume mass ``fmp2``
+   [kg/m^2] at cloud base (:func:`cloud_base_closure_mass_flux`). The *validated*
+   piece: on the BOMEX oracle it gives physical values (``fmp2 ~ 2-8 kg/m^2``).
+
+When ``allow_mc`` is set (mirroring ModelE ``SCMopt%allowMC``; **default off**)
+the term also runs the **full tendency chain** (:meth:`_convective_tendencies`):
+closure ``fmp2`` -> full-column entraining plume ascent with buoyancy sorting ->
+compensating subsidence + detrainment deposition -> ``dth_mc``/``dq_mc``,
+returned as temperature/humidity tendencies.
+
+**Validation status of the tendencies.** Measured against ModelE run as an
+oracle, driven from an identical column state, over all 48 periods of two
+convecting SCM cases:
+
+===========================  ==============  ==============
+``dth_mc``, whole column     BOMEX           RICO
+===========================  ==============  ==============
+correlation, median / p10    +0.977 / +0.887 +0.988 / +0.938
+nRMSE, median / p90           0.037 / 0.089   0.034 / 0.067
+peak ratio, median            1.009           0.956
+peak level offset             0               0
+closure base vs ModelE lmin  48/48 exact     46/46 exact
+===========================  ==============  ==============
+
+RICO was never used to choose a constant; the port ran on it unchanged. On
+DYCOMS-II RF02, where ModelE's convective tendencies are identically zero, the
+port declines to convect in all 48 periods, and it matches both of RICO's two
+non-convecting periods.
+
+Gradients through the whole chain agree with float64 finite differences to
+1.0000000x (``giss_mstcnv_test.TestGissConvectionGradient``).
+
+Still off by default: ``allow_mc`` mirrors ModelE's own ``SCMopt%allowMC``, and
+the term has not yet been run inside a free-running jcm integration. What is
+*not* ported is stated where it lives -- mixed phase below (``tfmc``), downdraft
+descent in ``giss_plume``, and see ``BSORT_PORT_PLAN.md`` in the companion
+modele-jcm-bridge repository.
+
+Conventions
+-----------
+* JCM orders the vertical with **index 0 = top, last index = surface**; the
+  ported GISS routines expect **surface-first**, so profiles are flipped
+  (``jnp.flip(axis=0)``) before use and indices are returned surface-first.
+* Operates broadcasting-native on column-vectorized state ``(nlev, ncols)``;
+  the per-column cloud base is handled with :func:`jnp.take_along_axis` (a gather
+  with per-column indices), so no ``vmap`` is needed.
+* ``state.specific_humidity`` is kg/kg, which is what the GISS routines use
+  directly (``physics_interface``: "mass of water vapor per unit mass of
+  moist air [kg/kg]"; ``state_bridge``: "kg/kg is dimensionless"). It was
+  g/kg before jax-gcm#824, and the ``/1000`` that undid that is gone: left
+  in, it dried every parcel by a factor of 1000, which put the diagnosed
+  cloud base 17 levels up and left ``fmp2`` zero on all 18432 columns of a
+  warm-started T63L47 run.
+* ``pressure_full`` [Pa], ``layer_thickness`` [m], ``air_density`` [kg/m^3] are
+  read from the diagnostics dict when present (``air_mass = density*thickness =
+  dp/g``). They are read optionally so the term still runs as a pure scaffold
+  (sentinel cloud base, zero mass flux) without them.
+* ``PhysicsTendency`` fields are per second.
+"""
+
+from __future__ import annotations
+
+from typing import ClassVar
+
+import jax.numpy as jnp
+from flax import nnx
+
+from jcm.physics_interface import PhysicsState, PhysicsTendency
+from jcm.physics.physics_term import PhysicsTerm
+from jcm.forcing import ForcingData
+from jcm.terrain import TerrainData
+from jcm.physics.modele.params import GissConvectionParameters
+from jcm.physics.modele.physics_data import GissConvectionData
+from jcm.physics.diagnostics.moist_air_state import advance_thermo_run
+from jcm.physics.convection import giss_bsort as bsort
+from jcm.physics.convection.giss_cloud_base import lifting_condensation_level
+from jcm.physics.convection.giss_mass_flux import (
+    _TADJ_CLOSURE2_SECONDS,
+    _TADJ_SECONDS,
+    cloud_base_closure,
+    cloud_base_mass_flux_column,
+)
+from jcm.physics.convection.giss_plume import plume_ascent_column
+from jcm.physics.convection.giss_plume_driver import (
+    convective_column,
+    CandidateSetup,
+    entrainment_efficiency,
+    displacement_top,
+    enhanced_source,
+    source_bottom,
+    source_weights,
+)
+from jcm.physics.convection.giss_tendencies import convective_tendencies
+from jcm.physics.convection.giss_thermodynamics import (
+    GRAV,
+    KAPA,
+    SHA,
+    safe_divide,
+    saturation_specific_humidity,
+)
+
+# Reference pressure for the Exner function. The closure recovers temperature as
+# ``theta*exner``, so the reference cancels and its specific value is arbitrary;
+# 1000 hPa is the conventional choice and matches the BOMEX validation.
+# `fmp2 = min(max(mwpen, fmp2), 100d0)` (`MSTCNV.F90:2957`) -- the ceiling
+# the closure's caller puts on the cloud-base mass, in kg/m^2.
+_CLOSURE_MASS_CAP = 100.0
+
+_P_REF = 100000.0
+
+# `MSTCNV` works in `th = theta/1000**kappa` against `plk = (p in mb)**kappa`,
+# so that `th*plk` is the temperature. This converts its potential temperature
+# back to the conventional one the rest of jcm uses.
+_MODELE_THETA_SCALE = 1000.0 ** KAPA
+
+# How many candidate cloud bases the sweep evaluates, counting down from the
+# displacement top. Static, because it is a trace length, and the cost is
+# linear in it: the scan runs every candidate whether or not it convects.
+#
+# ModelE sweeps `lmcm-1` down to `dcl` and does not stop at its first success,
+# so several bases can convert in one timestep. Crucially the sweep is
+# **sequential**: `apply_continuity_tendencies` writes each plume's tendencies
+# back into `SM`/`QM` (MSTCNV.F90:5199-5206) from inside both the plume loop
+# and the base loop (`:2454`), so a candidate is tested against a column the
+# plumes above it have already stabilised. `convective_column` reproduces that
+# by carrying the environment through the scan and re-running the closure at
+# each candidate; see its `cloud_base_closure_fn`.
+#
+# This was held at 1 for as long as the sweep ran against a frozen column,
+# because opening it then converted at 2.00 bases per BOMEX step against
+# ModelE's 1.08 and overshot peak heating by 39%. That was the frozen
+# environment, not the closure: with the sweep coupled, opening it gives
+#
+#   case     ModelE bases/step   port   corr median      peak
+#   BOMEX          1.08          1.31   +0.977 -> +0.978  1.010 -> 1.014
+#   RICO           1.11          1.10   +0.988 -> +0.987  0.976 -> 0.988
+#   TWP-ICE        1.75          1.76   +0.893 -> +0.912  0.939 -> 1.067
+#
+# and all three keep their cloud-base match (48/48, 46/46, 249/251). What is
+# left is one *extra* base on 11 of 48 BOMEX steps -- never two, and never a
+# missing one -- so the closure is still slightly too permissive per base, and
+# TWP-ICE now overshoots peak heating by 7% where it used to undershoot by 6%.
+#
+# **Why 16 and not 8.** This was 8 on the grounds that BOMEX and RICO converge
+# by width 4 and TWP-ICE by 8, with width 24 moving TWP-ICE by only 0.02
+# bases/step. That measurement stands -- widening recovers a base on 3 of the
+# 223 active TWP-ICE periods, which is 0.013 bases/period -- but it was the
+# wrong quantity to decide on. Those three periods are ones where the port
+# converted at *fewer* bases than ModelE, and at 16 their base counts match it
+# exactly (3/3, 2/2, 2/2); the production they carry is +0.066 mm/day, or 3.7%
+# of the deficit that remained once the per-level phase and the frozen geometry
+# were fixed. A width that leaves a base ModelE converts at unreachable is
+# unfaithful however little it moves a column mean, and 8 was our own
+# invention: ModelE has no candidate limit at all, its `cloud_base` loop
+# running downward from `lmcm-1` to `dcl` (MSTCNV.F90:1505-1523, with
+# `lmcm = ls1-1`), which is the whole troposphere.
+#
+# The rain overshoots on two of the three (period 93 goes 0.913 -> 1.117 of
+# ModelE, period 33 1.041 -> 1.051) while period 312 improves, 0.719 -> 0.816;
+# on the three together the absolute error falls 4.6% -> 3.2%. That spread is
+# the buoyancy sort's threshold sensitivity, not the width: the sort's fates
+# turn on ~1.7e-4 in blend buoyancy and the port reproduces it to ~2e-4, so a
+# recovered base cannot be expected to land on ModelE's mass. The base count is
+# the part that is free to be right.
+#
+# **Do not raise this further without re-timing it.** Measured on eight periods
+# with the host otherwise idle: width 8 costs 3.72 s/period, width 16 costs
+# 5.41 s (1.45x), and width 24 costs **129.91 s (35x)** while changing not one
+# number in the results. The per-candidate work is linear, so that is XLA
+# leaving a fast path somewhere between 16 and 24, and it is paid on every
+# column of every step in a global run.
+#
+# What is still unported is the other branch of the source-block choice
+# (MSTCNV.F90:2838-2848): above `lmax_disp` ModelE collapses the source to a
+# single layer and applies a TKE-against-stratification test, while the port
+# uses the full boundary-layer source at every candidate. On TWP-ICE that fires
+# on 8 of ModelE's 9,240 converting bases -- 0.1% -- but two of those are the
+# largest single production losses in the case, periods 102 and 276, where
+# ModelE converts at levels 45 and 50 and takes 51% and 77.5% of the period's
+# rain from there. No width reaches them: `closure_base` is 15 and 16, and a
+# sweep deep enough would be far past the cost cliff above. Capturing them needs
+# an elevated-layer search separate from this window, plus `wturb` supplied like
+# `fcp` and `mwpen`. See section 120 of `BSORT_PORT_PLAN.md` in the bridge.
+_MAX_PLUME_CANDIDATES = 16
+
+# ModelE's `tfmc`, the parcel temperature below which condensate forms as ice
+# (`tf - 15d0` in the preset this port targets, MSTCNV.F90:301).
+#
+# The **condensation** phase is now chosen per level, from the parcel's own
+# pre-condensation temperature against this threshold, exactly as ModelE does
+# (MSTCNV.F90:1842-1854) -- see `giss_bsort.plume_ascent`. That matters far more
+# than a choice of latent heat, because ModelE re-condenses the parcel from
+# scratch at every level, so crossing `tfmc` re-books the latent heat of the
+# whole condensate reservoir: measured at +1.66 K on the TWP-ICE level where it
+# happens, against an overshoot threshold of 1 K, and worth 14.3% of the port's
+# production deficit and 1.5 levels of mean cloud top.
+#
+# **What is still all-liquid** -- so `MIXED_PHASE_SUPPORTED` stays false:
+#
+#  * the *precipitation* phase. ModelE carries a second, separate phase field
+#    `lhp(l)` for the falling condensate (MSTCNV.F90:4295-4302), and tracks both
+#    in order to redistribute the melting/freezing heat as
+#    `heat1(l) += (vlat(l)-lhp(l))*condpr(l)*bysha`. Neither is ported.
+#  * the ice microphysics. `giss_microphysics` is the warm-rain partition
+#    (`PRECIPLIQ_GAMMA`) only; ModelE's live path also needs `PRECIPICE_GAMMA`
+#    and a `PRECIP_MP` graupel blend, about 500 lines of Fortran. Measured as an
+#    **accepted limitation**: over 223 TWP-ICE periods the levels ModelE runs in
+#    the ice phase are already at 0.991 of its rain and carry 1.1% of the
+#    deficit, against 0.883 and 98.9% for the water levels. That number is
+#    case-specific -- only 12.0% of ModelE's rain here falls at ice levels -- so
+#    it must be re-sized before this term is trusted outside the tropics.
+#  * ModelE's cross-plume latching of the phase through `VLAT(L)`/`TPSAV(L)`,
+#    which are column arrays shared by every plume of the timestep. The port
+#    decides per plume. Measured inert on this case: the two disagree on 3
+#    `(step, level)` pairs out of 3,772, none on an active period.
+#
+# See sections 115-117 of `BSORT_PORT_PLAN.md` in the bridge for the
+# measurements behind each of these.
+# One value, shared with the ascent that acts on it. ModelE's `tf` is 273.16,
+# not 273.15, and the difference is not cosmetic here: the threshold was
+# recovered from the oracle, where the level ModelE's dumped `lhx` switches on
+# straddles 258.16 K on 186 of 186 TWP-ICE steps.
+_FREEZING_THRESHOLD = bsort._TFMC
+MIXED_PHASE_CONDENSATION = True
+MIXED_PHASE_PRECIPITATION = False
+MIXED_PHASE_SUPPORTED = MIXED_PHASE_CONDENSATION and MIXED_PHASE_PRECIPITATION
+
+
+# Plume-ascent constants used by the (allow_mc) tendency path. These are physical
+# tunables that should graduate to differentiable ``GissConvectionParameters``
+# leaves; kept as module constants for now because the tendency magnitudes are
+# not yet validated (the plume over-penetrates -- see the module docstring), so
+# tuning them is premature.
+_CONTCE = 0.6          # Gregory entrainment strength (more-entraining plume)
+_CLOUD_BASE_W = 0.5    # cloud-base updraft seed [m/s]
+
+
+def surface_flux_scales(sensible_heat_flux, evaporation, friction_velocity,
+                        surface_density, surface_specific_humidity,
+                        tqstar_factor: float = 1.0):
+    """Surface-layer ``tstar``/``qstar`` scales that enhance the source parcel.
+
+    ``MSTCNV`` warms and moistens the boundary-layer source parcel by the
+    surface-flux scales before running the closure (``CLOUDS_DRV.F90:642``)::
+
+        tstar = min(1,        max(0, SHF / (rho*cp*ustar)))
+        qstar = min(0.2*q_sfc, max(0, evap / (rho*ustar)))
+
+    scaled by ``mc_tqstar_fac`` (1.0 in the default preset). Both are floored at
+    zero -- only an *upward* surface flux enhances the parcel -- and capped, so a
+    strongly forced surface cannot run away.
+
+    This matters more than its size suggests: paired with the multi-source
+    closure (whose blended source humidity is nearly invariant during the
+    bisection) a ~0.2 g/kg moisture boost shifts the whole ``DMSE1`` curve, and
+    the latent term carries ``LHE/SHA ≈ 2490 K`` per kg/kg.
+
+    Args:
+        sensible_heat_flux: **Upward** sensible heat flux [W/m^2].
+        evaporation: Surface evaporation rate [kg/m^2/s].
+        friction_velocity: ``ustar`` [m/s].
+        surface_density: Surface air density [kg/m^3].
+        surface_specific_humidity: Surface specific humidity [kg/kg] (caps qstar).
+        tqstar_factor: ``mc_tqstar_fac``.
+
+    Returns:
+        ``(tstar, qstar)`` -- source-parcel temperature [K] and humidity [kg/kg]
+        enhancements.
+
+    """
+    scale = surface_density * jnp.maximum(friction_velocity, 1.0e-6)
+    tstar = jnp.clip(sensible_heat_flux / (scale * SHA), 0.0, 1.0)
+    qstar = jnp.clip(evaporation / scale, 0.0,
+                     0.2 * surface_specific_humidity)
+    return tqstar_factor * tstar, tqstar_factor * qstar
+
+
+def convective_velocity_scale(sensible_heat_flux, evaporation,
+                              boundary_layer_height, surface_density,
+                              reference_theta, minimum=0.5):
+    """Cloud-base updraft seed from the convective velocity scale ``w*``.
+
+    ``MSTCNV`` seeds the plume with ``wbases = max(0.5, wturb)`` -- the
+    boundary-layer turbulent velocity from its own BL scheme (``MSTCNV`` line
+    ~2807). JCM has no direct equivalent, so we use the standard convective
+    velocity scale built from the surface **buoyancy** flux and the boundary-layer
+    depth::
+
+        w* = (g * z_i * (w'theta' + 0.61*theta*w'q') / theta)**(1/3)
+
+    On BOMEX this gives ~0.6 m/s against the oracle's observed 0.57 -- the right
+    scale, from inputs we actually have.
+
+    The seed matters more than its size suggests, but **which way depends on the
+    ascent**. The single-plume path (``plume_ascent_column``, Gregory-style with
+    ``contce``) does entrain as ``B/w**2``, so there a slow seed entrains hard
+    and dies early. The buoyancy-sorting path does the opposite:
+    :func:`~jcm.physics.convection.giss_bsort.entrainment_rate` is
+    ``min(0.95, sqrt(kew/(bdzsum*mplume)) - 1)/delz`` with ``kew`` proportional
+    to ``w**2``, so a *faster* seed raises the entrainment rate -- the closure
+    dilutes the plume down to ``enteff`` of the velocity its buoyancy history
+    could have supported, and a faster start means more to dilute away. A
+    30-day global A/B confirmed the sign: wiring this seed into the bsort path
+    deepened the convective precipitation deficit from 20.1 % to 23.3 %. The
+    ``max(0.5, ...)`` floor is ModelE's.
+    """
+    heat_flux = sensible_heat_flux / (surface_density * SHA)     # K m/s
+    moisture_flux = evaporation / surface_density                # kg/kg m/s
+    buoyancy_flux = heat_flux + 0.61 * reference_theta * moisture_flux
+    w_cubed = (GRAV * boundary_layer_height
+               * jnp.maximum(buoyancy_flux, 0.0) / reference_theta)
+    return jnp.maximum(w_cubed ** (1.0 / 3.0), minimum)
+
+
+def cloud_base_closure_mass_flux(temperature: jnp.ndarray,
+                                 specific_humidity: jnp.ndarray,
+                                 pressure: jnp.ndarray,
+                                 air_mass: jnp.ndarray,
+                                 cloud_base: jnp.ndarray,
+                                 boundary_layer_top=None,
+                                 source_dtheta=0.0,
+                                 source_dq=0.0):
+    """Cloud-base plume fraction / mass from the ``MASS_FLUX2`` closure.
+
+    Broadcasting-native wrapper around
+    :func:`~jcm.physics.convection.giss_mass_flux.cloud_base_mass_flux` that
+    builds the three-level cloud-base stencil from full column profiles and a
+    per-column cloud-base index.
+
+    All profile inputs are **surface-first** ``(nlev, ...)`` (index 0 = surface);
+    ``cloud_base`` ``(...)`` is the lifting-condensation-level index (the sentinel
+    ``nlev`` means no cloud base). The stencil spans ``[lmin, lmin+1, lmin+2]``
+    and its source level (index 0) is replaced by the **surface** parcel -- the
+    boundary-layer air that actually feeds the plume.
+
+    The closure level is ``lmin = cloud_base``. This is set by the plume oracle
+    (``modele_patches/`` in the bridge repo): ModelE's ``LMIN`` for the plume that
+    actually fires sits at the LCL or one level above it across the BOMEX
+    periods, never below. The closure is *very* sensitive to this -- on period 47
+    it returns ``fmp2`` of 6.8 / 9.4 / 29.9 kg/m² at ``lmin`` = LCL-1 / LCL / LCL+1
+    -- so evaluating it a level or two low (as ``cloud_base - 1`` did) badly
+    under-computes the cloud-base mass flux.
+
+    Args:
+        temperature: Temperature [K], ``(nlev, ...)``.
+        specific_humidity: Specific humidity [kg/kg], ``(nlev, ...)``.
+        pressure: Pressure [Pa], ``(nlev, ...)``.
+        air_mass: Layer air mass ``dp/g`` [kg/m^2], ``(nlev, ...)``.
+        cloud_base: Cloud-base (LCL) level index per column, ``(...)``.
+
+    Returns:
+        ``(fplume, fmp2)`` -- the plume mass fraction and mass [kg/m^2] per
+        column, ``(...)``; both zero where there is no cloud base.
+
+    """
+    nlev = temperature.shape[0]
+    exner = (pressure / _P_REF) ** KAPA
+    theta = temperature / exner
+
+    fplume, fmp2, _ = cloud_base_mass_flux_column(
+        theta, specific_humidity, air_mass, exner, pressure, cloud_base,
+        boundary_layer_top=boundary_layer_top,
+        source_dtheta=source_dtheta, source_dq=source_dq)
+
+    has_cloud = cloud_base < nlev
+    return jnp.where(has_cloud, fplume, 0.0), jnp.where(has_cloud, fmp2, 0.0)
+
+
+def _environment(state, diagnostics):
+    """Return the (T, q) this term convects, as the terms before it left them.
+
+    ECHAM hands ``cumastr`` the provisional ``ztp1 = ptm1 + ptte*dt``, i.e. the
+    column *after* vertical diffusion and the surface exchange have run
+    (``physc``), and ModelE's ordering is the same -- ``MSTCNV`` is called from
+    ``CLOUDS_DRV`` downstream of the boundary layer. Convection is driven by
+    boundary-layer instability, so reading the step-start state instead means
+    the closure never sees the moisture and heat the surface supplied on this
+    step. ``TiedtkeConvection`` reads the same view for the same reason.
+
+    Only T and q move. Pressure, geopotential and the layer masses stay at
+    their step-start values, as they do for ``TiedtkeConvection``: ``thermo_run``
+    carries no geometry, and the ascent uses the geopotential only through
+    differences (the layer depth and the 1 km lag lookback), so the mismatch is
+    second order against the instability the humidity sets.
+
+    Falls back to the raw state where nothing seeded ``thermo_run``: the single
+    column, the oracle harness and the unit tests, none of which carry it, so
+    the SCM validation is unchanged by this.
+    """
+    thermo_run = diagnostics.get("thermo_run")
+    if thermo_run is None:
+        return state.temperature, state.specific_humidity
+    return thermo_run["temperature"], thermo_run["specific_humidity"]
+
+
+class GissConvection(PhysicsTerm):
+    """GISS ModelE moist convection (``MSTCNV``) as a PhysicsTerm.
+
+    Returns zero tendencies and writes a
+    :class:`~jcm.physics.modele.physics_data.GissConvectionData` under the public
+    ``"convection"`` diagnostics key, populated with the diagnosed ``cloud_base``
+    and closure ``cloud_base_mass_flux`` (the rest zero). ``requires`` is empty:
+    the pressure / layer-mass diagnostics are read *optionally* so the term runs
+    standalone; the tendency-producing chain (which will need them) is not wired
+    in yet. See the module docstring.
+    """
+
+    name: ClassVar[str] = "giss_convection"
+    category: ClassVar[str] = "convection"
+    requires: ClassVar[tuple[str, ...]] = ()
+    # Everything this term reads is read *optionally*, with `.get()`, so that it
+    # still runs as a scaffold when an upstream term has not supplied it -- see
+    # the module docstring for what each absence costs. The column pressure /
+    # layer-mass trio is needed for any tendency at all; the rest degrade the
+    # closure rather than disable it.
+    optional_requires: ClassVar[tuple[str, ...]] = (
+        "pressure_full", "layer_thickness", "air_density", "height_full",
+        "surface", "boundary_layer_height", "mixed_layer_top",
+        "cold_pool_fraction", "penetrative_mass", "melting_pressure",
+        "convective_cloud_top_pressure",
+        # Read only for its `pbl_height`, and only when no term published
+        # `boundary_layer_height` directly -- which is every preset. See
+        # `_boundary_layer_height`.
+        "vertical_diffusion",
+    )
+    provides: ClassVar[tuple[str, ...]] = ("convection",)
+
+    def __init__(
+        self,
+        params: GissConvectionParameters | None = None,
+        allow_mc: bool = False,
+        bsort: bool = True,
+    ):
+        """Hold scheme parameters and the static moist-convection switch.
+
+        Args:
+            params: Float-valued, differentiable parameters held as an
+                ``nnx.Param`` so gradients flow through them once the tendency
+                path lands.
+            allow_mc: Static switch mirroring ModelE ``SCMopt%allowMC``. When
+                ``True`` the full convective tendency chain runs (see
+                :meth:`_convective_tendencies`); when ``False`` (default) the term
+                only *diagnoses* cloud base + mass flux and returns zero
+                tendencies. It is a plain (non-differentiable) attribute -- a
+                trace-time code-path switch, so it is read with a Python ``if``.
+            bsort: Which scheme the ``allow_mc`` path runs. ``True`` (default)
+                uses the buoyancy-sorting port -- the plume spectrum ModelE
+                actually runs, with its downdraft and substepped subsidence.
+                ``False`` falls back to the earlier single entraining plume in
+                :mod:`giss_plume`, which is kept only so the two can be compared
+                against the same oracle. Static, like ``allow_mc``.
+
+        """
+        self.params = nnx.Param(params or GissConvectionParameters.default())
+        self.allow_mc = allow_mc
+        self.bsort = bsort
+
+    def __call__(
+        self,
+        state: PhysicsState,
+        diagnostics: dict,
+        forcing: ForcingData,
+        terrain: TerrainData,
+    ) -> tuple[PhysicsTendency, dict]:
+        """Compute GISS convective tendencies (or just diagnose, if ``allow_mc``).
+
+        Always diagnoses ``cloud_base`` + ``cloud_base_mass_flux``. If
+        ``allow_mc`` is set, also runs the full chain (plume ascent ->
+        compensating subsidence -> ``dth_mc``/``dq_mc``) and returns real
+        temperature/humidity tendencies; otherwise returns zero tendencies. The
+        tendency path is **not magnitude-validated** (the plume over-penetrates;
+        see the module docstring), which is why it is off by default.
+
+        Args:
+            state: Column-vectorized ``PhysicsState`` (``(nlev, ncols)``).
+            diagnostics: Forward-flowing diagnostics; ``pressure_full`` [Pa],
+                ``layer_thickness`` [m], ``air_density`` [kg/m^3] are read when
+                present (all three are required for the tendency path).
+            forcing: Boundary-condition forcing (unused).
+            terrain: Terrain boundary conditions (unused).
+
+        Returns:
+            ``(PhysicsTendency, diagnostics)`` with the ``GissConvectionData``
+            (``cloud_base``, ``cloud_base_mass_flux``, and -- under ``allow_mc`` --
+            ``dth_mc``/``dq_mc``) under ``"convection"``.
+
+        """
+        dtsrc = self.params.get_value().dtsrc
+        shape = state.temperature.shape          # (nlev, ncols) in column mode
+        nlev = shape[0]
+        nodal_shape = shape[1:]
+
+        (cloud_base, fmp2, closure_base, boundary_layer_top, second_closure,
+         base_profile, candidate_closure) = self._diagnose(
+             state, diagnostics, nlev, nodal_shape)
+
+        if self.allow_mc and self.bsort:
+            (dtemp_dt, dq_dt, dth_mc, dq_mc, mcp, d_qc,
+             d_qi) = self._bsort_tendencies(
+                 state, diagnostics, closure_base, fmp2, boundary_layer_top,
+                 nlev, nodal_shape, dtsrc, second_closure, base_profile,
+                 candidate_closure)
+        elif self.allow_mc:
+            dtemp_dt, dq_dt, dth_mc, dq_mc = self._convective_tendencies(
+                state, diagnostics, cloud_base, fmp2, nlev, nodal_shape, dtsrc)
+            # The single-plume fallback has no microphysics of its own to
+            # account the rain with, so it reports no precipitation -- and no
+            # buoyancy sort, so nothing detrains as condensate either.
+            mcp = jnp.zeros(nodal_shape)
+            d_qc = jnp.zeros(shape)
+            d_qi = jnp.zeros(shape)
+        else:
+            # Convection off: zero tendencies. Multiplying by dtsrc*0 keeps the
+            # parameter in the trace so nnx.grad has a defined gradient path.
+            dtemp_dt = jnp.zeros(shape) * dtsrc * 0.0
+            dq_dt = jnp.zeros(shape)
+            dth_mc = jnp.zeros((nlev,) + nodal_shape)
+            dq_mc = jnp.zeros((nlev,) + nodal_shape)
+            mcp = jnp.zeros(nodal_shape)
+            d_qc = jnp.zeros(shape)
+            d_qi = jnp.zeros(shape)
+
+        # The detrained condensate is returned as a qc/qi tracer tendency, so
+        # the operator-split sum carries it into the prognostic condensate the
+        # way every other tendency is carried, and is published separately
+        # below for the cloud scheme. Only where the host actually carries the
+        # condensate tracers: on a stack without them (the idealised and
+        # SPEEDY compositions) there is nowhere to put it.
+        tracers = {}
+        if "qc" in state.tracers:
+            tracers["qc"] = d_qc
+        if "qi" in state.tracers:
+            tracers["qi"] = d_qi
+        tendency = PhysicsTendency.zeros(shape).copy(
+            temperature=dtemp_dt, specific_humidity=dq_dt)
+        if tracers:
+            tendency = tendency.copy(
+                tracers={**tendency.tracers, **tracers})
+        convection = GissConvectionData.zeros(nodal_shape, nlev).copy(
+            cloud_base=cloud_base, cloud_base_mass_flux=fmp2,
+            # Flipped into the frame the state uses, which is the frame every
+            # other published field is in. The plume code works in ModelE's
+            # own frame (`L=1` at the ground) and returns `dth_mc`/`dq_mc`
+            # there, while `dtemp_dt` and `d_qc` are already flipped back at
+            # their own returns. Published unflipped these two land upside
+            # down in the output -- a deep plume's heating maximum appears in
+            # the mesosphere and the troposphere reads as exactly zero, which
+            # is how this was found. The tendency the model integrates never
+            # went through here, so only the diagnostic was ever wrong.
+            dth_mc=jnp.flip(dth_mc, axis=0),
+            dq_mc=jnp.flip(dq_mc, axis=0), mcp=mcp,
+            # The same rain as a flux, which is what the rest of jcm reads:
+            # `EchamSurfaceExchange` sums it into the total surface
+            # precipitation. 1 mm of water is 1 kg/m^2.
+            #
+            # `precip_conv_snow` is left at the zero `zeros()` gave it, and
+            # that is deliberate: the melting/freezing block that would give
+            # the falling flux a snow phase is outside the ported descent
+            # (`giss_downdraft`), so this scheme has no snow to report and
+            # `surface_rain_and_snow` routes all of it as rain. See the field's
+            # own docstring in `GissConvectionData`.
+            precip_conv=mcp / 86400.0)
+
+        out = {**diagnostics, "convection": convection}
+
+        # ModelE's `detrQC`/`detrNc` are arguments to `LSCOND`, its stratiform
+        # scheme (`MSTCNV.F90:124-125`), not an addition to the environment's
+        # vapour. The same handoff here is `clouds.conv_detrainment_qc`/`_qi`,
+        # which `jcm.physics.clouds.cloud_inputs.cloud_scheme_inputs` takes out
+        # of the running condensate tendency and passes to the cloud scheme by
+        # itself, as ECHAM passes `pxtecl`/`pxteci`. `TiedtkeConvection`
+        # publishes the same two fields from the same place in its own call.
+        #
+        # Without this the fields stayed at the zero the cover term resets them
+        # to: a `physics=echam-giss-conv` run detrained no condensate anywhere
+        # on the globe, and the water went nowhere at all.
+        # `dtsrc` is ModelE's own step, which is what every rate this term
+        # returns is divided by; `_dt_seconds` is the step the host will
+        # actually apply those rates over. They are the same 1800 s in the
+        # configurations validated here, but the provisional condensate and
+        # `thermo_run` below have to be advanced by the increment the
+        # prognostic state will really receive, which is the host's -- the same
+        # `diagnostics["_dt_seconds"]` `TiedtkeConvection` uses.
+        dt_host = diagnostics.get("_dt_seconds", dtsrc)
+        if "clouds" in out:
+            cloud = out["clouds"]
+            out["clouds"] = cloud.copy(
+                qc=jnp.maximum(cloud.qc + d_qc * dt_host, 0.0),
+                qi=jnp.maximum(cloud.qi + d_qi * dt_host, 0.0),
+                conv_detrainment_qc=d_qc,
+                conv_detrainment_qi=d_qi)
+
+        # This term changes T, q and the condensate before the cloud
+        # microphysics runs, so the running thermodynamic view has to carry its
+        # effect or the cloud scheme's saturation balance condenses against the
+        # pre-convection column. The pattern is
+        # `moist_air_state.advance_thermo_run`'s "any opt-in pre-cloud term";
+        # Tiedtke is the other one.
+        out = advance_thermo_run(
+            out, dt_host,
+            d_temperature=dtemp_dt,
+            d_specific_humidity=dq_dt,
+            d_qc=d_qc,
+            d_qi=d_qi)
+        return tendency, out
+
+    def _bsort_tendencies(self, state, diagnostics, closure_base, fmp2,
+                          boundary_layer_top, nlev, nodal_shape, dtsrc,
+                          second_closure=False, base_profile=None,
+                          candidate_closure=None):  # noqa: D401
+        """Convective tendencies from the buoyancy-sorting port.
+
+        Hands the column to
+        :func:`~jcm.physics.convection.giss_plume_driver.convective_column`,
+        which runs the plume, its downdraft and the substepped compensating
+        subsidence, and carries the environment between plumes. Works
+        **surface-first** and flips the result back for the ``PhysicsTendency``.
+
+        Two conversions matter. ``MSTCNV`` works in ``th = theta/1000**kappa``
+        against ``plk = (p in mb)**kappa``, so the potential temperature handed
+        in and the tendency handed back are both scaled; and geopotential
+        becomes height by dividing out gravity, where only differences are used
+        so the datum cancels.
+
+        Scope: ``_MAX_PLUME_CANDIDATES`` bases, counting down from the
+        displacement top, which is ModelE's own descending sweep truncated.
+        The closure is re-run at each candidate against the column the
+        previous plumes have left, so the sweep is sequential as ModelE's is
+        and not a set of independent plumes added together.
+
+        Needs ``pressure_full``/``layer_thickness``/``air_density``; without
+        them returns zeros.
+
+        Returns:
+            ``(dT/dt [K/s], dq/dt [kg/kg/s])`` top-first, the
+            ``(dth_mc, dq_mc)`` surface-first per-step diagnostics in the
+            conventional potential temperature and kg/kg the rest of the term
+            reports, and ``mcp``, the surface convective precipitation rate
+            [mm/day] the plume sequence produced.
+
+        """
+        shape = state.temperature.shape
+        pressure_full = diagnostics.get("pressure_full")
+        thickness = diagnostics.get("layer_thickness")
+        density = diagnostics.get("air_density")
+        if pressure_full is None or thickness is None or density is None:
+            zero2d = jnp.zeros(shape)
+            zero3d = jnp.zeros((nlev,) + nodal_shape)
+            return (zero2d, zero2d, zero3d, zero3d, jnp.zeros(nodal_shape),
+                    zero2d, zero2d)
+
+        env_t, env_q = _environment(state, diagnostics)
+        p = jnp.flip(pressure_full, axis=0)
+        t = jnp.flip(env_t, axis=0)
+        q = jnp.flip(env_q, axis=0)
+        layer_mass = jnp.flip(density, axis=0) * jnp.flip(thickness, axis=0)
+        # `zl = gz*bygrav` (ATM_UTILS.f:874). Only differences are used -- the
+        # layer depth and the 1 km lag lookback -- so the datum does not matter.
+        height = jnp.flip(state.geopotential, axis=0) / GRAV
+
+        exner_modele = (p / 100.0) ** KAPA
+        theta_modele = t / exner_modele
+
+        levels = jnp.arange(nlev).reshape((nlev,) + (1,) * len(nodal_shape))
+        base = jnp.clip(closure_base, 1, nlev - 3)
+        # The sweep's cloud-base masses: the closure run at every candidate
+        # from the displacement top down, not only at the one base the port
+        # used to model. Falls back to the single base where the profile is not
+        # available (the scaffold paths).
+        cloud_base_mass = (jnp.where(levels == base, fmp2, 0.0)
+                           if base_profile is None else base_profile)
+        # `dcl` comes from the turbulence scheme in ModelE (`smixlev`); with no
+        # such diagnostic the layer below the plume's root is the best stand-in,
+        # and it is what bounds both the source draw and the downdraft.
+        blt = base - 1 if boundary_layer_top is None else boundary_layer_top
+        # The plume's own source parcel is drawn from `smo1` too, so it carries
+        # the same surface-flux enhancement the closure saw.
+        _, source_dtheta, source_dq = self._source_parcel_inputs(
+            diagnostics, q, jnp.flip(density, axis=0)[0], nlev)
+
+        # The cloud-base updraft seed, which ModelE takes from its own boundary
+        # layer as `wbases = max(0.5, wturb)` (MSTCNV.F90:~2807). Until this was
+        # wired, `convective_column` fell through to its own
+        # `_CLOUD_BASE_VELOCITY = 0.5` on every call, so the scale was dead code
+        # for the only path that runs: `_plume_seed` has one other caller,
+        # `_convective_tendencies`, which is the `allow_mc and not bsort`
+        # fallback.
+        #
+        # It is wired because ModelE seeds from its own boundary layer and its
+        # dumps put that seed at a median 0.567 m/s on both single-column
+        # cases, above the 0.5 floor -- fidelity to the reference, not a tuning
+        # choice. It does **not** improve the global bias: a 30-day A/B took
+        # the convective precipitation deficit from 20.1% to 23.3%, because in
+        # this closure a faster seed *raises* entrainment rather than lowering
+        # it (`giss_bsort.entrainment_rate`, and see
+        # `convective_velocity_scale` for the two paths' opposite signs).
+        #
+        # `theta_env` must be a REAL potential temperature here: the scale
+        # divides the buoyancy flux by it and scales the moisture flux by
+        # 0.61*theta. `theta_modele` a few lines below references `p/100`
+        # instead of `p/_P_REF` and so runs `_MODELE_THETA_SCALE` ~ 9.1 times
+        # larger, which would silently mis-set every seed. It is rebuilt on the
+        # SI Exner rather than reused.
+        #
+        # Only the velocity is taken. `_plume_seed` also returns the
+        # boundary-layer blend of theta and q, but the sort builds its own
+        # source parcel per candidate base inside `convective_column`, so those
+        # two would be the wrong parcel for it; the duplicated blend is one
+        # weighted sum.
+        _, _, cloud_base_velocity = self._plume_seed(
+            diagnostics, t / ((p / _P_REF) ** KAPA), q, layer_mass, nlev)
+
+        # `qcl + qci`, the environment's own cloud condensate. It loads the
+        # environment's virtual temperature in the downdraft's buoyancy test
+        # (`svm1`, MSTCNV.F90:4573), so omitting it makes the environment look
+        # lighter than it is and the downdraft correspondingly less likely to
+        # detrain. Read from the state tracers the way
+        # `clouds.cloud_data.radiation_cloud_fields` does, and zero where no
+        # cloud scheme has populated them.
+        #
+        # Invisible on BOMEX -- `qcl + qci` is identically zero on every oracle
+        # level and every step -- which is why it went unwired: the single
+        # validation case cannot distinguish the two. It matters wherever there
+        # is stratiform cloud.
+        environment_condensate = jnp.flip(
+            state.tracers.get("qc", jnp.zeros_like(state.temperature))
+            + state.tracers.get("qi", jnp.zeros_like(state.temperature)),
+            axis=0)
+
+        column = convective_column(
+            potential_temperature=theta_modele,
+            specific_humidity=q,
+            layer_mass=layer_mass,
+            exner=exner_modele,
+            pressure=p,
+            height=height,
+            cloud_base_mass=cloud_base_mass,
+            boundary_layer_top=blt,
+            highest_base=base,
+            timestep=dtsrc,
+            environment_condensate=environment_condensate,
+            source_dtheta=source_dtheta,
+            source_dq=source_dq,
+            # A `closure2` plume runs as the *less*-entraining plume with an
+            # efficiency set by its cloud-base pressure and the cold-pool
+            # fraction, not by the `bsort_enteff(2)` constant. On BOMEX and
+            # RICO `closure2` never fires, so both of these reduce to the
+            # constants the port used before and those cases are untouched.
+            entrainment_efficiency=entrainment_efficiency(
+                base_pressure=jnp.sum(
+                    jnp.where(levels == base, p, 0.0), axis=0),
+                cold_pool_fraction=diagnostics.get("cold_pool_fraction", 0.0),
+                second_closure=second_closure),
+            iplume=jnp.where(second_closure, 1, 2),
+            max_plumes=_MAX_PLUME_CANDIDATES,
+            # Re-runs the closure per candidate against the environment the
+            # sweep has already modified, which is where ModelE calls it from
+            # (MSTCNV.F90:1535, inside the base loop whose plumes write back at
+            # `:2454`). `cloud_base_mass` above is then only the fallback for
+            # the paths that have no closure to hand.
+            cloud_base_closure_fn=candidate_closure,
+            cloud_base_velocity=cloud_base_velocity,
+            max_overshoot_dt=self.params.get_value().max_dt_overshoot)
+
+        dth_mc = safe_divide(column.heat, layer_mass) * _MODELE_THETA_SCALE
+        dq_mc = safe_divide(column.water, layer_mass)
+        exner = (p / _P_REF) ** KAPA
+        dtemp_dt = jnp.flip(dth_mc * exner / dtsrc, axis=0)
+        dq_dt = jnp.flip(dq_mc / dtsrc, axis=0)
+        # `condpr` is the rain each *level* shed, summed over the sweep's
+        # plumes, so the column's surface flux is the sum over levels
+        # [kg/m^2 per step]. The oracle's `mcp` is a rate in mm/day and
+        # 1 kg/m^2 of water is 1 mm, so the step accumulation becomes a rate
+        # by dividing out `dtsrc` and scaling to a day.
+        #
+        # `condpr` is rain *produced*; what ModelE reports as `mcp` is what
+        # survives the fall, so the rain the clear air evaporates back into the
+        # environment has to come off. The driver accounts it per plume as
+        # `dqm_evp` and `convective_column` sums it over the sweep. Clamped at
+        # zero because the two are accumulated independently and nothing
+        # guarantees the difference stays positive in a column that produced
+        # almost no rain.
+        #
+        # **Both** evaporation terms come off, because ModelE's surface
+        # precipitation is a falling flux that is depleted on the way down:
+        # `prcpmc = prcpmc + prcp_d + prcp_e` accumulated inside the downdraft
+        # descent (MSTCNV.F90:5154-5155), with `condpr(l)` added where
+        # `l >= lcl` and the flux evaporating at every level below
+        # (MSTCNV.F90:5087-5097). Verified against the oracle: `prcpd + prcp_e`
+        # from the lowest descent row of each plume reproduces ModelE's own
+        # `mcp` to a median ratio of 1.0020 over the 223 active TWP-ICE periods.
+        #
+        # Where ModelE's falling rain goes, as a fraction of what it produced:
+        #
+        #   case      into the downdraft   into clear air   delivered
+        #   BOMEX           69.5%              9.7%           20.7%
+        #   TWP-ICE         36.0%              3.5%           63.3%
+        #
+        # so the **downdraft is the dominant sink** -- 98% of the depletion on
+        # TWP-ICE -- and netting only the clear-air term left the port
+        # delivering 95.7% of its production against ModelE's 63.3%, i.e. 1.376x
+        # ModelE's surface rain with 40 of 223 periods over 3x.
+        #
+        # An earlier version of this comment said netting the downdraft term as
+        # well "takes BOMEX to 0.29x ModelE's `mcp`" and kept it out. That is
+        # not what the oracle shows: ModelE delivers only 20.7% on BOMEX, the
+        # port's own downdraft evaporation there is 69.2% of production against
+        # ModelE's 69.5% -- a ratio of 1.00 -- and netting it lands the port at
+        # 21.4% delivered. Netting is what makes BOMEX right.
+        #
+        # The netted term is the right size. An earlier reading put it at
+        # "0.46x ModelE's on TWP-ICE" and left a magnitude error open; that
+        # compared the port over the first 60 active periods with ModelE over
+        # all 223, and TWP-ICE's rain is concentrated in the later monsoon
+        # burst. Measured over the same 251 periods the port evaporates 40.9%
+        # of its production into the downdraft against ModelE's 44.3%, and
+        # replaying ModelE's own per-level shaft through `downdraft_descent`
+        # reproduces its `dqevp` to **1.0002** over 1031 TWP-ICE downdrafts
+        # (1.0000 on all 52 of BOMEX's). So the 0.923 surface ratio that
+        # reconstructing the flux left was the production deficit showing
+        # through, not an undersized sink. See section 128 of
+        # `BSORT_PORT_PLAN.md` in the bridge, and the replay test that
+        # pins it there.
+        #
+        # The flux is therefore read off the descent rather than reconstructed
+        # from the sums. Reconstructing it as `produced - evaporated` loses a
+        # source: the falling flux is also fed by `wmdnl`, the condensate the
+        # buoyancy sort carries into the downdraft (`prcp_d = prcp_d + wmdnl(l)`,
+        # MSTCNV.F90:4738), which never enters `condpr`. ModelE's own budget
+        # closes only with it -- on BOMEX `condpr + wmdnl - dqevp - dqm_evp` is
+        # 0.9142 mm/day against its reported 0.911, where dropping `wmdnl`
+        # leaves 0.3008 -- and `wmdnl` is 42% of BOMEX's production and 7% of
+        # TWP-ICE's, so the reconstruction was short by that much.
+        #
+        # `column.surface_precipitation` is the descent's own `prcp_d + prcp_e`
+        # where it runs out of column beneath it, summed over the sweep's
+        # plumes: the same quantity `prcpmc` accumulates, and conservative by
+        # construction rather than as the difference of three separate sums.
+        mcp = column.surface_precipitation / dtsrc * 86400.0
+        # `detrQC`, the condensate the plumes hand to the environment as cloud
+        # (`MSTCNV.F90:2294`). Extensive per level, so `/layer_mass` makes it a
+        # mixing ratio and `/dtsrc` a rate, and the flip puts it in the
+        # top-first frame the rest of `jcm` uses -- the same two conversions
+        # `dq_dt` gets just above.
+        #
+        # This water is NOT in `dq_mc`: it left the plume as condensate, not
+        # vapour, so nothing downstream sees it unless the term publishes it.
+        # Dropping it lost 27% of what the plumes condense on BOMEX and 13% on
+        # TWP-ICE (`dwm` in `sweep_state_diag.txt`), which is a hole in the
+        # column's water budget rather than a bias in a rate.
+        d_qc = jnp.flip(safe_divide(column.detrained_liquid, layer_mass)
+                        / dtsrc, axis=0)
+        d_qi = jnp.flip(safe_divide(column.detrained_ice, layer_mass)
+                        / dtsrc, axis=0)
+        return dtemp_dt, dq_dt, dth_mc, dq_mc, mcp, d_qc, d_qi
+
+    def _convective_tendencies(self, state, diagnostics, cloud_base, fmp2,
+                               nlev, nodal_shape, dtsrc):
+        """Full convective tendencies via the ported chain (the ``allow_mc`` path).
+
+        Assembles: closure ``fmp2`` -> full-column entraining plume ascent
+        (:func:`~jcm.physics.convection.giss_plume.plume_ascent_column`, launched
+        at the traced cloud base) -> compensating subsidence + detrainment
+        deposition (:func:`~jcm.physics.convection.giss_tendencies.convective_tendencies`)
+        for potential temperature and specific humidity. Works **surface-first**
+        internally (the GISS routines' convention) and flips the result back to
+        the JCM top-first state for the ``PhysicsTendency``.
+
+        NOT magnitude-validated: the plume over-penetrates the trade inversion, so
+        the tendencies are structurally sensible (heating/moistening in the cloud
+        layer) but their magnitude and vertical shape are not yet trustworthy.
+
+        Needs ``pressure_full``/``layer_thickness``/``air_density``; without them
+        returns zeros.
+
+        Returns:
+            ``(dT/dt [K/s], dq/dt [kg/kg/s])`` top-first, and ``(dth_mc, dq_mc)``
+            surface-first per-step diagnostics.
+
+        """
+        shape = state.temperature.shape
+        pressure_full = diagnostics.get("pressure_full")
+        thickness = diagnostics.get("layer_thickness")
+        density = diagnostics.get("air_density")
+        if pressure_full is None or thickness is None or density is None:
+            zero2d = jnp.zeros(shape)
+            zero3d = jnp.zeros((nlev,) + nodal_shape)
+            return zero2d, zero2d, zero3d, zero3d
+
+        # Surface-first environment (JCM state is top-first); humidity g/kg->kg/kg.
+        env_t, env_q = _environment(state, diagnostics)
+        p = jnp.flip(pressure_full, axis=0)
+        t = jnp.flip(env_t, axis=0)
+        q = jnp.flip(env_q, axis=0)
+        phi = jnp.flip(state.geopotential, axis=0)
+        dz = jnp.flip(thickness, axis=0)
+        air_mass = jnp.flip(density, axis=0) * dz
+        exner = (p / _P_REF) ** KAPA
+        theta_env = t / exner
+
+        # Cloud-base source parcel. The plume is seeded with the **same** parcel
+        # the closure is built on: the mass-weighted boundary-layer blend plus
+        # the surface-flux enhancement, lifted to cloud base. Seeding instead
+        # with raw surface air re-saturated at cloud base discards the parcel's
+        # moisture excess -- the very water whose condensation warms the plume --
+        # so it starts marginally (often negatively) buoyant, entrains hard
+        # (``eps ~ B/w^2``) and dies early. Validated against the plume oracle:
+        # this moves the BOMEX cloud top from 10/10/15/15 to 15/15/16/16 for
+        # periods 12/24/36/47, against ModelE's 16/17/18/20.
+        cb = jnp.clip(cloud_base, 0, nlev - 1)
+
+        def at_base(a):
+            return jnp.take_along_axis(a, cb[None, ...], axis=0)[0]
+
+        theta_source, q_source, w_base = self._plume_seed(
+            diagnostics, theta_env, q, air_mass, nlev)
+        t_base = theta_source * at_base(exner)
+
+        # Relax the closure mass flux over the cloud-base adjustment timescale
+        # (MSTCNV line 2769): only the fraction of the neutralising mass flux
+        # that fits in one physics step is applied. The `cloud_base_mass_flux`
+        # diagnostic stays the raw (pre-relaxation) closure value.
+        m_base = fmp2 * jnp.minimum(1.0, dtsrc / _TADJ_SECONDS)
+
+        parcel_t, _cond, _buoy, mass_flux, det, _top = plume_ascent_column(
+            cloud_base, t_base, q_source, at_base(phi),
+            w_base, m_base, t, q, phi, p, dz, air_mass,
+            contce=_CONTCE)
+
+        # The plume profiles are zero outside the live cloud; use the environment
+        # there so qsat/theta stay finite (they are multiplied by a zero mass flux
+        # / zero detrainment anyway, but NaN*0 = NaN in JAX, so guard the inputs).
+        parcel_t_safe = jnp.where(parcel_t > 1.0, parcel_t, t)
+        theta_plume = parcel_t_safe / exner
+        # Detrained moisture is the plume's **total** water: its in-cloud vapour
+        # plus the condensate it carries, which evaporates into the (subsaturated)
+        # environment. Depositing only the vapour leaves the condensate with
+        # nowhere to go, so the scheme loses water.
+        q_plume = saturation_specific_humidity(parcel_t_safe, p) + _cond
+
+        dth_mc = convective_tendencies(mass_flux, theta_plume, det, dz,
+                                       theta_env, air_mass)
+        dq_mc = convective_tendencies(mass_flux, q_plume, det, dz, q, air_mass)
+
+        # Per-step changes -> per-second rates; potential-temperature change ->
+        # temperature change (x Exner). Flip back to JCM top-first for the state.
+        dT_dt = jnp.flip(dth_mc * exner / dtsrc, axis=0)
+        dq_dt = jnp.flip(dq_mc / dtsrc, axis=0)
+        return dT_dt, dq_dt, dth_mc, dq_mc
+
+    def _diagnose(self, state, diagnostics, nlev, nodal_shape):
+        """Cloud base + closure mass flux per column (surface-first).
+
+        Reads ``pressure_full`` (and, for the mass flux, ``layer_thickness`` /
+        ``air_density``) from the diagnostics dict. Profiles are flipped to
+        surface-first for the ported GISS routines. Without a pressure profile
+        the term degrades to the pure scaffold (sentinel cloud base, zero mass
+        flux); without the layer-mass diagnostics the cloud base is still
+        diagnosed but the mass flux is zero.
+        """
+        pressure_full = diagnostics.get("pressure_full")
+        if pressure_full is None:
+            sentinel = jnp.full(nodal_shape, nlev, dtype=int)
+            return (sentinel, jnp.zeros(nodal_shape), sentinel, None,
+                    False, None, None)
+
+        # Surface-first profiles (JCM state is top-first); humidity g/kg -> kg/kg.
+        env_t, env_q = _environment(state, diagnostics)
+        p_sf = jnp.flip(pressure_full, axis=0)
+        t_sf = jnp.flip(env_t, axis=0)
+        q_sf = jnp.flip(env_q, axis=0)
+
+        cloud_base, _ = lifting_condensation_level(t_sf[0], p_sf[0], q_sf[0], p_sf)
+
+        thickness = diagnostics.get("layer_thickness")
+        density = diagnostics.get("air_density")
+        if thickness is None or density is None:
+            return (cloud_base, jnp.zeros(nodal_shape), cloud_base, None,
+                    False, None, None)
+
+        air_mass = jnp.flip(density, axis=0) * jnp.flip(thickness, axis=0)
+        blt, dtheta, dq = self._source_parcel_inputs(
+            diagnostics, q_sf, jnp.flip(density, axis=0)[0], nlev)
+
+        # The plume is rooted at `lmax_disp`, the highest level a
+        # boundary-layer parcel can be displaced to (see
+        # :func:`~jcm.physics.convection.giss_plume_driver.displacement_top`).
+        # ModelE's descending sweep rejects every candidate above it -- their
+        # source collapses to one layer and must pass a TKE test it fails in an
+        # undisturbed column -- so the sweep converts at exactly that level:
+        # `LMIN == lmax_disp` on 48 of the 52 BOMEX plumes, `<=` on all 52.
+        #
+        # This previously used `dcl + 1`, an offset fitted to the same oracle.
+        # It agrees with `lmax_disp` wherever one level clears the displacement
+        # and disagrees where the boundary layer is deeper (at `dcl = 7` the
+        # rule gives `dcl + 2`).
+        #
+        # The closure is very level-sensitive, so this matters: on period 47 it
+        # returns 28 / 85 / 82 kg/m^2 at dcl / dcl+1 / dcl+2 against ModelE's 71.
+        # Deriving the level from where the source parcel saturates does *not*
+        # work: that rule only tracked `LMIN` because it was calibrated against a
+        # post-convection (too dry) state, and it moves the wrong way once the
+        # state is corrected, since a moister parcel saturates lower.
+        #
+        # The *reported* ``cloud_base`` stays the surface-parcel LCL, which is the
+        # quantity validated against ModelE's ``cldmc`` (47/48 exact).
+        # `melting_pressure`/`cloud_top_pressure` drive ModelE's *second*
+        # displacement, which is what selects the base on a deep column: the
+        # sweep converts at `lmax_disp2` on 99% of TWP-ICE steps against 64% for
+        # `lmax_disp1`. They are optional because `pmct` is prognostic -- a
+        # running cloud top with a two-hour constant -- and without them the
+        # second displacement is zero, which is the right answer for a column
+        # whose cloud top sits below the threshold (every BOMEX step).
+        second_closure = False
+        if blt is None:
+            closure_base = cloud_base
+            # No displacement without a boundary-layer top, so the two tops
+            # coincide and the gap between them is empty.
+            first_top = closure_base
+        else:
+            top, second_closure, first_top = displacement_top(
+                air_mass, p_sf, blt, jnp.asarray(nlev - 3, dtype=int),
+                melting_pressure=diagnostics.get("melting_pressure"),
+                cloud_top_pressure=diagnostics.get(
+                    "convective_cloud_top_pressure"),
+                return_second_closure=True)
+            closure_base = jnp.clip(top, 0, nlev - 3)
+
+        if self.bsort:
+            # `MASS_FLUX2` blends the source over `lmin0..lmin` rather than
+            # taking it from one layer, and works in ModelE's `th`/`plk` pair.
+            # The single-source form the other branch uses is the `nlpi = 1`
+            # special case, which this configuration never takes.
+            plk = (p_sf / 100.0) ** KAPA
+            theta_modele = t_sf / plk
+            lmin0 = source_bottom(p_sf, closure_base)
+            bl_top = closure_base - 1 if blt is None else blt
+            fpi = source_weights(air_mass, lmin0, closure_base, bl_top)
+            # `MASS_FLUX2` runs on `smo1`/`qmo1`, which are the environment
+            # *after* the surface-flux enhancement, so the closure gets the
+            # boosted source rather than the raw column.
+            theta_src, q_src = enhanced_source(
+                theta_modele, q_sf, plk, bl_top, dtheta, dq)
+            # A closure2 plume relaxes over `tadjmc(2)` rather than
+            # `tadjmc(1)`; the two differ by a factor of two in the resulting
+            # mass flux at this timestep, so the base and its timescale have to
+            # be chosen together.
+            tadj = jnp.where(second_closure, _TADJ_CLOSURE2_SECONDS,
+                             _TADJ_SECONDS)
+            _, fmp2, _ = cloud_base_closure(
+                theta_src, q_src, air_mass, plk, p_sf, lmin0, closure_base,
+                fpi, timestep=self.params.get_value().dtsrc,
+                adjustment_time=tadj)
+            has_cloud = cloud_base < nlev
+            fmp2 = jnp.where(has_cloud, fmp2, 0.0)
+
+            # The two limiters `MASS_FLUX2` leaves to its caller
+            # (`MSTCNV.F90:2956-2964`) apply to *this* `fmp2` as well, not only
+            # to the swept candidates below. `candidate_closure` applies them
+            # to the mass it hands each candidate, but the value returned from
+            # here -- which is what `_bsort_tendencies` and
+            # `_convective_tendencies` actually run the plume on -- came
+            # straight from the closure with only the `dtsrc/tadj` factor on
+            # it, so on a `closure2` base the `mwpen` floor never reached the
+            # plume. Measured on TWP-ICE: the floored value reproduces ModelE's
+            # dumped `fmp2` exactly where it binds (100.0000, 96.8196, 90.2650
+            # against 38.98, 27.15, 38.96 unfloored), and the heating was short
+            # by a matching factor, so the term was genuinely running on the
+            # unlimited mass rather than merely reporting it.
+            #
+            # `closure_base` is the second displacement top wherever one
+            # exists -- checked against `sweep_diag.txt`'s `lmax_disp2` on
+            # every TWP-ICE period sampled -- so `second_closure` is already
+            # ModelE's `lmin .eq. lmax_disp2 .and. lmax_disp2 .gt. lmax_disp1`
+            # for this base and no separate level test is needed here.
+            penetrative = diagnostics.get("penetrative_mass", 0.0)
+            fmp2 = jnp.where(
+                second_closure,
+                jnp.minimum(jnp.maximum(penetrative, fmp2), _CLOSURE_MASS_CAP),
+                fmp2)
+            # Half of each drawn source layer's own air mass. Layers with zero
+            # weight cannot bind and their division is skipped rather than
+            # producing an infinity.
+            drawn_main = fpi > 0.0
+            fmp2 = jnp.minimum(fmp2, jnp.min(
+                jnp.where(drawn_main,
+                          0.5 * air_mass / jnp.where(drawn_main, fpi, 1.0),
+                          jnp.inf), axis=0))
+            fmp2 = jnp.where(has_cloud, fmp2, 0.0)
+
+            # ModelE's sweep does not stop at its first success: a base that
+            # yields nothing is skipped (`cycle cloud_base`) and the descent
+            # continues, so several bases can convert in one timestep -- a
+            # median of 2 on TWP-ICE against 1.08 on BOMEX. Where ModelE
+            # converts at one base the port already matches peak heating to
+            # 1.003; where it converts at two the port's own plume is right and
+            # the heating is low by 15% because the second plume is missing.
+            #
+            # So the closure runs at every candidate from `closure_base` down to
+            # the boundary-layer top, and the result is a *profile* of
+            # cloud-base masses rather than one value. Only the base ModelE
+            # reached through the second displacement carries `tadjmc(2)`; the
+            # rest relax over `tadjmc(1)`.
+            boundary_layer_floor = (jnp.asarray(0) if blt is None
+                                    else jnp.asarray(blt))
+            level_index = jnp.arange(nlev).reshape(
+                (nlev,) + (1,) * len(nodal_shape))
+
+            def candidate_closure(env_theta, env_q, candidate):
+                """``mplume`` at one candidate base, for a given environment.
+
+                Takes the environment as arguments rather than closing over the
+                incoming column, because ModelE runs this from inside its base
+                loop -- after the previous plume's tendencies have been written
+                back -- so each candidate sees a column the plumes above it
+                have already dried. `convective_column` threads its carried
+                environment through here for exactly that reason.
+                """
+                # ModelE's sweep runs `do lmin = lmin_start, lmin_stop` with
+                # `lmin_stop = dcl`, so the boundary-layer top is **included**.
+                # A strict `>` here drops the only candidate whenever the
+                # displacement top coincides with `dcl`, which silences the
+                # column entirely -- period 300 of TWP-ICE is one.
+                #
+                # And every base strictly between the two displacement tops is
+                # skipped outright: `if(lmin.gt.lmax_disp1 .and.
+                # lmin.lt.lmax_disp2) cycle` (MSTCNV.F90:1489). Without it the
+                # port converts at bases ModelE never even evaluates -- on step
+                # 127 at 11, 12, 13 and 14, where ModelE's own candidate list
+                # jumps straight from 2 to 15.
+                in_gap = (candidate > first_top) & (candidate < closure_base)
+                inside = ((candidate >= boundary_layer_floor)
+                          & (candidate <= closure_base) & ~in_gap)
+                # A candidate outside the sweep is still *evaluated* -- the trip
+                # count is static and `jnp.where` takes both branches -- so it
+                # has to be evaluated somewhere valid. Sending it to
+                # `closure_base` keeps the geometry well formed; the result is
+                # masked out below. Pointing it at a degenerate base instead
+                # leaves NaNs that are invisible in the forward value and fatal
+                # to the gradient.
+                safe = jnp.where(inside, jnp.clip(candidate, 1, nlev - 3),
+                                 closure_base)
+                low = source_bottom(p_sf, safe)
+                # `bl_top` is the boundary-layer top itself, not something
+                # clipped to each candidate. Clipping it changed the source
+                # block and the surface-flux enhancement for every candidate
+                # below `blt`, which is what made a wide sweep convert where
+                # ModelE does not. Measured against `sweep_diag.txt` over the
+                # span this sweep covers, the closure built this way reproduces
+                # ModelE's accept/reject decision on 97.7% of candidates and
+                # finds all 83 of its conversions.
+                top = safe - 1 if blt is None else blt
+                weights = source_weights(air_mass, low, safe, top)
+                src_theta, src_q = enhanced_source(
+                    env_theta, env_q, plk, top, dtheta, dq)
+                # Only the base at the second displacement top is a
+                # `closure2` plume: `closure2 = lmin .eq. lmax_disp2 .and.
+                # lmax_disp2 .gt. lmax_disp1` (MSTCNV.F90:1509), re-evaluated
+                # at every candidate. Everything below it relaxes over
+                # `tadjmc(1)` and runs as the *more*-entraining plume at the
+                # `bsort_enteff(2)` constant.
+                is_closure2 = (safe == closure_base) & second_closure
+                this_tadj = jnp.where(is_closure2, _TADJ_CLOSURE2_SECONDS,
+                                      _TADJ_SECONDS)
+                _, mass, _ = cloud_base_closure(
+                    src_theta, src_q, air_mass, plk, p_sf, low, safe, weights,
+                    timestep=self.params.get_value().dtsrc,
+                    adjustment_time=this_tadj)
+                # Two limiters `MASS_FLUX2` leaves to its caller, applied
+                # in ModelE's order (MSTCNV.F90:2931-2937) right after the
+                # `dtsrc/tadj` factor the closure itself applies.
+                #
+                # The first is the `closure2` pair, `fmp2 = min(max(mwpen,
+                # fmp2), 100)`: a floor at the penetrative mass and a cap at
+                # 100. Verified against `fmp2_limiters_diag.txt` to the last
+                # bit on every BOMEX and TWP-ICE candidate.
+                #
+                # The floor binds on 125 of TWP-ICE's 265 closure2 bases and
+                # does nothing on the other 140, which is why the port's mass
+                # there was bimodal -- exactly 1.001 on half the bases and
+                # 0.202-0.998 on the rest -- rather than uniformly short.
+                #
+                # `mwpen` has to be supplied. It is `max(0, wenv(lmax_disp2))`
+                # clipped to the boundary-layer mass and zeroed below 0.01
+                # (`:1475-1477`), and `wenv` is *prognostic*: a running average
+                # of the plumes' own mass flux plus the resolved velocity with
+                # a two-hour time constant (`:2605-2612`). A single column
+                # cannot reconstruct it, so it is an input here and the term
+                # falls back to no floor without it -- the same treatment as
+                # `pmct` and `fcp`, and the same obstacle to running free.
+                penetrative_mass = diagnostics.get("penetrative_mass", 0.0)
+                mass = jnp.where(
+                    is_closure2,
+                    jnp.minimum(jnp.maximum(penetrative_mass, mass),
+                                _CLOSURE_MASS_CAP),
+                    mass)
+                # The second caps the plume at half of each source layer's own
+                # air mass. ModelE walks the source block and rescales, so the
+                # binding layer is whichever gives the smallest `fmp2`; layers
+                # with zero weight (those above `dcl`, dropped by
+                # `source_weights`) cannot bind, and their division is skipped
+                # rather than producing an infinity.
+                drawn = weights > 0.0
+                layer_cap = jnp.min(
+                    jnp.where(drawn, 0.5 * air_mass / jnp.where(drawn, weights,
+                                                                1.0),
+                              jnp.inf), axis=0)
+                mass = jnp.minimum(mass, layer_cap)
+                base_pressure = jnp.sum(
+                    jnp.where(level_index == safe, p_sf, 0.0), axis=0)
+                return CandidateSetup(
+                    cloud_base_mass=jnp.where(inside & has_cloud, mass, 0.0),
+                    entrainment_efficiency=entrainment_efficiency(
+                        base_pressure=base_pressure,
+                        cold_pool_fraction=diagnostics.get(
+                            "cold_pool_fraction", 0.0),
+                        second_closure=is_closure2),
+                    iplume=jnp.where(is_closure2, 1, 2))
+
+            # The profile the closure gives against the *incoming* column. It
+            # is what the non-swept paths use and what the harness inspects;
+            # the swept path re-runs `candidate_closure` per candidate against
+            # the environment as the sweep has left it, so it does not read
+            # this.
+            #
+            # The trip count is static, so this is a Python loop over a traced
+            # scatter rather than a traced loop.
+            base_level = jnp.arange(nlev).reshape(
+                (nlev,) + (1,) * len(nodal_shape))
+            base_profile = sum(
+                jnp.where(base_level == closure_base - offset,
+                          candidate_closure(
+                              theta_modele, q_sf,
+                              closure_base - offset).cloud_base_mass, 0.0)
+                for offset in range(_MAX_PLUME_CANDIDATES))
+        else:
+            candidate_closure = None
+            _, fmp2 = cloud_base_closure_mass_flux(
+                t_sf, q_sf, p_sf, air_mass, closure_base,
+                boundary_layer_top=blt, source_dtheta=dtheta, source_dq=dq)
+        return (cloud_base, fmp2, closure_base, blt, second_closure,
+                base_profile, candidate_closure)
+
+    def _plume_seed(self, diagnostics, theta_env, q_sf, air_mass, nlev):
+        """Source parcel and updraft seed for the plume ascent.
+
+        Returns the mass-weighted boundary-layer blend of potential temperature
+        and humidity -- enhanced by the surface-flux scales, exactly as the
+        closure's parcel is -- together with the cloud-base updraft speed from
+        :func:`convective_velocity_scale`. Falls back to surface air and the
+        ``0.5 m/s`` floor when the boundary-layer/surface diagnostics are absent.
+        """
+        density = diagnostics.get("air_density")
+        surface_density = (1.2 if density is None
+                           else jnp.flip(density, axis=0)[0])
+        blt, dtheta, dq = self._source_parcel_inputs(
+            diagnostics, q_sf, surface_density, nlev)
+
+        level = jnp.arange(nlev).reshape((nlev,) + (1,) * (theta_env.ndim - 1))
+        top = nlev - 3 if blt is None else blt
+        weights = jnp.where(level <= top, air_mass, 0.0)
+        weights = weights / jnp.maximum(jnp.sum(weights, axis=0), 1.0e-20)
+        theta_source = jnp.sum(theta_env * weights, axis=0) + dtheta
+        q_source = jnp.sum(q_sf * weights, axis=0) + dq
+
+        surface = diagnostics.get("surface")
+        pbl_height = self._boundary_layer_height(diagnostics)
+        if surface is None or pbl_height is None:
+            return theta_source, q_source, jnp.asarray(_CLOUD_BASE_W)
+        w_base = convective_velocity_scale(
+            surface.sensible_heat_flux, surface.evaporation, pbl_height,
+            surface_density, theta_source, minimum=_CLOUD_BASE_W)
+        return theta_source, q_source, w_base
+
+    @staticmethod
+    def _boundary_layer_height(diagnostics):
+        """Return the PBL depth for the cloud-base seed, from either publisher.
+
+        A top-level ``boundary_layer_height`` is preferred: that is what the
+        oracle harness injects (ModelE's own ``pblht``), so the single-column
+        path is untouched by this.
+
+        Otherwise take TTE-TKE's ``pbl_height`` out of its ``vertical_diffusion``
+        record -- the same quantity, ECHAM's ``zghabl/g`` in metres, which
+        ``mam4_jax`` already consumes the same way. **No term in any preset
+        publishes the top-level key**: ``TteTkeVerticalDiffusion.provides`` is
+        ``("vertical_diffusion", "surface", "mixed_layer_top")``, so before this
+        fallback existed every global run silently took the
+        ``_CLOUD_BASE_W = 0.5 m/s`` floor instead of the convective velocity
+        scale, in **99.6 %** of tropical columns -- where ``w*`` recomputed from
+        the saved fields has a median of **1.14 m/s**.
+
+        The gap is large: ``w*`` recomputed from a global run's saved fields has
+        a tropical median of 1.14 m/s against the 0.5 floor. Its sign is the
+        opposite of what an earlier reading of this code claimed -- in the
+        buoyancy-sorting closure a faster seed *raises* the entrainment rate
+        (``giss_bsort.entrainment_rate``, ``kew`` going as ``w**2``), so the
+        floor was under-entraining, and supplying the real depth deepens the
+        global convective deficit rather than closing it. It is wired for
+        fidelity to ModelE's own seed, not as a fix.
+
+        **This only reaches the single-plume path.** Its one caller is
+        :meth:`_plume_seed`, which only :meth:`_convective_tendencies` uses --
+        the ``allow_mc and not bsort`` fallback. The production path,
+        :meth:`_bsort_tendencies`, calls ``convective_column`` **without**
+        ``cloud_base_velocity``, so every buoyancy-sorting plume in every
+        configuration is seeded at ``giss_plume_driver._CLOUD_BASE_VELOCITY``,
+        also 0.5, and the convective velocity scale never enters. That is the
+        larger defect and it is not fixed here; see
+        ``docs/source/design/giss_convection_port.md``.
+        """
+        height = diagnostics.get("boundary_layer_height")
+        if height is not None:
+            return height
+        vdiff = diagnostics.get("vertical_diffusion")
+        return None if vdiff is None else vdiff.pbl_height
+
+    def _source_parcel_inputs(self, diagnostics, q_surface_first,
+                              surface_density, nlev):
+        """Boundary-layer top and source-parcel enhancement, if available.
+
+        The closure blends its source parcel over the boundary layer and boosts
+        it by the surface-flux scales. Both inputs are read *optionally*:
+
+        * ``mixed_layer_top`` -- ``dcl`` itself, as a level index. ``MSTCNV``
+          excludes source levels above it so a parcel displaced through the top
+          is not mixed with free-tropospheric air. Preferred when offered:
+          ModelE's own ``smixlev`` ("layer to which dry convection or moist
+          turbulence mixes", ``ATURB_COM.f:34``), and in a jcm integration the
+          vertical-diffusion term produces the same quantity.
+        * ``boundary_layer_height`` [m] (with ``height_full``) is the
+          **fallback**, used only when the level is not offered. It cannot
+          recover ``dcl`` in general. ModelE sets ``pblht = dbl`` by
+          interpolating between levels against a critical Richardson number
+          (``ATURB_DRV.f:2341-2372``) while ``dcl = ldbl`` is the index from the
+          same scheme, so ``pblht`` can fall on either side of ``z(dcl)``:
+          *above* it on all 48 BOMEX and 48 RICO periods, *below* it on all 128
+          TWP-ICE periods sampled. Counting the levels under it therefore
+          returns ``dcl`` on the shallow cases and ``dcl - 1`` on the deep one,
+          and no fixed offset satisfies both -- removing the ``- 1`` below takes
+          BOMEX from 48/48 exact cloud bases to 0/48. The ``- 1`` is kept
+          because it is right for the cases the fallback is accurate on, and the
+          fallback is wrong for a deep column either way.
+        * ``surface`` (a ``SurfaceData``) supplies the fluxes for
+          :func:`surface_flux_scales`; ``ustar`` comes from the momentum fluxes,
+          ``ustar = sqrt(|tau|/rho)``.
+
+        Without them the closure falls back to blending over the whole sub-cloud
+        column with no surface enhancement, which under-computes the cloud-base
+        mass flux (see
+        ``docs/source/design/giss_convection_port.md``).
+        """
+        boundary_layer_top = None
+        mixed_layer_top = diagnostics.get("mixed_layer_top")
+        if mixed_layer_top is not None:
+            boundary_layer_top = jnp.clip(
+                jnp.asarray(mixed_layer_top).astype(int), 0, nlev - 3)
+        else:
+            height = diagnostics.get("height_full")
+            pbl_height = diagnostics.get("boundary_layer_height")
+            if height is not None and pbl_height is not None:
+                height_sf = jnp.flip(height, axis=0)
+                below_top = jnp.sum(
+                    (height_sf < pbl_height[None, ...]).astype(int), axis=0) - 1
+                boundary_layer_top = jnp.clip(below_top, 0, nlev - 3)
+
+        surface = diagnostics.get("surface")
+        if surface is None:
+            return boundary_layer_top, 0.0, 0.0
+        tau = jnp.sqrt(surface.momentum_flux_u ** 2
+                       + surface.momentum_flux_v ** 2)
+        ustar = jnp.sqrt(tau / jnp.maximum(surface_density, 1.0e-6))
+        dtheta, dq = surface_flux_scales(
+            surface.sensible_heat_flux, surface.evaporation, ustar,
+            surface_density, q_surface_first[0])
+        return boundary_layer_top, dtheta, dq

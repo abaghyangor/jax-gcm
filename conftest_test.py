@@ -283,6 +283,77 @@ class TestPysesTestsHoldX64:
         assert not conftest._builds_pyses_backend(self._Item())
 
 
+class TestNeedsX64RunsEndAtTheirBoundary:
+    """A ``needs_x64`` run hands the flag back before the next class is built.
+
+    ``needs_x64`` modules are exempt from the pin on the same terms as the
+    pySES backend -- the plume-driver tests compare against ModelE's float64
+    dumps at tolerances float32 rounding breaks -- and keep the flag on across
+    a consecutive run rather than paying a compilation-cache invalidation
+    twice per test. The teardown hook is what ends the run, so it has to
+    recognise the same exemption the setup hook does.
+
+    While it tested only for pySES, it did not: a ``needs_x64`` test handed
+    ``x64=True`` to the next class's ``setUpClass`` while that class's own
+    test bodies ran at the restored default, because the pin is
+    function-scoped and a class fixture is built before it can act. Anything
+    built class-wide was therefore built at a precision its own tests then
+    denied -- ``checkpoint_test.py`` and ``cf_metadata_test.py`` build Models
+    exactly that way. Nothing failed; the dtype was simply wrong.
+    """
+
+    class _Item:
+        nodeid = "m.py::T::test"
+
+        def __init__(self, x64=False):
+            import pytest
+            self._marks = [pytest.mark.needs_x64.mark] if x64 else []
+
+        def iter_markers(self, name):
+            return iter([m for m in self._marks if m.name == name])
+
+        def getparent(self, kind):
+            return None
+
+    def test_setup_turns_x64_on_for_a_needs_x64_test_only(self, monkeypatch):
+        import jax
+
+        conftest = sys.modules["conftest"]
+        monkeypatch.setattr(conftest, "_X64_BASELINE", False)
+        try:
+            jax.config.update("jax_enable_x64", False)
+            conftest.pytest_runtest_setup(self._Item())
+            assert not jax.config.read("jax_enable_x64")
+            conftest.pytest_runtest_setup(self._Item(x64=True))
+            assert jax.config.read("jax_enable_x64")
+        finally:
+            jax.config.update("jax_enable_x64", False)
+
+    def test_teardown_ends_the_run_but_not_the_middle_of_it(self, monkeypatch):
+        import jax
+
+        conftest = sys.modules["conftest"]
+        monkeypatch.setattr(conftest, "_X64_BASELINE", False)
+        monkeypatch.setattr(conftest, "_malloc_trim", None)
+        monkeypatch.setattr(conftest, "_MAX_GROWTH_BYTES", 2**62)
+        monkeypatch.setattr(conftest, "_rss_at_last_clear", 0)
+        exempt, other = self._Item(x64=True), self._Item()
+        try:
+            jax.config.update("jax_enable_x64", True)
+            # Still inside the run: the flag stays on, so the next test in it
+            # does not pay a second cache invalidation.
+            conftest.pytest_runtest_teardown(exempt, self._Item(x64=True))
+            assert jax.config.read("jax_enable_x64")
+            # Leaving it for an ordinary test, and for the end of the queue.
+            conftest.pytest_runtest_teardown(exempt, other)
+            assert not jax.config.read("jax_enable_x64")
+            jax.config.update("jax_enable_x64", True)
+            conftest.pytest_runtest_teardown(exempt, None)
+            assert not jax.config.read("jax_enable_x64")
+        finally:
+            jax.config.update("jax_enable_x64", False)
+
+
 class TestRunsDoNotEnableTheSharedCompilationCache:
     """``runners.run()`` in a test leaves JAX's persistent cache alone (#880)."""
 

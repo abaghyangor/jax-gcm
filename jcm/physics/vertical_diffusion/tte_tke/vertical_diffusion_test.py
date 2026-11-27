@@ -59,6 +59,9 @@ def _turbulence_diagnostics(state, params, k):
     return compute_turbulence_diagnostics(
         state, params, kk, kk, kk,
         boundary_layer_height=jnp.full(ncol, 1000.0),
+        # The level that height refers to, top-first: a mid-column value, since
+        # these tests only exercise the surface exchange and the 10 m wind.
+        boundary_layer_level=jnp.full(ncol, nlev // 2, dtype=int),
         richardson_number=jnp.zeros((ncol, nlev - 1)),
         mixing_length=jnp.full((ncol, nlev - 1), 50.0))
 
@@ -2545,3 +2548,100 @@ def test_missing_soilw_rel_check_accepts_traced_forcing(caplog, monkeypatch):
     with caplog.at_level(logging.WARNING, logger=vd.__name__):
         validate(jnp.zeros((4,)))
     assert "forcing has no soilw_rel" in caplog.text
+
+
+class TestMixedLayerTopIsPublishedSurfaceFirst:
+    """``mixed_layer_top`` is published, int32, and counted from the SURFACE.
+
+    The term declares it in ``provides`` as a plain top-level key because a
+    convection scheme has to know how deep the turbulent layer is to pick the
+    parcel its closure lifts, and one term cannot reach into another's
+    diagnostic struct. The GISS convection port is the consumer, and it works
+    surface-first the way ``MSTCNV`` does (``giss_mstcnv`` flips every profile
+    before use), so the closure's top-first ``ihpbl`` is republished as
+    ``(nlev - 1) - ihpbl``.
+
+    Nothing used to check any of that: not the key's presence, not its dtype,
+    and not which end of the column it counts from. A future axis reorder, or
+    dropping the flip, would leave the whole suite green while the convection
+    scheme seeded its plumes from the stratosphere.
+    """
+
+    @staticmethod
+    def _run(lrce):
+        from jcm.forcing import ForcingData
+        from jcm.physics.clouds.cloud_data import CloudData
+        from jcm.physics.surface.echam.surface_types import SurfaceData
+        from jcm.physics_interface import PhysicsState
+        from jcm.terrain import TerrainData
+        from .vertical_diffusion import TteTkeVerticalDiffusion
+        from .vertical_diffusion_types import (VDiffParameters,
+                                               VerticalDiffusionData)
+
+        vstate = _make_marine_bl_state(ncol=1, sst_offset=5.0, wind=10.0)
+        nlev = vstate.u.shape[1]
+        to_col = lambda a: jnp.asarray(a).T  # noqa: E731
+        state = PhysicsState(
+            u_wind=to_col(vstate.u), v_wind=to_col(vstate.v),
+            temperature=to_col(vstate.temperature),
+            specific_humidity=to_col(vstate.qv),
+            geopotential=to_col(vstate.geopotential),
+            normalized_surface_pressure=jnp.ones((1,)),
+            tracers={"qc": jnp.zeros((nlev, 1)), "qi": jnp.zeros((nlev, 1))},
+        )
+        t_sfc = float(vstate.surface_temperature[0, 0])
+        diagnostics = {
+            "_dt_seconds": 900.0,
+            "pressure_full": to_col(vstate.pressure_full),
+            "pressure_half": to_col(vstate.pressure_half),
+            "height_full": to_col(vstate.height_full),
+            "height_half": to_col(vstate.height_half),
+            "surface": SurfaceData.zeros((1,), nlev),
+            "clouds": CloudData.zeros((1,), nlev),
+            "vertical_diffusion": VerticalDiffusionData.zeros((1,), nlev).copy(
+                tke=jnp.full((nlev, 1), 1.0)),
+        }
+        forcing = ForcingData.zeros((1, 1)).copy(
+            stl_am=jnp.full((1, 1), t_sfc),
+            sea_surface_temperature=jnp.full((1, 1), t_sfc),
+            soilw_am=jnp.full((1, 1), 0.5),
+        )
+        term = TteTkeVerticalDiffusion(VDiffParameters.default(lrce=lrce))
+        _, diag = term(state, diagnostics, forcing,
+                       TerrainData.single_column(fmask=0.0))
+        return term, nlev, diag
+
+    def test_it_is_declared_and_published_as_an_int32_level(self):
+        term, nlev, diag = self._run(lrce=False)
+        assert "mixed_layer_top" in term.provides
+        assert "mixed_layer_top" in diag
+        mlt = diag["mixed_layer_top"]
+        # int32 specifically: it is carried in the physics state, and
+        # ``boundary_layer_level`` is an argmax that JAX widens to int64 under
+        # ``jax_enable_x64`` (``echam_terms_test.TestSixtyFourBitMode``).
+        assert mlt.dtype == jnp.int32, mlt.dtype
+        assert mlt.shape == (1,)
+        assert 0 <= int(np.asarray(mlt)[0]) <= nlev - 1
+
+    def test_lrce_cannot_deepen_the_layer_which_pins_the_orientation(self):
+        """ECHAM's RCE switch can only make the layer shallower, never deeper.
+
+        ``diagnose_pbl_extension`` sets ``ihpbl = ihpblc`` under ``lrce`` and
+        ``min(ihpblc, ihpbld)`` otherwise, and a *larger* ``ihpbl`` is a
+        level nearer the surface — so ``ihpbl_lrce >= ihpbl_default`` by
+        construction, whatever the state. Surface-first that inequality
+        flips: ``mixed_layer_top`` under ``lrce`` must be the SMALLER of the
+        two. Publishing ``ihpbl`` unflipped would reverse it, which is what
+        makes this an orientation test rather than a magic number.
+        """
+        _, nlev, deep = self._run(lrce=False)
+        _, _, shallow = self._run(lrce=True)
+        deep_top = int(np.asarray(deep["mixed_layer_top"])[0])
+        shallow_top = int(np.asarray(shallow["mixed_layer_top"])[0])
+        assert 0 <= shallow_top <= deep_top <= nlev - 1, (
+            f"lrce=True gave mixed_layer_top={shallow_top} and the default "
+            f"gave {deep_top}; surface-first the RCE branch cannot be the "
+            "deeper of the two, so the flip is missing or doubled")
+        # The two must actually differ on this state, or the comparison above
+        # would hold vacuously and pin nothing.
+        assert shallow_top < deep_top

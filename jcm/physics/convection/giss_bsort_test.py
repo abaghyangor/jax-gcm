@@ -1,0 +1,1014 @@
+"""Tests for the buoyancy-sorting plume entrainment/detrainment port.
+
+The regression fixtures are **taken from inside ModelE's own ascent loop** --
+not regenerated from this module -- via the instrumentation in the bridge repo's
+``modele_patches/mstcnv_scm_dumps.patch``. Each fixture is a real BOMEX plume
+level, chosen to span the four regimes the closure can land in:
+
+* ``CEILING``   -- entrainment pinned at the ``4e-3`` maximum,
+* ``INTERIOR``  -- the ``sqrt(kew/(bdzsum*mplume)) - 1`` branch unclipped,
+* ``FLOOR``     -- pinned at the ``5e-4`` buoyant floor,
+* ``OVERSHOOT`` -- buoyancy integral negative, so the rate becomes detrainment
+  and the blend spectrum collapses to a single pure-updraft blend.
+
+Full-column agreement (536 levels, 1572 blends) is recorded in
+the bridge repo's ``BSORT_PORT_PLAN.md``; these tests lock in a
+representative sample plus the structural properties.
+"""
+
+import unittest
+from unittest import mock
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+from jcm.physics.convection import giss_bsort as bs
+from jcm.physics.convection import giss_thermodynamics as gt
+from jcm.physics.modele.params import GissConvectionParameters
+
+# level, mplume, ent, det, ma, mplume_lag, mplume_b, gzl, delz, buoy, bdzsum,
+# kew, frem
+_ORACLE = {
+    "ceiling": dict(
+        mplume=51.78002, ent=0.004, det=0.0, ma=114.139,
+        lag=51.78002, mpb=51.78002, gzl=104.5873, delz=104.5267,
+        buoy=0.002612452, bdzsum=0.1472851, kew=23.11038, frem=0.418349,
+        smp=2155.917, qmp=0.8344364, wmp=0.0306781,
+        senv=41.55117, qenv=0.01419186, tvl=295.343,
+        plk=7.047142, pres=91782.26,
+        plume_out=40.94896, detrained=32.49318, downdraft=0.0,
+        mixbuoy=[-0.0003713399, -4.448836e-05, 0.001291898]),
+    "interior": dict(
+        mplume=49.80765, ent=0.002373484, det=0.0, ma=145.2678,
+        lag=51.78002, mpb=51.78002, gzl=138.7207, delz=136.0888,
+        buoy=0.002362324, bdzsum=0.5112552, kew=44.57142, frem=0.3421566,
+        smp=2079.185, qmp=0.749384, wmp=0.02899073,
+        senv=41.67797, qenv=0.01280588, tvl=293.6729,
+        plk=6.991814, pres=89289.23,
+        plume_out=41.12595, detrained=25.08094, downdraft=0.0,
+        mixbuoy=[-0.000454143, -0.0006783077, 0.0008232186]),
+    "floor": dict(
+        mplume=23.86885, ent=0.0005, det=0.0, ma=238.6542,
+        lag=51.78002, mpb=51.78002, gzl=237.6995, delz=237.0469,
+        buoy=0.001210612, bdzsum=1.355113, kew=39.80636, frem=0.2941929,
+        smp=1005.529, qmp=0.3215634, wmp=0.01914901,
+        senv=42.17594, qenv=0.008228802, tvl=290.8705,
+        plk=6.862273, pres=83641.74,
+        plume_out=16.8468, detrained=0.0, downdraft=9.858854,
+        mixbuoy=[-0.002642248, -0.002767787, -0.001156702]),
+    "overshoot": dict(
+        mplume=16.8468, ent=0.0, det=0.001809418, ma=269.783,
+        lag=51.78002, mpb=51.78002, gzl=276.6867, delz=276.3319,
+        buoy=-0.001605852, bdzsum=-0.08094228, kew=-50.86821, frem=0.500642,
+        smp=713.1072, qmp=0.2176886, wmp=0.01345424,
+        senv=42.56336, qenv=0.005121686, tvl=290.4641,
+        plk=6.803096, pres=81148.71,
+        plume_out=8.412587, detrained=8.434217, downdraft=0.0,
+        mixbuoy=[-0.001605912]),
+}
+
+_PRESSURE = 9.5e4  # Pa; only affects the (unreachable here) iplume==1 floor.
+
+
+def _rates(case, iplume=2):
+    o = _ORACLE[case]
+    return bs.entrainment_rate(
+        jnp.array(o["buoy"]), jnp.array(o["mplume"]), jnp.array(o["delz"]),
+        jnp.array(o["kew"]), jnp.array(o["bdzsum"]), jnp.array(_PRESSURE),
+        iplume=iplume)
+
+
+class TestEntrainmentRate(unittest.TestCase):
+
+    def test_matches_oracle_in_every_regime(self):
+        for case, o in _ORACLE.items():
+            ent, det = _rates(case)
+            # Relative where non-zero: JAX is float32 here, the oracle dump
+            # carries six significant digits.
+            for got, want in ((ent, o["ent"]), (det, o["det"])):
+                if want > 0.0:
+                    self.assertAlmostEqual(float(got) / want, 1.0, delta=1e-5,
+                                           msg=case)
+                else:
+                    self.assertEqual(float(got), 0.0, msg=case)
+
+    def test_rates_are_mutually_exclusive_and_non_negative(self):
+        for case in _ORACLE:
+            ent, det = _rates(case)
+            self.assertGreaterEqual(float(ent), 0.0)
+            self.assertGreaterEqual(float(det), 0.0)
+            self.assertEqual(float(ent) * float(det), 0.0, msg=case)
+
+    def test_negative_buoyancy_integral_gives_detrainment(self):
+        # The overshoot fixture has kew < 0, so the closure takes the fixed
+        # -0.5/delz branch, which becomes detrainment of that magnitude.
+        o = _ORACLE["overshoot"]
+        ent, det = _rates("overshoot")
+        self.assertEqual(float(ent), 0.0)
+        self.assertAlmostEqual(float(det) / (0.5 / o["delz"]), 1.0,
+                               delta=1e-6)
+
+    def test_ceiling_is_enforced(self):
+        # Drive the closure far past its ceiling with a huge energy ratio.
+        ent, det = bs.entrainment_rate(
+            jnp.array(0.01), jnp.array(10.0), jnp.array(100.0),
+            jnp.array(1e6), jnp.array(0.01), jnp.array(_PRESSURE))
+        self.assertAlmostEqual(float(ent) / bs._ENT_MAX, 1.0, delta=1e-6)
+        self.assertEqual(float(det), 0.0)
+
+    def test_floor_applies_only_where_buoyant(self):
+        # Same marginal energy ratio, opposite buoyancy sign. Where buoyant the
+        # 5e-4 floor lifts the rate; where not, the fixed detrainment applies.
+        common = dict(plume_mass=jnp.array(30.0), layer_thickness=jnp.array(200.0),
+                      pressure=jnp.array(_PRESSURE))
+        ent_pos, _ = bs.entrainment_rate(
+            buoyancy=jnp.array(1e-4), kew=jnp.array(1.0001),
+            bdzsum=jnp.array(1.0 / 30.0), **common)
+        self.assertAlmostEqual(
+            float(ent_pos) / bs._ENT_FLOOR_MORE_ENTRAINING, 1.0, delta=1e-6)
+        ent_neg, det_neg = bs.entrainment_rate(
+            buoyancy=jnp.array(-1e-4), kew=jnp.array(-1.0),
+            bdzsum=jnp.array(1.0 / 30.0), **common)
+        self.assertEqual(float(ent_neg), 0.0)
+        self.assertGreater(float(det_neg), 0.0)
+
+    def test_less_entraining_plume_floor_is_pressure_gated(self):
+        # iplume == 1 gets the 3e-4 floor, but only below 700 mb; above it there
+        # is no floor at all, unlike iplume == 2.
+        args = dict(buoyancy=jnp.array(1e-4), plume_mass=jnp.array(30.0),
+                    layer_thickness=jnp.array(200.0), kew=jnp.array(1.0001),
+                    bdzsum=jnp.array(1.0 / 30.0))
+        low, _ = bs.entrainment_rate(pressure=jnp.array(9.5e4), iplume=1, **args)
+        high, _ = bs.entrainment_rate(pressure=jnp.array(5.0e4), iplume=1, **args)
+        self.assertAlmostEqual(
+            float(low) / bs._ENT_FLOOR_LESS_ENTRAINING, 1.0, delta=1e-6)
+        self.assertLess(float(high), bs._ENT_FLOOR_LESS_ENTRAINING)
+
+    def test_gradients_finite_including_the_discarded_sqrt_branch(self):
+        # The non-buoyant branch must not leak a NaN from sqrt of a negative
+        # ratio, even though `jnp.where` discards that value.
+        def f(kew):
+            ent, det = bs.entrainment_rate(
+                jnp.array(-1e-3), jnp.array(20.0), jnp.array(200.0), kew,
+                jnp.array(-0.05), jnp.array(_PRESSURE))
+            return ent + det
+        grad = jax.grad(f)(jnp.array(-50.0))
+        self.assertTrue(bool(jnp.isfinite(grad)))
+
+
+class TestBlendAirMasses(unittest.TestCase):
+
+    def _blend(self, case):
+        o = _ORACLE[case]
+        return bs.blend_air_masses(
+            jnp.array(o["mplume"]), jnp.array(o["mpb"]), jnp.array(o["lag"]),
+            jnp.array(o["ent"]), jnp.array(o["det"]), jnp.array(o["gzl"]),
+            jnp.array(o["ma"]))
+
+    def test_updraft_air_matches_oracle_frem(self):
+        # ModelE sets aside `frem = updairm/mplume` of the plume for sorting.
+        for case, o in _ORACLE.items():
+            _, updraft_air, _, _, _ = self._blend(case)
+            self.assertAlmostEqual(
+                float(updraft_air) / (o["mplume"] * o["frem"]), 1.0,
+                delta=1e-5, msg=case)
+
+    def test_environment_air_formula(self):
+        for case, o in _ORACLE.items():
+            environment_air, _, _, _, _ = self._blend(case)
+            expected = min(o["mplume"], 2.0 * o["mpb"]) * (o["ent"] * o["gzl"])
+            expected = min(expected, o["ma"] * bs._REMRAT)
+            if expected > 0.0:
+                self.assertAlmostEqual(float(environment_air) / expected, 1.0,
+                                       delta=1e-6, msg=case)
+            else:
+                self.assertEqual(float(environment_air), 0.0, msg=case)
+
+    def test_weights_partition_the_set_aside_air(self):
+        # The per-blend factors must redistribute exactly the totals, no more.
+        for case in _ORACLE:
+            _, _, updraft_factor, environment_factor, _ = self._blend(case)
+            self.assertAlmostEqual(float(jnp.sum(updraft_factor)), 1.0,
+                                   delta=1e-6, msg=case)
+            env_sum = float(jnp.sum(environment_factor))
+            expected = 0.0 if case == "overshoot" else 1.0
+            self.assertAlmostEqual(env_sum, expected, delta=1e-6, msg=case)
+
+    def test_overshoot_collapses_to_a_single_pure_updraft_blend(self):
+        o = _ORACLE["overshoot"]
+        env, upd, uf, ef, _ = self._blend("overshoot")
+        self.assertEqual(float(env), 0.0)
+        self.assertEqual(float(jnp.sum(ef)), 0.0)
+        # All updraft weight on the first blend, none on the others.
+        self.assertAlmostEqual(float(uf[0]), 1.0, delta=1e-6)
+        self.assertEqual(float(jnp.sum(uf[1:])), 0.0)
+        self.assertAlmostEqual(
+            float(upd) / (o["mplume"] * min(0.95, o["det"] * o["gzl"])), 1.0,
+            delta=1e-6)
+
+    def test_updraft_air_never_exceeds_the_plume(self):
+        # A thin plume in a deep layer would ask for more updraft air than it
+        # has; ModelE clamps and scales the entrained air back by the same ratio.
+        env, upd, _, _, _ = bs.blend_air_masses(
+            jnp.array(0.5), jnp.array(50.0), jnp.array(50.0),
+            jnp.array(4e-3), jnp.array(0.0), jnp.array(500.0), jnp.array(200.0))
+        self.assertLessEqual(float(upd), 0.5)
+        self.assertAlmostEqual(float(upd) / 0.5, bs._UPDRAFT_FRACTION_MAX,
+                               delta=1e-6)
+
+    def test_thinning_plume_shifts_blends_toward_complete_mixing(self):
+        # refblendwt < 1 pulls fupd away from [1/4,1/2,3/4] toward fupd_fullmix,
+        # which compresses the spread of the spectrum.
+        common = dict(cloud_base_mass=jnp.array(50.0), entrainment=jnp.array(1e-3),
+                      detrainment=jnp.array(0.0), layer_depth=jnp.array(200.0),
+                      layer_mass=jnp.array(200.0))
+        _, _, _, _, fresh = bs.blend_air_masses(
+            plume_mass=jnp.array(50.0), plume_mass_lag=jnp.array(50.0), **common)
+        _, _, _, _, thinned = bs.blend_air_masses(
+            plume_mass=jnp.array(10.0), plume_mass_lag=jnp.array(50.0), **common)
+        spread_fresh = float(fresh[2] - fresh[0])
+        spread_thinned = float(thinned[2] - thinned[0])
+        self.assertLess(spread_thinned, spread_fresh)
+
+    def test_column_matches_vectorized(self):
+        keys = ("mplume", "mpb", "lag", "ent", "det", "gzl", "ma")
+        cols = {k: jnp.array([_ORACLE[c][k] for c in _ORACLE]) for k in keys}
+        column = bs.blend_air_masses(*[cols[k] for k in keys])
+        block = bs.blend_air_masses(
+            *[cols[k][:, None] * jnp.ones((1, 3)) for k in keys])
+        for a, b in zip(column, block):
+            # Blend axis leads; the level axis is axis 0 of the remainder.
+            self.assertLess(
+                float(jnp.max(jnp.abs(a[..., None] - b))), 1e-9)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TestSortBlends(unittest.TestCase):
+    """The sorting itself, against the same real BOMEX levels.
+
+    The four fixtures cover all three fates: ``ceiling``/``interior`` detrain
+    part of the blend air, ``floor`` sends its negative blends to the downdraft,
+    and ``overshoot`` has blends below the downdraft threshold that detrain
+    anyway because the plume is overshooting.
+    """
+
+    def _sorted(self, case):
+        o = _ORACLE[case]
+        env, upd, uf, ef, _ = bs.blend_air_masses(
+            jnp.array(o["mplume"]), jnp.array(o["mpb"]), jnp.array(o["lag"]),
+            jnp.array(o["ent"]), jnp.array(o["det"]), jnp.array(o["gzl"]),
+            jnp.array(o["ma"]))
+        return o, bs.sort_blends(
+            jnp.array(o["mplume"]), jnp.array(o["smp"]), jnp.array(o["qmp"]),
+            jnp.array(o["wmp"]), jnp.array(o["senv"]), jnp.array(o["qenv"]),
+            env, upd, uf, ef, jnp.array(o["plk"]), jnp.array(o["pres"]),
+            jnp.array(o["tvl"]), jnp.array(o["buoy"])), env
+
+    def test_mass_budget_matches_oracle(self):
+        for case in _ORACLE:
+            o, r, _ = self._sorted(case)
+            for got, want, label in (
+                    (r.plume_mass, o["plume_out"], "plume"),
+                    (r.detrained_mass, o["detrained"], "detrained"),
+                    (r.downdraft_mass, o["downdraft"], "downdraft")):
+                if want > 0.0:
+                    self.assertAlmostEqual(float(got) / want, 1.0, delta=1e-4,
+                                           msg=f"{case}/{label}")
+                else:
+                    self.assertLess(float(got), 1e-6, msg=f"{case}/{label}")
+
+    def test_mixture_buoyancy_matches_oracle(self):
+        # Absolute, not relative: mixbuoy is a small difference of two ~290 K
+        # virtual temperatures, and the decision threshold it is compared
+        # against is ~1.7e-4, so absolute agreement is what matters.
+        for case, o in _ORACLE.items():
+            _, r, _ = self._sorted(case)
+            for blend, want in enumerate(o["mixbuoy"]):
+                self.assertAlmostEqual(
+                    float(r.mixture_buoyancy[blend]), want, delta=5e-6,
+                    msg=f"{case}/blend{blend}")
+
+    def test_conserves_mass(self):
+        # Everything entering the level -- the plume plus the entrained
+        # environmental air -- must leave it via exactly one of the three fates.
+        for case in _ORACLE:
+            o, r, env = self._sorted(case)
+            total_in = o["mplume"] + float(env)
+            total_out = (float(r.plume_mass) + float(r.detrained_mass)
+                         + float(r.downdraft_mass))
+            self.assertAlmostEqual(total_out / total_in, 1.0, delta=1e-6,
+                                   msg=case)
+
+    def test_conserves_water_because_evaporation_is_only_a_test(self):
+        # ModelE evaporates each blend purely to decide its buoyancy, then hands
+        # back the untouched pre-evaporation properties. If the port applied the
+        # evaporation to the returned blend instead, vapour would be created
+        # here and this invariant would break.
+        for case in _ORACLE:
+            o, r, env = self._sorted(case)
+            water_in = o["qmp"] + float(env) * o["qenv"]
+            water_out = (float(r.plume_water) + float(r.detrained_water)
+                         + float(r.downdraft_water))
+            self.assertAlmostEqual(water_out / water_in, 1.0, delta=1e-6,
+                                   msg=case)
+            condensate_out = (float(r.plume_condensate)
+                              + float(r.detrained_condensate)
+                              + float(r.downdraft_condensate))
+            # Environmental air brings no condensate.
+            self.assertAlmostEqual(condensate_out / o["wmp"], 1.0, delta=1e-5,
+                                   msg=case)
+
+    def test_overshoot_guard_diverts_downdraft_air_to_detrainment(self):
+        # This fixture's blend is below the downdraft threshold, so without the
+        # guard it would seed a downdraft. Because the plume is overshooting it
+        # must detrain instead.
+        o, r, _ = self._sorted("overshoot")
+        threshold = bs._NEGATIVE_BUOYANCY / o["tvl"]
+        self.assertLess(o["mixbuoy"][0], threshold)   # would qualify
+        self.assertEqual(float(r.downdraft_mass), 0.0)
+        self.assertGreater(float(r.detrained_mass), 0.0)
+
+    def test_buoyant_blends_rejoin_and_grow_the_plume(self):
+        # The ceiling fixture has one clearly positive blend; the plume it
+        # returns must exceed what was retained after the set-aside.
+        o, r, _ = self._sorted("ceiling")
+        retained = o["mplume"] * (1.0 - o["frem"])
+        self.assertGreater(float(r.plume_mass), retained)
+
+    def test_column_matches_vectorized(self):
+        keys = ("mplume", "mpb", "lag", "ent", "det", "gzl", "ma", "smp", "qmp",
+                "wmp", "senv", "qenv", "plk", "pres", "tvl", "buoy")
+        v = {k: jnp.array([_ORACLE[c][k] for c in _ORACLE]) for k in keys}
+
+        def run(get):
+            env, upd, uf, ef, _ = bs.blend_air_masses(
+                get("mplume"), get("mpb"), get("lag"), get("ent"), get("det"),
+                get("gzl"), get("ma"))
+            return bs.sort_blends(
+                get("mplume"), get("smp"), get("qmp"), get("wmp"), get("senv"),
+                get("qenv"), env, upd, uf, ef, get("plk"), get("pres"),
+                get("tvl"), get("buoy"))
+
+        column = run(lambda k: v[k])
+        block = run(lambda k: v[k][:, None] * jnp.ones((1, 3)))
+        self.assertLess(
+            float(jnp.max(jnp.abs(column.plume_mass[:, None]
+                                  - block.plume_mass))), 1e-4)
+        self.assertLess(
+            float(jnp.max(jnp.abs(column.detrained_mass[:, None]
+                                  - block.detrained_mass))), 1e-4)
+
+    def test_gradient_finite(self):
+        o = _ORACLE["interior"]
+
+        def f(plume_mass):
+            env, upd, uf, ef, _ = bs.blend_air_masses(
+                plume_mass, jnp.array(o["mpb"]), jnp.array(o["lag"]),
+                jnp.array(o["ent"]), jnp.array(o["det"]), jnp.array(o["gzl"]),
+                jnp.array(o["ma"]))
+            r = bs.sort_blends(
+                plume_mass, jnp.array(o["smp"]), jnp.array(o["qmp"]),
+                jnp.array(o["wmp"]), jnp.array(o["senv"]), jnp.array(o["qenv"]),
+                env, upd, uf, ef, jnp.array(o["plk"]), jnp.array(o["pres"]),
+                jnp.array(o["tvl"]), jnp.array(o["buoy"]))
+            return r.plume_mass
+
+        grad = jax.grad(f)(jnp.array(o["mplume"]))
+        self.assertTrue(bool(jnp.isfinite(grad)))
+
+
+# One real BOMEX column (period 1), levels 10-16. Columns follow the dump's
+# layout; see modele_patches/README.md in the bridge repo.
+_COLUMN = dict(
+    level=[10, 11, 12, 13, 14, 15, 16],
+    cloud_base=10, enteff=0.67,
+    mplume=[51.78002, 40.94896, 49.80765, 41.12595, 32.37008, 23.86885, 16.8468],
+    wcu=[0.6661229, 0.8595595, 1.00644, 1.261636, 1.548336, 1.632314, 0.0],
+    ent=[0.004, 0.004, 0.002373484, 0.001860267, 0.001478261, 0.0005, 0.0],
+    det=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.001809418],
+    lag=[51.78002] * 7,
+    ma=[114.139, 124.5152, 145.2678, 176.3966, 207.5254, 238.6542, 269.783],
+    gzl=[104.5873, 117.7456, 138.7207, 168.017, 201.5415, 237.6995, 276.6867],
+    delz=[104.5267, 115.2422, 136.0888, 167.6942, 200.9352, 237.0469, 276.3319],
+    zl=[871.9527, 981.8191, 1107.444, 1259.26, 1443.478, 1662.343, 1918.877],
+    senv=[41.55117, 41.61034, 41.67797, 41.75965, 41.87822, 42.17594, 42.56336],
+    qenv=[0.01419186, 0.01354509, 0.01280588, 0.01191302, 0.01070161,
+          0.008228802, 0.005121686],
+    tvl=[295.343, 294.5645, 293.6729, 292.5937, 291.3948, 290.8705, 290.4641],
+    plk=[7.047142, 7.021307, 6.991814, 6.956239, 6.913175, 6.862273, 6.803096],
+    pres=[91782.26, 90612.06, 89289.23, 87712.0, 85829.51, 83641.74, 81148.71],
+    detrained=[32.49318, 10.42755, 25.08094, 21.61005, 12.09685, 0.0, 8.434217],
+    downdraft=[0.0, 0.0, 0.0, 0.0, 6.048424, 9.858854, 0.0],
+    smp=2155.917, qmp=0.8344364, wmp=0.0306781,
+    detrained0=32.49318, downdraft0=0.0,
+)
+_NLEV = 24
+
+
+def _column_profile(key, fill=0.0):
+    a = [fill] * _NLEV
+    for i, lev in enumerate(_COLUMN["level"]):
+        a[lev] = _COLUMN[key][i]
+    return jnp.array(a)
+
+
+def _run_column(**overrides):
+    kwargs = dict(
+        cloud_base=jnp.array(_COLUMN["cloud_base"]),
+        cloud_base_mass=jnp.array(_COLUMN["mplume"][0]),
+        cloud_base_heat=jnp.array(_COLUMN["smp"]),
+        cloud_base_water=jnp.array(_COLUMN["qmp"]),
+        cloud_base_condensate=jnp.array(_COLUMN["wmp"]),
+        environment_heat=_column_profile("senv", 41.5),
+        environment_water=_column_profile("qenv", 0.005),
+        environment_virtual_temperature=_column_profile("tvl", 300.0),
+        layer_mass=_column_profile("ma", 1.0),
+        layer_depth=_column_profile("gzl", 1.0),
+        layer_thickness=_column_profile("delz", 1.0),
+        height=_column_profile("zl", 3000.0),
+        exner=_column_profile("plk", 7.0),
+        pressure=_column_profile("pres", 9.0e4),
+        entrainment_efficiency=jnp.array(_COLUMN["enteff"]))
+    kwargs.update(overrides)
+    return bs.plume_ascent(**kwargs)
+
+
+class TestPlumeAscent(unittest.TestCase):
+    """The ascent driver: seeding, the 1 km lookback, and termination.
+
+    Scope note: this exercises the driver's own plumbing, and the **cloud-base
+    level against the oracle**, where the plume state is known exactly. It does
+    *not* chain the whole column against ModelE, because between plume levels
+    ModelE also condenses (``get_dq_cond``) and runs
+    ``CONVECTIVE_MICROPHYSICS`` to remove precipitation, neither of which is
+    ported yet. The per-level bsort physics is validated separately over all
+    536 oracle levels; see the bridge repo's ``BSORT_PORT_PLAN.md``.
+    """
+
+    def test_cloud_base_level_matches_oracle(self):
+        r = _run_column()
+        base = _COLUMN["cloud_base"]
+        self.assertAlmostEqual(float(r.plume_mass[base]) / _COLUMN["mplume"][0],
+                               1.0, delta=1e-5)
+        self.assertAlmostEqual(float(r.vertical_velocity[base])
+                               / _COLUMN["wcu"][0], 1.0, delta=1e-3)
+        self.assertAlmostEqual(float(r.entrainment[base]) / _COLUMN["ent"][0],
+                               1.0, delta=1e-5)
+        self.assertAlmostEqual(float(r.detrained_mass[base])
+                               / _COLUMN["detrained0"], 1.0, delta=1e-4)
+        self.assertEqual(float(r.downdraft_mass[base]), _COLUMN["downdraft0"])
+
+    def test_levels_below_cloud_base_are_inactive(self):
+        r = _run_column()
+        base = _COLUMN["cloud_base"]
+        self.assertFalse(bool(jnp.any(r.active[:base])))
+        self.assertEqual(float(jnp.sum(r.plume_mass[:base])), 0.0)
+        self.assertEqual(float(jnp.sum(r.detrained_mass[:base])), 0.0)
+
+    def test_lag_falls_back_to_cloud_base_within_one_km(self):
+        # This column never climbs a full kilometre above its base, so every
+        # level's lookback must fall back to the cloud-base mass.
+        r = _run_column()
+        for i, lev in enumerate(_COLUMN["level"]):
+            if not bool(r.active[lev]):
+                continue
+            self.assertAlmostEqual(float(r.mass_lag[lev])
+                                   / _COLUMN["mplume"][0], 1.0, delta=1e-5,
+                                   msg=f"level {lev}")
+
+    def test_lag_selects_the_highest_level_more_than_one_km_below(self):
+        # Stretch the column so the lookback reaches past 1 km. At the level
+        # 1 km above the base the walk should land on a stored level, and the
+        # value it returns must be the mass that entered that level.
+        tall = jnp.array([0.0] * 10 + [i * 400.0 for i in range(14)])
+        r = _run_column(height=tall)
+        base = _COLUMN["cloud_base"]
+        # tall[base]=0, tall[base+3]=1200 > 1000, so level base+3 looks back to
+        # base; level base+4 (1600) can reach base+1 (400).
+        if bool(r.active[base + 4]):
+            self.assertAlmostEqual(
+                float(r.mass_lag[base + 4]) / float(r.plume_mass[base + 1]),
+                1.0, delta=1e-5)
+        self.assertAlmostEqual(
+            float(r.mass_lag[base + 3]) / float(r.plume_mass[base]), 1.0,
+            delta=1e-5)
+
+    def test_terminates_when_plume_shrinks_below_cloud_base_fraction(self):
+        # A tiny seed relative to its own cloud-base mass cannot survive: the
+        # 1% test fires on the state entering the second level.
+        r = _run_column(cloud_base_mass=jnp.array(1.0e-3),
+                        cloud_base_heat=jnp.array(_COLUMN["smp"] * 1e-3 / 51.78),
+                        cloud_base_water=jnp.array(_COLUMN["qmp"] * 1e-3 / 51.78),
+                        cloud_base_condensate=jnp.array(0.0))
+        self.assertLessEqual(int(jnp.sum(r.active)), 2)
+
+    def test_once_dead_stays_dead(self):
+        r = _run_column()
+        active = np.asarray(r.active)
+        if active.any():
+            first, last = active.argmax(), len(active) - active[::-1].argmax()
+            self.assertTrue(active[first:last].all(),
+                            "active levels must be contiguous")
+
+    def test_column_matches_vectorized(self):
+        """One column and a 3-wide block must be the same computation.
+
+        Asserted in float64 against a few-ULP relative tolerance, rather than in
+        float32 against a hand-picked absolute one. The scheme ships in float32
+        and there the two differ by ~1.3e-4 on a `plume_mass` of magnitude 52 --
+        1.9e-6 relative, which is XLA compiling the `(nlev,)` and `(nlev, 3)`
+        shapes to different reduction orders, not a broadcasting defect. float64
+        shrinks that disagreement by ~10 orders of magnitude but does not remove
+        it: the reduction orders still differ, so the residual is a couple of
+        ULPs and is hardware-dependent (bit-exact on arm64, 1.8e-14 on CI's
+        x86 runners). The tolerance below is ~12 orders of magnitude tighter
+        than a genuine axis-mixing bug, which would move these by O(1).
+
+        The precision is set here rather than inherited. This test used to pass
+        only when the whole directory ran in one process, because
+        `giss_plume_driver_test` enables x64 at module import; run alone it
+        failed at 1.3e-4 against a 1e-4 tolerance. An order-dependent test is
+        worse than a flaky one -- it is green on CI and red for whoever runs the
+        file on its own.
+        """
+        previous = jax.config.jax_enable_x64
+        jax.config.update("jax_enable_x64", True)
+        try:
+            self._column_matches_vectorized()
+        finally:
+            jax.config.update("jax_enable_x64", previous)
+
+    def _column_matches_vectorized(self):
+        single = _run_column()
+
+        def widen(x):
+            return x[:, None] * jnp.ones((1, 3)) if x.ndim else x
+        block = bs.plume_ascent(
+            cloud_base=jnp.full((3,), _COLUMN["cloud_base"]),
+            cloud_base_mass=jnp.full((3,), _COLUMN["mplume"][0]),
+            cloud_base_heat=jnp.full((3,), _COLUMN["smp"]),
+            cloud_base_water=jnp.full((3,), _COLUMN["qmp"]),
+            cloud_base_condensate=jnp.full((3,), _COLUMN["wmp"]),
+            environment_heat=widen(_column_profile("senv", 41.5)),
+            environment_water=widen(_column_profile("qenv", 0.005)),
+            environment_virtual_temperature=widen(
+                _column_profile("tvl", 300.0)),
+            layer_mass=widen(_column_profile("ma", 1.0)),
+            layer_depth=widen(_column_profile("gzl", 1.0)),
+            layer_thickness=widen(_column_profile("delz", 1.0)),
+            height=widen(_column_profile("zl", 3000.0)),
+            exner=widen(_column_profile("plk", 7.0)),
+            pressure=widen(_column_profile("pres", 9.0e4)),
+            entrainment_efficiency=jnp.full((3,), _COLUMN["enteff"]))
+        # Same inputs and same code, so the two agree to floating-point
+        # reassociation and nothing more. Compared relative to each field's own
+        # magnitude: if the vertical scan read a horizontal axis anywhere, these
+        # would differ by O(1), not by ULPs.
+        for name, one, many in (
+                ("plume_mass", single.plume_mass, block.plume_mass),
+                ("detrained_mass", single.detrained_mass,
+                 block.detrained_mass)):
+            scale = float(jnp.max(jnp.abs(one)))
+            self.assertGreater(scale, 0.0, msg=f"{name} is identically zero")
+            self.assertLess(
+                float(jnp.max(jnp.abs(one[:, None] - many))) / scale, 1e-12,
+                msg=name)
+
+    def test_gradient_finite(self):
+        def f(cloud_base_mass):
+            return jnp.sum(_run_column(cloud_base_mass=cloud_base_mass)
+                           .detrained_mass)
+        grad = jax.grad(f)(jnp.array(_COLUMN["mplume"][0]))
+        self.assertTrue(bool(jnp.isfinite(grad)))
+
+
+class TestResaturatePlume(unittest.TestCase):
+    """The inter-level step: evaporate everything, re-condense at the new level.
+
+    The fixture is a real BOMEX transition (level 10 -> 11 of the first column):
+    the plume state leaving ``plume_ent_det_w2_bsort`` at one level, and the
+    state ModelE hands it at the next.
+    """
+
+    OUT_HEAT, OUT_WATER, OUT_CONDENSATE = 1704.724, 0.6546861, 0.02265676
+    MASS, EXNER, PRESSURE = 40.94896, 7.021307, 90612.06
+    EXPECT_HEAT, EXPECT_WATER = 1707.956, 0.6455845
+    ORACLE_CONDENSATE = 0.0268701
+
+    def _run(self):
+        return bs.resaturate_plume(
+            jnp.array(self.MASS), jnp.array(self.OUT_HEAT),
+            jnp.array(self.OUT_WATER), jnp.array(self.OUT_CONDENSATE),
+            jnp.array(self.EXNER), jnp.array(self.PRESSURE))
+
+    def test_heat_and_vapour_match_oracle(self):
+        heat, water, _ = self._run()
+        self.assertAlmostEqual(float(heat) / self.EXPECT_HEAT, 1.0, delta=1e-5)
+        self.assertAlmostEqual(float(water) / self.EXPECT_WATER, 1.0,
+                               delta=1e-5)
+
+    def test_total_water_is_conserved(self):
+        # The step only re-partitions; it neither creates nor destroys water.
+        # Precipitation is removed afterwards, by the microphysics.
+        _, water, condensate = self._run()
+        before = self.OUT_WATER + self.OUT_CONDENSATE
+        self.assertAlmostEqual(float(water + condensate) / before, 1.0,
+                               delta=1e-6)
+
+    def test_condensate_exceeds_oracle_by_the_precipitated_amount(self):
+        # Documents the known gap: without the microphysics the plume keeps
+        # condensate ModelE would have rained out. If this ever starts matching,
+        # precipitation has been ported and the assertion should be tightened.
+        _, _, condensate = self._run()
+        self.assertGreater(float(condensate), self.ORACLE_CONDENSATE)
+        self.assertLess(float(condensate) / self.ORACLE_CONDENSATE, 1.5)
+
+    def test_column_matches_vectorized(self):
+        args = (self.MASS, self.OUT_HEAT, self.OUT_WATER, self.OUT_CONDENSATE,
+                self.EXNER, self.PRESSURE)
+        single = bs.resaturate_plume(*[jnp.array(a) for a in args])
+        block = bs.resaturate_plume(*[jnp.full((4,), a) for a in args])
+        for a, b in zip(single, block):
+            self.assertLess(float(jnp.max(jnp.abs(a - b))), 1e-6)
+
+    def test_gradient_finite(self):
+        def f(water):
+            return bs.resaturate_plume(
+                jnp.array(self.MASS), jnp.array(self.OUT_HEAT), water,
+                jnp.array(self.OUT_CONDENSATE), jnp.array(self.EXNER),
+                jnp.array(self.PRESSURE))[2]
+        grad = jax.grad(f)(jnp.array(self.OUT_WATER))
+        self.assertTrue(bool(jnp.isfinite(grad)))
+
+
+class TestClosedColumn(unittest.TestCase):
+    """The whole chain against one real ModelE column.
+
+    With the re-saturation and the precipitation stand-in in place the ascent
+    tracks ModelE level by level. This is the end-to-end regression test: it
+    would catch any of the per-level pieces drifting, and it is the check that
+    was impossible before the inter-level step existed.
+    """
+
+    def _run(self):
+        return _run_column()
+
+    def test_plume_survives_the_whole_column(self):
+        r = self._run()
+        for lev in _COLUMN["level"][:-1]:
+            self.assertTrue(bool(r.active[lev]), msg=f"died at level {lev}")
+
+    def test_plume_mass_tracks_oracle(self):
+        r = self._run()
+        for i, lev in enumerate(_COLUMN["level"]):
+            if not bool(r.active[lev]):
+                continue
+            self.assertAlmostEqual(
+                float(r.plume_mass[lev]) / _COLUMN["mplume"][i], 1.0,
+                delta=0.05, msg=f"level {lev}")
+
+    def test_vertical_velocity_tracks_oracle(self):
+        r = self._run()
+        for i, lev in enumerate(_COLUMN["level"]):
+            if not bool(r.active[lev]) or _COLUMN["wcu"][i] <= 0.0:
+                continue
+            self.assertAlmostEqual(
+                float(r.vertical_velocity[lev]) / _COLUMN["wcu"][i], 1.0,
+                delta=0.05, msg=f"level {lev}")
+
+    def test_mass_flux_decays_with_height_as_in_the_oracle(self):
+        # The qualitative signature of buoyancy sorting, and the behaviour the
+        # previous Gregory-entrainment port could not produce: the plume sheds
+        # mass on the way up instead of growing until it terminates.
+        r = self._run()
+        base, top = _COLUMN["level"][0], _COLUMN["level"][-1]
+        self.assertLess(float(r.plume_mass[top]), float(r.plume_mass[base]))
+
+
+class TestPlumeGlaciation(unittest.TestCase):
+    """The per-level phase, and what a change of phase does to the parcel.
+
+    ModelE picks ``lhx`` per level from the parcel's own pre-condensation
+    temperature against ``tfmc`` (``MSTCNV.F90:1849-1854``) and records it in
+    ``VLAT(l)``. Because it then re-condenses the parcel from scratch at every
+    level -- evaporating the whole reservoir back at ``VLAT(l-1)`` and re-adding
+    it at ``lhx`` -- a change of phase re-books the latent heat of **all** the
+    condensate, not of the increment. That is worth +1.66 K on the TWP-ICE
+    period where it was measured, against an overshoot threshold of 1 K, and
+    without it the port's plume stopped nine levels below ModelE's.
+    """
+
+    def test_tfmc_is_the_default_preset(self):
+        # `tf-15d0`, the preset that also sets `max_dt_overshoot = 1d0` (which
+        # section 109 recovered as exactly 1.0 from the oracle) and
+        # `geometric_fevapfac = 0d0`. Recovered independently: the level where
+        # ModelE's dumped `lhx` switches straddles this value on 186 of 186
+        # TWP-ICE steps. A tuned GCM preset uses 251.47871, 252.36180 or
+        # 260.28967 and will need this made configurable with them.
+        self.assertAlmostEqual(bs._TFMC, 273.16 - 15.0, places=10)
+        self.assertEqual(bs._MAX_OVERSHOOT_DT, 1.0)
+
+    def test_phase_change_rebooks_the_whole_reservoir(self):
+        # Freeze a parcel that already carries condensate: the heat it gains is
+        # the latent heat of the *new* total at LHS less the latent heat of the
+        # *old* total at LHE -- not LHS times the increment.
+        mass, exner, pressure = 40.94896, 7.021307, 90612.06
+        heat, water, condensate = 1704.724, 0.6546861, 0.02265676
+        args = (jnp.array(mass), jnp.array(heat), jnp.array(water),
+                jnp.array(condensate), jnp.array(exner), jnp.array(pressure))
+        liquid_heat, _, liquid_cond = bs.resaturate_plume(
+            *args, "water", "water")
+        frozen_heat, _, frozen_cond = bs.resaturate_plume(*args, "ice", "water")
+
+        expected = (heat
+                    - gt.LHE * condensate / gt.SHA / exner
+                    + gt.LHS * float(frozen_cond) / gt.SHA / exner)
+        self.assertAlmostEqual(float(frozen_heat) / expected, 1.0, delta=1e-6)
+
+        # Whether freezing *gains* heat depends on the temperature, and the
+        # closed form above holds either way. Above ~265 K the Murphy & Koop
+        # ice fit sits above the water fit, so an ice parcel condenses less and
+        # the re-booking does not pay for it: at 292 K this fixture loses
+        # 1.9 K. In the regime where ModelE actually glaciates a plume it gains
+        # -- +0.8 K at 257 K, +1.5 K at 250 K -- and the measured TWP-ICE case
+        # (a ~257 K parcel holding 4.5 g/kg) gained 1.66 K, the reservoir being
+        # what makes it that large.
+        cold_heat = 250.0 / exner * mass
+        cold = (jnp.array(mass), jnp.array(cold_heat), jnp.array(water),
+                jnp.array(condensate), jnp.array(exner), jnp.array(pressure))
+        cold_liquid, _, _ = bs.resaturate_plume(*cold, "water", "water")
+        cold_frozen, _, _ = bs.resaturate_plume(*cold, "ice", "water")
+        gain = (float(cold_frozen) - float(cold_liquid)) * exner / mass
+        self.assertGreater(gain, 1.0)
+
+    def test_previous_phase_defaults_to_the_current_one(self):
+        # `previous_phase=None` must mean "same phase", so every caller that
+        # names one phase keeps the single-phase behaviour exactly.
+        args = (jnp.array(40.94896), jnp.array(1704.724), jnp.array(0.6546861),
+                jnp.array(0.02265676), jnp.array(7.021307),
+                jnp.array(90612.06))
+        for ph in ("water", "ice"):
+            default = bs.resaturate_plume(*args, ph)
+            explicit = bs.resaturate_plume(*args, ph, ph)
+            for a, b in zip(default, explicit):
+                self.assertEqual(float(a), float(b))
+
+    def test_ascent_reports_lhx_and_a_warm_column_stays_liquid(self):
+        # The BOMEX fixture's parcel is ~291 K throughout, well above `tfmc`,
+        # so every level the plume reaches must condense over water. This also
+        # pins that the new output is the latent heat in J/kg, the units
+        # ModelE's `mass_budget.txt` dumps `lhx` in.
+        ascent = _run_column()
+        reached = np.asarray(ascent.active)
+        lhx = np.asarray(ascent.latent_heat)
+        self.assertTrue(reached.any(), "fixture produced no ascent")
+        np.testing.assert_allclose(lhx[reached], gt.LHE)
+
+    def test_ascent_switches_phase_level_by_level(self):
+        """`lhx` is chosen per level from the parcel, not once per ascent.
+
+        Scaling the fixture's Exner profile to make the parcel cold kills the
+        ascent outright -- a parcel that cold is never buoyant -- so move the
+        threshold instead and keep the sounding. The property being pinned is
+        the one that matters: each level is decided on its own parcel
+        temperature, so the switch sits where the profile crosses `tfmc`, and
+        lowering `tfmc` moves it up.
+        """
+        switch_at = {}
+        for threshold in (291.0, 290.0, 289.0):
+            with mock.patch.object(bs, "_TFMC", threshold):
+                ascent = _run_column()
+            reached = np.asarray(ascent.active)
+            lhx = np.asarray(ascent.latent_heat)[reached]
+            self.assertTrue(reached.any(),
+                            f"no ascent at _TFMC={threshold}")
+            ice = lhx == gt.LHS
+            # Liquid below, ice above, with exactly one transition: the
+            # fixture's parcel temperature falls monotonically with height.
+            self.assertEqual(int(np.sum(np.diff(ice.astype(int)) != 0)), 1,
+                             f"_TFMC={threshold} gave {lhx.tolist()}")
+            self.assertFalse(bool(ice[0]))
+            self.assertTrue(bool(ice[-1]))
+            switch_at[threshold] = int(np.argmax(ice))
+
+        # A colder threshold freezes later, one level at a time here.
+        self.assertEqual([switch_at[t] for t in (291.0, 290.0, 289.0)],
+                         [3, 4, 5])
+
+    def test_static_ice_phase_overrides_the_switch(self):
+        # A caller that names "ice" gets an all-ice ascent, as before, even
+        # though the fixture's parcel is far above `tfmc`.
+        ascent = _run_column(phase="ice")
+        reached = np.asarray(ascent.active)
+        np.testing.assert_allclose(np.asarray(ascent.latent_heat)[reached],
+                                   gt.LHS)
+
+
+class TestTheTerminalDumpLandsOnTheLevelReached(unittest.TestCase):
+    """Where a plume puts what it is still carrying when it stops.
+
+    ModelE decrements ``lmax`` to "the highest layer actually reached"
+    (MSTCNV.F90:2163) before ``DM(LMAX) += MPLUME``, so the dump goes to the
+    last level the plume occupied -- not to the level whose entry test it
+    failed, where it never condensed and has no phase. Emitting it there split
+    the detrainment across two levels and stranded its ``lhx`` at zero, which
+    ``_is_ice`` reads as liquid.
+    """
+
+    def test_per_level_detrainment_matches_the_continuity_oracle(self):
+        # ModelE's own `dm(l)` for this plume, from `continuity_diag.txt`
+        # (BOMEX step 1, first plume). This is the post-loop total -- the
+        # buoyancy sort's detrainment plus the terminal dump -- and is the one
+        # part of the tendency chain its Fortran comment records as never
+        # having been checked against an oracle.
+        want = {10: 32.49318, 11: 10.42755, 12: 25.08094, 13: 21.61005,
+                14: 12.09685, 15: 0.0, 16: 16.84680}
+        got = np.asarray(_run_column().detrained_mass)
+        for level, expected in want.items():
+            if expected == 0.0:
+                self.assertEqual(float(got[level]), 0.0, msg=f"level {level}")
+            else:
+                self.assertAlmostEqual(float(got[level]) / expected, 1.0,
+                                       delta=1e-4, msg=f"level {level}")
+        # Level 16 is the last the plume reaches, so nothing may detrain above
+        # it: the whole 16.8468 belongs there, not 8.434 there and 8.413 at 17.
+        self.assertEqual(float(np.sum(got[17:])), 0.0)
+
+    def test_nothing_detrains_above_the_level_the_plume_reached(self):
+        # The property behind the oracle row, over every glaciation state the
+        # fixture can reach -- lowering `tfmc` stops the plume earlier, which
+        # moves the dump without changing where it must land.
+        for threshold in (258.16, 291.0, 290.0, 289.0, 288.0):
+            with mock.patch.object(bs, "_TFMC", threshold):
+                ascent = _run_column()
+            reached = np.asarray(ascent.active)
+            self.assertTrue(reached.any(), f"no ascent at _TFMC={threshold}")
+            top = int(np.max(np.where(reached)[0]))
+            for name in ("detrained_mass", "detrained_heat", "detrained_water",
+                         "detrained_condensate"):
+                above = np.asarray(getattr(ascent, name))[top + 1:]
+                self.assertEqual(float(np.sum(np.abs(above))), 0.0,
+                                 f"_TFMC={threshold}: {name} above level {top}")
+
+    def test_every_level_carrying_condensate_carries_a_phase(self):
+        # The phase travelled with the level, so misplacing the dump stranded
+        # it. `latent_heat` is what the driver splits liquid from ice on, and
+        # zero there reads as liquid at any temperature.
+        for threshold in (258.16, 291.0, 290.0, 289.0, 288.0):
+            with mock.patch.object(bs, "_TFMC", threshold):
+                ascent = _run_column()
+            det = np.asarray(ascent.detrained_condensate)
+            lhx = np.asarray(ascent.latent_heat)
+            unphased = (det > 0.0) & (lhx == 0.0)
+            self.assertFalse(unphased.any(),
+                             f"_TFMC={threshold}: condensate with no phase at "
+                             f"levels {np.where(unphased)[0].tolist()}")
+
+    def test_a_glaciated_plume_detrains_its_last_condensate_as_ice(self):
+        # Lower the threshold until the fixture's ~291 K parcel freezes before
+        # it stops, so the plume is demonstrably icy when it terminates, and
+        # the condensate it leaves behind must be ice.
+        with mock.patch.object(bs, "_TFMC", 289.0):
+            ascent = _run_column()
+        reached = np.asarray(ascent.active)
+        top = int(np.max(np.where(reached)[0]))
+        self.assertGreater(
+            float(np.asarray(ascent.detrained_condensate)[top]), 0.0,
+            "no condensate was left at the top, so nothing is pinned")
+        self.assertEqual(float(np.asarray(ascent.latent_heat)[top]), gt.LHS)
+
+
+class TestTheTerminationReasonMatchesModelEsCode(unittest.TestCase):
+    """``termination_reason`` is ModelE's ``mc_why``, labelled the same way.
+
+    The point of the field is to be comparable with ``ascent_exit_diag.txt``
+    plume for plume, so what has to hold is the *labelling convention*: one
+    non-zero entry per plume, on the level whose entry test failed, carrying the
+    code of the **first** test that failed in ModelE's order
+    (``MSTCNV.F90:1843-1927``). A conjunction cannot be read backwards, so a
+    plume failing two tests at once is exactly the case that matters.
+    """
+
+    def test_exactly_one_level_carries_a_reason(self):
+        ascent = _run_column()
+        reason = np.asarray(ascent.termination_reason).squeeze()
+        self.assertEqual(int(np.count_nonzero(reason)), 1,
+                         f"one plume terminates once; got {np.nonzero(reason)}")
+        # It sits one above the top the plume reached, which is the level whose
+        # test it failed -- the same level ModelE sets `mc_why` on before
+        # decrementing `lmax` (`:2163`).
+        active = np.asarray(ascent.active).squeeze()
+        self.assertEqual(int(np.argmax(reason != 0)),
+                         int(np.max(np.nonzero(active))) + 1)
+
+    def test_a_plume_stopped_by_a_warm_lid_reports_the_overshoot_code(self):
+        """A lid leaves mass and velocity intact, so only test 5 can fire."""
+        warm = jnp.asarray(_column_profile("tvl", 300.0)).at[14:].add(8.0)
+        ascent = _run_column(environment_virtual_temperature=warm)
+        reason = np.asarray(ascent.termination_reason).squeeze()
+        self.assertEqual(int(reason[np.argmax(reason != 0)]), 5)
+
+    def test_the_first_failing_test_wins_when_several_fail_at_once(self):
+        """Priority, not coincidence: a stalled plume reports 1, not 2 or 5.
+
+        Driving the cloud-base mass to a sliver makes the mass tests fail too,
+        and a plume with no kinetic energy is also not buoyant -- ModelE exits
+        on ``wcu2(l-1) <= 0`` first and so must this.
+        """
+        ascent = _run_column(cloud_base_velocity=0.0)
+        reason = np.asarray(ascent.termination_reason).squeeze()
+        nonzero = np.nonzero(reason)[0]
+        self.assertEqual(reason[nonzero[0]], 1)
+
+    def test_the_margin_is_recorded_wherever_the_plume_rose(self):
+        """The margin is recorded wherever the plume rose.
+
+        ModelE writes it for every plume, not only the ones it fires on, so the
+        termination can be compared on the continuous quantity rather than only
+        on which test tripped. It must therefore be finite on every level.
+        """
+        ascent = _run_column()
+        margin = np.asarray(ascent.overshoot_margin).squeeze()
+        active = np.asarray(ascent.active).squeeze()
+        self.assertTrue(np.all(np.isfinite(margin)))
+        self.assertTrue(np.any(margin[active] != 0.0))
+
+
+class TestMaxOvershootIsATunableParameter(unittest.TestCase):
+    """``max_dt_overshoot`` is GISS's own tuning knob, not a fixed constant.
+
+    ``MSTCNV.F90:297`` defaults it to 1.0 and the instrumented SCM runs this
+    port is validated against used that value, so the default has to stay 1.0 or
+    every oracle number moves. But GISS's tuned presets set 1.59-2.09
+    (``:369``, ``:410``, ``:460``), and since exit 5 is what terminates every
+    deep plume, the global depth comparison cannot be run without being able to
+    set it. What these pin is the default and the *direction*.
+    """
+
+    def test_the_default_is_modeles_untuned_value(self):
+        self.assertEqual(
+            float(GissConvectionParameters.default().max_dt_overshoot), 1.0)
+        # The module constant is that default's source, so they cannot drift.
+        self.assertEqual(
+            float(GissConvectionParameters.default().max_dt_overshoot),
+            bs._MAX_OVERSHOOT_DT)
+
+    def test_the_default_argument_reproduces_the_constant(self):
+        """Passing the constant explicitly must change nothing at all."""
+        implicit = _run_column()
+        explicit = _run_column(max_overshoot_dt=bs._MAX_OVERSHOOT_DT)
+        np.testing.assert_array_equal(
+            np.asarray(implicit.plume_mass), np.asarray(explicit.plume_mass))
+
+    def test_a_larger_threshold_lets_the_plume_rise_further(self):
+        """The direction is the whole point: a bigger allowance means depth.
+
+        Exit 5 stops the plume once its buoyancy falls below
+        ``-max_dt_overshoot/tvl``, so raising the threshold lets it penetrate
+        further into negatively buoyant air before terminating.
+
+        The lid has to be chosen so the two thresholds straddle it. The test
+        compares a kelvin of virtual temperature against ``tvl``, so at 300 K
+        the two allow -0.0033 and -0.0070 of buoyancy; a lid strong enough to
+        put the parcel well below both stops the plume in the same place
+        whatever the threshold, and one too weak never reaches the test at all.
+        At +3 K the default stops the plume on exit 5 and GISS's tuned value
+        carries it a level further, where it runs out of kinetic energy
+        instead -- which is both halves of the contract in one column.
+        """
+        warm = jnp.asarray(_column_profile("tvl", 300.0)).at[14:].add(3.0)
+        tops, reasons = [], []
+        for threshold in (1.0, 2.0862949):
+            ascent = _run_column(environment_virtual_temperature=warm,
+                                 max_overshoot_dt=threshold)
+            active = np.asarray(ascent.active).squeeze()
+            why = np.asarray(ascent.termination_reason).squeeze()
+            tops.append(int(np.max(np.nonzero(active))))
+            reasons.append(int(why[np.argmax(why != 0)]))
+        self.assertGreater(
+            tops[1], tops[0],
+            f"GISS's tuned threshold must not stop the plume sooner: {tops}")
+        self.assertEqual(reasons[0], 5, "the default must stop on the "
+                         "overshoot test, or the lid is the wrong strength")
+        self.assertNotEqual(reasons[1], 5, "the tuned threshold must carry the "
+                            "plume past the test the default stopped it on")
+
+    def test_gradients_flow_through_the_threshold(self):
+        """It is a differentiable leaf, which is why it belongs in the params.
+
+        A numeric tunable held as a module constant is invisible to
+        ``jax.grad``; CLAUDE.md requires physics parameters to be pytree leaves.
+        """
+        warm = jnp.asarray(_column_profile("tvl", 300.0)).at[14:].add(8.0)
+
+        def total_mass(threshold):
+            ascent = _run_column(environment_virtual_temperature=warm,
+                                 max_overshoot_dt=threshold)
+            return jnp.sum(ascent.plume_mass)
+
+        grad = jax.grad(total_mass)(jnp.array(1.5))
+        self.assertTrue(np.isfinite(float(grad)))

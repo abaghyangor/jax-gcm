@@ -89,6 +89,7 @@ def _all_terms():
 #: sets it True, so anything usable with both families qualifies.
 LAYOUT_AGNOSTIC = frozenset({
     "AerocomDiagnostics",
+    "GissConvection",
     "MoistAirColumnState",
     "NudgingTerm",
     "UpperSponge",
@@ -191,8 +192,59 @@ def _nudging_term():
     ))
 
 
-#: Constructors for terms whose ``__init__`` needs arguments.
-TERM_FACTORIES = {"NudgingTerm": _nudging_term}
+def _giss_convection_allow_mc():
+    """Build the GISS term on its tendency path, not only its diagnostics.
+
+    ``allow_mc`` mirrors ModelE's ``SCMopt%allowMC`` and defaults to false, on
+    which the term still writes its two cloud-base diagnostics but returns
+    zero tendencies. Those diagnostics alone satisfy the vacuous-pass guard
+    below, so the default construction would report the term audited while
+    the whole ported chain -- the mass-flux closure, the candidate sweep over
+    cloud bases, the buoyancy-sorting ascent, the microphysics partition, the
+    downdraft descent and the tendency assembly -- never ran on the nodal
+    grid. That is the same trap ``_attach_nudging_target`` exists for.
+    """
+    from jcm.physics.convection.giss_mstcnv import GissConvection
+    return GissConvection(allow_mc=True)
+
+
+#: Per-term relative tolerance for the host-agreement comparison, where the
+#: default 1e-5 is tighter than float32 can deliver.
+#:
+#: The default suits a term whose outputs are a short chain of operations on
+#: the environment. It is too tight for one whose published diagnostic is an
+#: accumulated float32 column reduction: the two hosts hand XLA the SAME
+#: columns in different shapes -- ``(nlon, nlat)`` against ``(ncols,)`` -- so
+#: it vectorises them over different lane widths and the reduction associates
+#: in a different order, which moves the last bits on some lanes and not
+#: others.
+#:
+#: Loosen a term here only with the measured spread written down, and only
+#: when the field that needed it is an accumulation. A real layout error --
+#: a transposed axis, a mis-broadcast level index -- misplaces whole levels
+#: and shows up as an O(1) relative difference, so it is still caught four
+#: orders of magnitude before these values.
+HOST_AGREEMENT_RTOL = {
+    # ``mcp`` is the convective precipitation accumulated down the column in
+    # mm/day (~50 on this environment), so its rounding is ~100x float32 eps.
+    # Measured: bit-exact between the two hosts on arm64, while on the x86 CI
+    # runners 8 of 2048 lanes differ by 1.2e-5 -- just over the default, which
+    # is why this only ever failed in CI. Every other field of this term is
+    # bit-exact on both hosts, the ``temperature`` and ``specific_humidity``
+    # tendencies included, so ``mcp`` alone drives this entry. 1e-4 leaves
+    # roughly 8x headroom over the one spread that has actually been observed;
+    # it is a margin, not a measurement, because the x86 difference cannot be
+    # reproduced on an arm64 host to bound it properly.
+    "GissConvection": 1e-4,
+}
+
+
+#: Constructors for terms whose ``__init__`` needs arguments, or that need a
+#: non-default flag to reach the code the audit is meant to compare.
+TERM_FACTORIES = {
+    "NudgingTerm": _nudging_term,
+    "GissConvection": _giss_convection_allow_mc,
+}
 
 
 def _attach_nudging_target(state, diagnostics, forcing, horiz):
@@ -431,7 +483,8 @@ class LayoutAgnosticTermsTest(unittest.TestCase):
                     )
                     np.testing.assert_allclose(
                         np.nan_to_num(a), np.nan_to_num(b),
-                        rtol=1e-5, atol=1e-9,
+                        rtol=HOST_AGREEMENT_RTOL.get(cls.__name__, 1e-5),
+                        atol=1e-9,
                         err_msg=f"{cls.__name__}.{key} differs between hosts",
                     )
 
