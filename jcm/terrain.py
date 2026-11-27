@@ -527,6 +527,17 @@ class TerrainData:
 
         # Pick the best available SSO source.
         sso = _load_sso_from_file(terrain_file) if src_has_sso else None
+        # BOTH axes, deliberately: re-deriving Baines-Palmer statistics needs
+        # several source cells inside each target cell to take the variance
+        # OVER, and a grid finer in longitude but coarser in latitude supplies
+        # them in one direction only. Such a mixed source is therefore treated
+        # like a coarser one and interpolated, which is the conservative
+        # choice -- it keeps the descriptors the file already carries instead
+        # of computing a variance from a single row of cells. It does mean the
+        # axis that is being coarsened is point-sampled rather than
+        # aggregated, so its between-cell variance is lost; no shipped terrain
+        # file is mixed this way, and a file that is would be better
+        # regridded to a common resolution before it gets here.
         source_is_finer = (src_lat_n > target_shape[1]
                            and src_lon_n > target_shape[0])
         if sso is not None and any(
@@ -554,9 +565,9 @@ class TerrainData:
                 # cannot recover the real high-resolution topography the
                 # file's descriptors already carry. Regrid them instead.
                 logger.info(
-                    "terrain file %s carries SSO fields at %s, coarser than "
-                    "the model's %s — interpolating them onto the model "
-                    "grid", terrain_file,
+                    "terrain file %s carries SSO fields at %s, not finer than "
+                    "the model's %s on both axes — interpolating them onto "
+                    "the model grid", terrain_file,
                     next(iter(sso.values())).shape, target_shape)
                 sso = _load_sso_from_file(terrain_file, grid=target_grid)
                 if any(v.shape != target_shape for v in sso.values()):

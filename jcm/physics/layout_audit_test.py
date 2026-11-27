@@ -89,6 +89,7 @@ def _all_terms():
 #: sets it True, so anything usable with both families qualifies.
 LAYOUT_AGNOSTIC = frozenset({
     "AerocomDiagnostics",
+    "GissConvection",
     "MoistAirColumnState",
     "NudgingTerm",
     "UpperSponge",
@@ -119,12 +120,6 @@ INERT_IN_HARNESS = frozenset({
     "AerosolFree",
     "BettsMillerConvection",
     "FrontalGravityWaveDrag",
-    # Broadcasting-native (vertical on axis 0, per-column cloud base gathered
-    # with ``take_along_axis``, no vmap), but it reads ``pressure_full`` /
-    # ``layer_thickness`` / ``air_density`` optionally and this harness supplies
-    # none of them: without that trio it returns zero tendencies and a sentinel
-    # cloud base in either host, so a host-vs-host comparison proves nothing.
-    "GissConvection",
     "IceNucleation",
     "LottMillerSso",
     "M7JaxMicrophysics",
@@ -197,8 +192,28 @@ def _nudging_term():
     ))
 
 
-#: Constructors for terms whose ``__init__`` needs arguments.
-TERM_FACTORIES = {"NudgingTerm": _nudging_term}
+def _giss_convection_allow_mc():
+    """Build the GISS term on its tendency path, not only its diagnostics.
+
+    ``allow_mc`` mirrors ModelE's ``SCMopt%allowMC`` and defaults to false, on
+    which the term still writes its two cloud-base diagnostics but returns
+    zero tendencies. Those diagnostics alone satisfy the vacuous-pass guard
+    below, so the default construction would report the term audited while
+    the whole ported chain -- the mass-flux closure, the candidate sweep over
+    cloud bases, the buoyancy-sorting ascent, the microphysics partition, the
+    downdraft descent and the tendency assembly -- never ran on the nodal
+    grid. That is the same trap ``_attach_nudging_target`` exists for.
+    """
+    from jcm.physics.convection.giss_mstcnv import GissConvection
+    return GissConvection(allow_mc=True)
+
+
+#: Constructors for terms whose ``__init__`` needs arguments, or that need a
+#: non-default flag to reach the code the audit is meant to compare.
+TERM_FACTORIES = {
+    "NudgingTerm": _nudging_term,
+    "GissConvection": _giss_convection_allow_mc,
+}
 
 
 def _attach_nudging_target(state, diagnostics, forcing, horiz):
