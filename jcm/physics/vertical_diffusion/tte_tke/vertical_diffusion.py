@@ -42,7 +42,7 @@ from .vertical_diffusion_types import (
 )
 from .moist_buoyancy import interior_buoyancy_and_shear, richardson_number
 from .closure import interior_closure, surface_tke_boundary
-from .turbulence_coefficients import (compute_turbulence_diagnostics, tile_effective_wind)
+from .turbulence_coefficients import compute_turbulence_diagnostics, tile_effective_wind
 from .matrix_solver import _surface_air_density, vertical_diffusion_step
 
 

@@ -558,6 +558,33 @@ of tropical columns. `convective_velocity_scale` now falls back to the
 `vertical_diffusion` record, preferring an explicitly published top-level key so
 the oracle harness — which injects ModelE's own `pblht` — is untouched.
 
+**The source parcel needs the PBL *level*, so that is what is published.**
+`TteTkeVerticalDiffusion` now publishes `mixed_layer_top` as a top-level key
+beside its record, because one term cannot reach into another's diagnostic
+struct and the closure's own `ihpbl` is what picks the parcel the mass-flux
+closure lifts — ModelE takes exactly this from its own turbulence scheme. Two
+details of that contract are easy to get wrong and are fixed deliberately:
+
+* **It is counted from the surface**, `(nlev - 1) - ihpbl`. The closure counts
+  top-first; the ported GISS routines work surface-first as `MSTCNV` does, and
+  flip every profile on entry, so the index has to arrive in the same frame as
+  the profiles it indexes. Nothing about a wrong choice here is loud — the
+  plume would simply be seeded from the stratosphere — so
+  `vertical_diffusion_test.py::TestMixedLayerTopIsPublishedSurfaceFirst` pins
+  the orientation against the closure's own algebra rather than against a
+  recorded number: ECHAM's RCE branch sets `ihpbl = ihpblc` where the default
+  is `min(ihpblc, ihpbld)`, so under `lrce` the layer can only be shallower,
+  and surface-first that inequality must invert.
+* **It is the level, not something derived from the height**, and it is the
+  *unclipped* `ihpbl`. `zghabl` is `min(50000, pgeom1(ihpbl))` because that
+  geopotential feeds the convective velocity scale (`vdiff.f90` l.761), so
+  above a ~5 km boundary layer the published height and the published level
+  describe different altitudes on purpose. Deriving a level from the capped
+  height would pin every deep PBL to the cap; and the heights are not
+  comparable anyway — `boundary_layer_height` is above the *surface* while the
+  `height_full` diagnostic is above sea level, so differencing them is wrong by
+  the orography.
+
 **But the seed never reaches a buoyancy-sorting plume at all.** That fallback
 only feeds `_plume_seed`, whose only caller is `_convective_tendencies`, the
 `allow_mc and not bsort` single-plume path. The production path,

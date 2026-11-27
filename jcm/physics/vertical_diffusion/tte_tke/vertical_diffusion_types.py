@@ -546,13 +546,23 @@ class VDiffDiagnostics(NamedTuple):
 
     # Boundary layer diagnostics
     boundary_layer_height: jnp.ndarray    # PBL extension zghabl/g [m] (ncol,)
-    # ECHAM's ``ihpbl``: the LEVEL the extension above refers to, top-first
-    # like the rest of the closure (0 = model top, nlev-1 = surface). Carried
-    # beside the height because the height alone cannot be turned back into a
-    # level by a consumer: ``boundary_layer_height`` is a geopotential *above
-    # the surface*, while the ``height_full`` diagnostic is above sea level, so
-    # comparing them is wrong by the surface elevation -- and a convection
-    # scheme choosing a source parcel needs the level, not the height.
+    # ECHAM's ``ihpbl`` as diagnosed, top-first like the rest of the closure
+    # (0 = model top, nlev-1 = surface). Carried beside the height because the
+    # height alone cannot be turned back into a level by a consumer:
+    # ``boundary_layer_height`` is a geopotential *above the surface*, while
+    # the ``height_full`` diagnostic is above sea level, so comparing them is
+    # wrong by the surface elevation -- and a convection scheme choosing a
+    # source parcel needs the level, not the height.
+    #
+    # It is NOT the level the height above resolves to whenever the cap binds.
+    # ``zghabl`` is ``MIN(50000, pgeom1(ihpbl))`` (``closure.py``'s
+    # ``PBL_GEOPOTENTIAL_CAP``, ECHAM ``vdiff.f90`` l.761) because that
+    # geopotential feeds the convective velocity scale ``w*``; the level is the
+    # unclipped ``ihpbl``. Above a ~5 km PBL the two therefore describe
+    # different heights on purpose, and that is the faithful reading -- ECHAM
+    # clips the length scale, not its own diagnosis of where the layer ends.
+    # Consumers that want the layer's extent must read this level; deriving one
+    # from the capped height would pin every deep PBL to the cap.
     boundary_layer_level: jnp.ndarray     # ihpbl, top-first index (ncol,)
     friction_velocity: jnp.ndarray        # u* [m/s] (ncol,), grid-mean
                                            # (fraction-weighted across tiles)
