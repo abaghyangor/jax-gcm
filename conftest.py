@@ -166,15 +166,21 @@ def _pin_jax_x64(request):
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_runtest_setup(item):
-    """Turn ``jax_enable_x64`` on before a pySES-backend test's fixtures.
+    """Turn ``jax_enable_x64`` on before an x64-exempt test's fixtures.
 
     The CAM-SE backend needs float64 for the whole life of the grids and
     dycores its ``setUpClass`` fixtures build, which is why those tests are
-    exempt from the pin above. pySES turns the flag on itself only when it is
-    first imported, so a class built after some other test has restored the
-    session default would otherwise be built in float32. ``tryfirst``, and a
-    hook rather than a fixture, because a class fixture is set up before any
-    function-scoped fixture could act.
+    exempt from the pin above; ``needs_x64`` modules are exempt on the same
+    terms. pySES turns the flag on itself only when it is first imported, so a
+    class built after some other test has restored the session default would
+    otherwise be built in float32. ``tryfirst``, and a hook rather than a
+    fixture, because a class fixture is set up before any function-scoped
+    fixture could act.
+
+    The matching restore is in :func:`pytest_runtest_teardown`, which has the
+    ``nextitem`` this hook does not: an exempt test deliberately leaves the
+    flag on so a consecutive run of them costs one cache invalidation rather
+    than two per test, and only the transition back to a non-exempt test pays.
     """
     if _wants_x64(item):
         import jax
@@ -373,12 +379,19 @@ def pytest_runtest_teardown(item, nextitem):
     class-scoped fixtures' references by the time the GC runs.
     """
     global _rss_at_last_clear
-    # Leaving a run of pySES-backend tests: put the flag back before the next
+    # Leaving a run of x64-exempt tests: put the flag back before the next
     # test's fixtures are built. Only the pin protects a function-scoped
     # test; a class fixture is built first, and xdist's ``--dist loadscope``
-    # does not keep the pySES tests together at the end of a worker's queue.
-    if _builds_pyses_backend(item) and (
-            nextitem is None or not _builds_pyses_backend(nextitem)):
+    # does not keep the exempt tests together at the end of a worker's queue.
+    # The predicate is `_wants_x64`, not `_builds_pyses_backend`: `needs_x64`
+    # modules are exempt on the same terms, so leaving one has to end the run
+    # the same way. Testing only for pySES here let a `needs_x64` test hand
+    # `x64=True` to the next class's `setUpClass` while its own test bodies
+    # ran at the restored default -- so anything built class-wide, as
+    # `checkpoint_test.py` and `cf_metadata_test.py` build Models, was built
+    # at a precision those tests then denied.
+    if _wants_x64(item) and (
+            nextitem is None or not _wants_x64(nextitem)):
         _restore_x64()
     maps = _memory_map_count()
     over_maps = maps is not None and maps > _MAX_MAP_COUNT
